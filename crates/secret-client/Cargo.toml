@@ -4,7 +4,6 @@ description = "Rust client for the secretd JSON-RPC protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 secret-proto = { path = "../secret-proto" }

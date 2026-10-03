@@ -1,0 +1,76 @@
+# /etc/secretd/config.toml
+#
+# Ownership: root:secretd, mode 0640 (secretd refuses a config that is not owned by
+# root or the secretd user, or that is group/world writable).
+# Reload ACLs, limits and timeouts with `systemctl reload secretd` (SIGHUP). Changes to
+# sockets, the listen address, notifier and OIDC settings need a restart.
+
+[daemon]
+user = "secretd"
+socket = "/run/secretd/secretd.sock"
+admin_socket = "/run/secretd/admin.sock"
+store = "/var/lib/secretd/store.age"
+audit_log = "/var/log/secretd/audit.jsonl"
+# Server-side maximum (and default) wait for owner approval, in seconds.
+request_timeout_secs = 300
+# Client socket mode when secretd binds the socket itself (ignored under socket
+# activation, where the .socket unit decides). 0o660 or 0o666.
+socket_mode = 0o660
+
+[limits]
+max_pending_per_uid = 3
+max_pending_total = 32
+max_gets_per_uid_per_min = 10
+max_conns_per_uid = 8
+max_conns_total = 128
+idle_timeout_secs = 30
+
+[notify]
+# "ntfy" (POST to a topic URL) or "webhook" (JSON POST, optionally HMAC signed).
+kind = "ntfy"
+url = "https://ntfy.example.com/secretd-alerts"
+# Bearer token for ntfy, read from a file (never inline). root:secretd 0640.
+auth_token_file = "/etc/secretd/ntfy.token"
+# For kind = "webhook": file with the HMAC-SHA256 key used for X-Secretd-Signature.
+# hmac_secret_file = "/etc/secretd/webhook.key"
+timeout_secs = 10
+attempts = 3          # total tries, with exponential backoff
+backoff_ms = 500
+priority = "high"
+
+[approval]
+# Plain HTTP on loopback; TLS is the reverse proxy's job (see README).
+listen = "127.0.0.1:8443"
+# Mandatory. Used for approval links, the OIDC redirect URI and the Secure cookie flag.
+external_url = "https://secretd.example.com"
+# Only peers in this list may supply X-Forwarded-For.
+trusted_proxies = ["127.0.0.1/32", "::1/128"]
+# Needed only if the proxy is on another host / container network. Logs a warning.
+# allow_non_loopback = true
+# Failed approval/login attempts per source IP per minute before HTTP 429.
+max_failed_attempts_per_min = 5
+
+[approval.oidc]
+issuer = "https://accounts.google.com"
+client_id = "xxxxxxxx.apps.googleusercontent.com"
+client_secret_file = "/etc/secretd/oidc-client-secret"
+# Defaults to <external_url>/auth/callback; must be registered in Google Cloud Console.
+redirect_url = "https://secretd.example.com/auth/callback"
+# Case-insensitive exact match on the verified `email` claim.
+owner_emails = ["owner@example.com"]
+session_ttl_secs = 3600
+
+# One block per secret. Names: [A-Za-z0-9._/-]+. A secret with no allow_uids/allow_gids
+# is unreachable. allow_exes must be absolute; allow_any_exe = true is the only way to
+# omit it (a warning is logged).
+[[secret]]
+name = "db-password"
+description = "Primary DB password"          # shown to the owner
+allow_uids = [1000]                          # numbers or user names
+# allow_gids = ["developers"]               # optional
+allow_exes = ["/usr/bin/psql", "/opt/app/bin/app"]
+
+# [[secret]]
+# name = "deploy-token"
+# allow_uids = ["deploy"]
+# allow_any_exe = true

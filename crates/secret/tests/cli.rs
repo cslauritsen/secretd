@@ -54,9 +54,12 @@ fn pw() -> Zeroizing<String> {
 
 impl Env {
     async fn start(limits: &str) -> Env {
+        Self::start_for_uid(limits, unsafe { libc::geteuid() }).await
+    }
+
+    async fn start_for_uid(limits: &str, uid: u32) -> Env {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().display();
-        let uid = unsafe { libc::geteuid() };
         let exe = std::fs::canonicalize(BIN).unwrap();
         let exe = exe.display();
         let mut secrets = String::new();
@@ -392,4 +395,52 @@ async fn inject_output_file_mode_and_overwrite_protection() {
         .filter(|x| x.file_name().to_string_lossy().contains(".tmp"))
         .collect();
     assert!(leftovers.is_empty());
+}
+
+/// Real multi-uid check of SO_PEERCRED: needs root and `setpriv`, so it only
+/// runs with `SECRETD_TEST_MULTIUID=1` (the `secret` binary and its directory
+/// must also be reachable by uid 65534).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiuid_real_peer_credentials() {
+    use std::os::unix::fs::PermissionsExt;
+    if std::env::var_os("SECRETD_TEST_MULTIUID").is_none() {
+        eprintln!("skipped: set SECRETD_TEST_MULTIUID=1 (requires root and setpriv)");
+        return;
+    }
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "multi-uid test must run as root"
+    );
+    let e = Env::start_for_uid("", 65534).await;
+    std::fs::set_permissions(e.dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&e.sock, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let run = |uid: u32| {
+        let mut c = Command::new("setpriv");
+        c.args([
+            &format!("--reuid={uid}"),
+            &format!("--regid={uid}"),
+            "--clear-groups",
+            BIN,
+            "get",
+            "db",
+            "--socket",
+        ])
+        .arg(&e.sock)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        std::thread::spawn(move || c.spawn().unwrap().wait_with_output().unwrap())
+    };
+    // Allowed uid: notification shows the real uid; approval releases.
+    let h = run(65534);
+    let n = e.nth(0).await;
+    assert_eq!(n.uid, 65534);
+    e.approve(0).await;
+    let o = join(h).await;
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(o.stdout, b"db-secret");
+    // Another uid is refused by the ACL without any notification.
+    let o = join(run(65533)).await;
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert_eq!(e.notifications().len(), 1);
 }

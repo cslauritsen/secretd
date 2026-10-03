@@ -161,3 +161,20 @@ Choices the specification left open, recorded as simply as possible.
   `create_new`; with `--force` it is written to a 0600 temp file in the same directory and renamed.
 - The `secret` crate's integration tests run the real binary against the in-process daemon core
   with the real `SO_PEERCRED`/`/proc` providers (ACL pins the binary's own path and uid).
+
+## Packaging and hardening (milestone 6)
+
+- Two socket units: `secretd.socket` (client socket, `FileDescriptorName=secretd`, 0660
+  `secretd:secretd`) and `secretd-admin.socket` (`FileDescriptorName=admin`, 0600 root). The
+  service lists both in `Sockets=`; `secretd` maps inherited descriptors by `LISTEN_FDNAMES`.
+  `tmpfiles.d` creates `/run/secretd` (0755, `secretd:secretd`), `sysusers.d` the user.
+- `CapabilityBoundingSet=CAP_SYS_PTRACE` + `AmbientCapabilities=CAP_SYS_PTRACE` instead of the
+  spec's empty bounding set: reading another uid's `/proc/<pid>/exe` needs it (verified
+  experimentally; details in `docs/HARDENING.md`).
+- Under systemd the service starts as `User=secretd`, so the daemon's own privilege drop is a no-op;
+  when started as root outside systemd it binds sockets, then drops to `daemon.user`.
+- `rust-version` is not declared (unverified MSRV); the code is developed and tested on stable 1.97.
+- CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, the gated multi-uid test as root, and
+  `cargo audit` via `rustsec/audit-check`. `cargo deny` is not configured.
+- The multi-uid `SO_PEERCRED` test is gated behind `SECRETD_TEST_MULTIUID=1` (needs root and
+  `setpriv`); everything else covers uid logic through the injectable peer-credential provider.

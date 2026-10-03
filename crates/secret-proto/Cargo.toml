@@ -4,7 +4,6 @@ description = "Shared JSON-RPC types, framing, store format and configuration fo
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [features]
 default = []

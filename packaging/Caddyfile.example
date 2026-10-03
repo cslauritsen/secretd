@@ -1,0 +1,14 @@
+# Caddy alternative: automatic HTTPS, forwards only /approve/*, /auth/* and /healthz.
+secretd.example.com {
+	@secretd path /approve/* /auth/* /healthz
+	handle @secretd {
+		reverse_proxy 127.0.0.1:8443 {
+			# Caddy sets X-Forwarded-For from the client address; do not trust
+			# incoming values from untrusted hops.
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+	handle {
+		respond 404
+	}
+}

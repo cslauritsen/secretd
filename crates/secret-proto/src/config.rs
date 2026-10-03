@@ -742,6 +742,16 @@ owner_emails = ["Owner@Example.com"]
     }
 
     #[test]
+    fn packaged_example_config_parses() {
+        let text = include_str!("../../../packaging/config.example.toml");
+        let c = Config::parse(text, &R).unwrap();
+        assert_eq!(c.secrets[0].name, "db-password");
+        assert_eq!(c.daemon.socket_mode, 0o660);
+        assert_eq!(c.approval.external_host, "secretd.example.com");
+        assert_eq!(c.notify.attempts, 3);
+    }
+
+    #[test]
     fn file_perms() {
         use std::os::unix::fs::PermissionsExt;
         let d = tempfile::tempdir().unwrap();
