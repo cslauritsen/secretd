@@ -2,6 +2,9 @@
 //! Shared integration-test harness: an in-process daemon core on a temp
 //! socket with injectable peer credentials, `/proc` reader and notifier.
 
+pub mod mock;
+pub mod web;
+
 use async_trait::async_trait;
 use secret_proto::config::{Config, NameResolver};
 use secret_proto::store::{self, Entry};
@@ -83,6 +86,8 @@ pub struct Opts {
     pub limits: String,
     pub timeout_secs: u64,
     pub notifier: Option<Arc<dyn Notifier>>,
+    #[allow(clippy::type_complexity)]
+    pub notifier_from_cfg: Option<Box<dyn FnOnce(&Config) -> Arc<dyn Notifier>>>,
     pub audit_writer: Option<Box<dyn std::io::Write + Send>>,
     pub peer: Option<Arc<dyn PeerCredProvider>>,
     pub procs: Option<Arc<dyn ProcReader>>,
@@ -90,6 +95,10 @@ pub struct Opts {
     pub oidc_issuer: String,
     pub listen: String,
     pub external_url: String,
+    pub notify_kind: String,
+    pub notify_extra: String,
+    pub trusted_proxies: String,
+    pub session_ttl_secs: u64,
 }
 
 impl Default for Opts {
@@ -99,6 +108,7 @@ impl Default for Opts {
             limits: String::new(),
             timeout_secs: 30,
             notifier: None,
+            notifier_from_cfg: None,
             audit_writer: None,
             peer: None,
             procs: None,
@@ -106,6 +116,10 @@ impl Default for Opts {
             oidc_issuer: "https://accounts.google.com".into(),
             listen: "127.0.0.1:8443".into(),
             external_url: "https://secretd.test".into(),
+            notify_kind: "ntfy".into(),
+            notify_extra: String::new(),
+            trusted_proxies: "[\"127.0.0.1/32\", \"::1/128\"]".into(),
+            session_ttl_secs: 3600,
         }
     }
 }
@@ -120,6 +134,7 @@ pub struct Harness {
     pub procs: Arc<StaticProcReader>,
     pub notifier: Arc<RecordingNotifier>,
     pub config_text: String,
+    pub cfg: Config,
 }
 
 pub fn config_text(dir: &std::path::Path, o: &Opts) -> String {
@@ -134,19 +149,22 @@ request_timeout_secs = {t}
 [limits]
 {limits}
 [notify]
-kind = "ntfy"
+kind = "{nkind}"
 url = "{nurl}"
 attempts = 3
 backoff_ms = 10
+{files}
+{nextra}
 [approval]
 listen = "{listen}"
 external_url = "{ext}"
+trusted_proxies = {proxies}
 [approval.oidc]
 issuer = "{iss}"
 client_id = "client-abc"
 client_secret_file = "{d}/oidc-secret"
 owner_emails = ["owner@example.com"]
-session_ttl_secs = 3600
+session_ttl_secs = {ttl}
 
 [[secret]]
 name = "db-password"
@@ -188,6 +206,15 @@ allow_exes = ["{psql}"]
         d = dir.display(),
         t = o.timeout_secs,
         limits = o.limits,
+        files = if o.notify_kind == "webhook" {
+            format!("hmac_secret_file = \"{}/hmac.key\"", dir.display())
+        } else {
+            format!("auth_token_file = \"{}/ntfy.token\"", dir.display())
+        },
+        nkind = o.notify_kind,
+        nextra = o.notify_extra,
+        proxies = o.trusted_proxies,
+        ttl = o.session_ttl_secs,
         nurl = o.notify_url,
         listen = o.listen,
         ext = o.external_url,
@@ -202,6 +229,8 @@ impl Harness {
         let dir = tempfile::tempdir().unwrap();
         let text = config_text(dir.path(), &o);
         std::fs::write(dir.path().join("oidc-secret"), "client-secret-value\n").unwrap();
+        std::fs::write(dir.path().join("ntfy.token"), "ntfy-token-value\n").unwrap();
+        std::fs::write(dir.path().join("hmac.key"), "hmac-key-value\n").unwrap();
         let cfg = Config::parse(&text, &NoNames).unwrap();
 
         let store_path = dir.path().join("store.age");
@@ -229,9 +258,13 @@ impl Harness {
             gid: 100,
             pid: PID,
         }));
-        let n: Arc<dyn Notifier> = o.notifier.unwrap_or_else(|| notifier.clone());
+        let n: Arc<dyn Notifier> = match (o.notifier, o.notifier_from_cfg) {
+            (Some(n), _) => n,
+            (None, Some(f)) => f(&cfg),
+            (None, None) => notifier.clone(),
+        };
         let p: Arc<dyn ProcReader> = o.procs.unwrap_or_else(|| procs.clone());
-        let core = Core::new(cfg, audit, n, p);
+        let core = Core::new(cfg.clone(), audit, n, p);
 
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).unwrap();
@@ -251,6 +284,7 @@ impl Harness {
             procs,
             notifier,
             config_text: text,
+            cfg,
         }
     }
 

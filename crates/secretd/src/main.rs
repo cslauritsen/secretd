@@ -3,7 +3,8 @@ use clap::Parser;
 use secret_proto::config::{Config, SystemResolver};
 use secretd::audit::Audit;
 use secretd::core::Core;
-use secretd::notify::NullNotifier;
+use secretd::notify_http::HttpNotifier;
+use secretd::oidc::OidcClient;
 use secretd::peer::RealPeerCred;
 use secretd::procinfo::RealProcReader;
 use secretd::{runtime, server};
@@ -79,7 +80,24 @@ async fn main() -> Result<()> {
 
     let audit = Audit::open(&cfg.daemon.audit_log)
         .with_context(|| format!("opening audit log {}", cfg.daemon.audit_log.display()))?;
-    let core = Core::new(cfg, audit, Arc::new(NullNotifier), Arc::new(RealProcReader));
+    let notifier = HttpNotifier::new(&cfg.notify).context("setting up notifier")?;
+    let client_secret =
+        secret_proto::config::read_secret_file(&cfg.approval.oidc.client_secret_file)
+            .map_err(|e| anyhow!("{e}"))?;
+    let oidc = Arc::new(OidcClient::new(cfg.approval.oidc.clone(), client_secret)?);
+    let approval_cfg = cfg.approval.clone();
+    let core = Core::new(cfg, audit, Arc::new(notifier), Arc::new(RealProcReader));
+    let http_listener = tokio::net::TcpListener::bind(approval_cfg.listen)
+        .await
+        .with_context(|| format!("binding approval endpoint {}", approval_cfg.listen))?;
+    tracing::info!(
+        "approval endpoint on {} (plain HTTP; terminate TLS in a reverse proxy)",
+        approval_cfg.listen
+    );
+    tokio::spawn(secretd::approval::serve(
+        http_listener,
+        secretd::approval::router(core.clone(), approval_cfg, oidc),
+    ));
     let peer: Arc<dyn secretd::peer::PeerCredProvider> = Arc::new(RealPeerCred);
     tokio::spawn(server::serve_clients(core.clone(), client_l, peer.clone()));
     tokio::spawn(server::serve_admin(core.clone(), admin_l, peer));

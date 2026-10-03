@@ -33,6 +33,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize.workspace = true
 
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+hmac = "0.12"
+sha2 = "0.10"
+openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+url = "2"
+
 [dev-dependencies]
 tempfile.workspace = true
 secret-client = { path = "../secret-client" }
+jsonwebtoken = "9"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json", "form"] }

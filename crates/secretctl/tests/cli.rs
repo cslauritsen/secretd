@@ -239,3 +239,130 @@ fn check_config() {
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("writable"));
 }
+
+// ------------------------------------------------------------ admin socket
+
+mod admin {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+
+    /// A fake admin server that serves one connection and records requests.
+    fn fake_server(
+        dir: &Path,
+        replies: Vec<serde_json::Value>,
+    ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
+        let l = UnixListener::bind(dir.join("a.sock")).unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut rd = BufReader::new(s.try_clone().unwrap());
+            let mut wr = s;
+            let mut seen = Vec::new();
+            for reply in replies {
+                let mut line = String::new();
+                if rd.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let mut resp = reply;
+                resp["jsonrpc"] = "2.0".into();
+                resp["id"] = req["id"].clone();
+                seen.push(req);
+                wr.write_all(format!("{resp}\n").as_bytes()).unwrap();
+            }
+            seen
+        })
+    }
+
+    #[test]
+    fn pending_lists_requests() {
+        let e = Env::new();
+        let srv = fake_server(
+            e.dir.path(),
+            vec![serde_json::json!({"result": {"pending": [{
+                "request_id": "abc123", "secret_name": "db", "uid": 1000, "username": "alice",
+                "pid": 77, "exe": "/usr/bin/psql", "cmdline": "psql -h x",
+                "reason": "backup", "expires_at": "2030-01-01T00:00:00Z"}]}})],
+        );
+        let sock = e.path("a.sock").display().to_string();
+        let o = e.run(&["--admin-socket", &sock, "pending"], None);
+        ok(&o);
+        let out = String::from_utf8_lossy(&o.stdout).to_string();
+        assert!(out.contains("abc123") && out.contains("db") && out.contains("alice"));
+        assert!(out.contains("reason (client-supplied, untrusted): backup"));
+        let seen = srv.join().unwrap();
+        assert_eq!(seen[0]["method"], "admin.pending");
+    }
+
+    #[test]
+    fn approve_sends_passphrase_and_reports_errors() {
+        let e = Env::new();
+        let srv = fake_server(
+            e.dir.path(),
+            vec![serde_json::json!({"result": {"ok": true}})],
+        );
+        let sock = e.path("a.sock").display().to_string();
+        let pf = e.pf();
+        ok(&e.run(
+            &[
+                "--admin-socket",
+                &sock,
+                "--passphrase-file",
+                &pf,
+                "approve",
+                "abc123",
+            ],
+            None,
+        ));
+        let seen = srv.join().unwrap();
+        assert_eq!(seen[0]["method"], "admin.approve");
+        assert_eq!(seen[0]["params"]["request_id"], "abc123");
+        assert_eq!(seen[0]["params"]["passphrase"], "pw-one");
+
+        std::fs::remove_file(e.path("a.sock")).unwrap();
+        let srv = fake_server(
+            e.dir.path(),
+            vec![
+                serde_json::json!({"error": {"code": -32006, "message": "wrong passphrase",
+                "data": {"kind": "DECRYPT_FAILED", "remaining_attempts": 2}}}),
+            ],
+        );
+        let o = e.run(
+            &[
+                "--admin-socket",
+                &sock,
+                "--passphrase-file",
+                &pf,
+                "approve",
+                "abc123",
+            ],
+            None,
+        );
+        assert!(!o.status.success());
+        assert!(String::from_utf8_lossy(&o.stderr).contains("wrong passphrase"));
+        srv.join().unwrap();
+    }
+
+    #[test]
+    fn deny_sends_request_id() {
+        let e = Env::new();
+        let srv = fake_server(
+            e.dir.path(),
+            vec![serde_json::json!({"result": {"ok": true}})],
+        );
+        let sock = e.path("a.sock").display().to_string();
+        ok(&e.run(&["--admin-socket", &sock, "deny", "abc123"], None));
+        let seen = srv.join().unwrap();
+        assert_eq!(seen[0]["method"], "admin.deny");
+        assert_eq!(seen[0]["params"]["request_id"], "abc123");
+    }
+
+    #[test]
+    fn missing_socket_is_a_clear_error() {
+        let e = Env::new();
+        let sock = e.path("nope.sock").display().to_string();
+        let o = e.run(&["--admin-socket", &sock, "pending"], None);
+        assert!(!o.status.success());
+        assert!(String::from_utf8_lossy(&o.stderr).contains("admin socket"));
+    }
+}

@@ -77,3 +77,47 @@ Choices the specification left open, recorded as simply as possible.
   `LISTEN_FDNAMES` `secretd`/`admin`, else fd 3 is the client socket) while privileged, then
   root is dropped to `daemon.user`, then the audit log is opened. Config reload (SIGHUP)
   swaps ACLs, limits and timeouts; listen addresses, notifier and OIDC settings need a restart.
+
+## Notification, approval endpoint, admin socket (milestone 3)
+
+- ntfy: `POST <url>` with `Title` (ASCII-only), `Priority` (config, default `high`),
+  `Tags: lock`, `Click` (approval URL) and optional `Authorization: Bearer <token from
+  auth_token_file>`. The plain-text body lists secret, request id, caller, exe, cmdline, the
+  client reason (labelled untrusted), expiry and the approval URL. Retries: `attempts` (default
+  3) with exponential backoff starting at `backoff_ms` (default 500 ms). Non-2xx counts as failure.
+  Errors are logged with `without_url()` so topic URLs do not reach logs.
+- Webhook: JSON body (same fields, `reason_source` marks the reason as untrusted) with
+  `X-Secretd-Signature: sha256=<hex HMAC-SHA256>` when `hmac_secret_file` is configured.
+- Approval server: axum 0.8 on plain HTTP; `Host` must equal the host (and port, if any) of
+  `external_url` for every route except `/healthz`. Cookies use the `__Host-` prefix, always
+  `Secure; HttpOnly; SameSite=Lax; Path=/`, independent of the incoming scheme.
+- Source IP: `X-Forwarded-For` is honoured only when the TCP peer is in `trusted_proxies`; the
+  header is walked from the right skipping trusted proxies, so leading (spoofable) entries are
+  ignored.
+- Failed-attempt limiter: 5 per minute per source IP (configurable via
+  `approval.max_failed_attempts_per_min`) then 429 + `Retry-After`. Counted failures: unknown
+  or expired request id, bad approval token, bad CSRF, wrong passphrase, failed/forbidden OIDC
+  callbacks.
+- Unknown, expired, cancelled and already-resolved request URLs all return 410 Gone (so they are
+  indistinguishable); a wrong token for a live request returns a generic 403.
+- Token handling: the approval token lives only in memory and in the push message; it is not in
+  the audit log. It is compared in constant time (`subtle`) before the OIDC redirect, so the
+  login flow is only started for URLs that carry a valid token. It travels through the login
+  redirect as a validated `next` parameter (strict `/approve/<32 hex>?t=<token chars>` format; any
+  other value is rejected, so there is no open redirect).
+- CSRF token: `HMAC-SHA256(per-process random key, "csrf|<session id>|<request id>")`, issued by
+  the GET and verified on POST; stateless.
+- OIDC: discovery and JWKS are fetched lazily on first login, cached for 1 h and refreshed once
+  (at most every 30 s) after a failed verification to survive key rotation. Login state
+  (PKCE verifier, nonce, `next`) is server-side, single-use, 10 min TTL, bound to the browser by a
+  login cookie equal to `state`. Access/refresh tokens are dropped immediately after the ID token
+  is extracted. `amr`, if present, is written to the audit log (`detail`) and never trusted.
+- Auth outcomes are audited as `admin_action` with `outcome` `oidc_login` / `oidc_rejected` /
+  `bad_approval_token` / `bad_csrf` (the spec's event list has no dedicated auth events).
+- The passphrase arrives in a form body; the HTTP stack makes short-lived copies that are not
+  zeroized (the copy handed to the store is). This is a known gap.
+- Admin socket: JSON-RPC (`admin.pending`, `admin.approve`, `admin.deny`); each call is audited as
+  `admin_action`. `secretctl approve` re-prompts on wrong passphrase when interactive, and
+  makes a single attempt with `--passphrase-file`.
+- Tests use RSA key pairs committed under `crates/secretd/tests/common/keys/` that exist only for
+  the mock OIDC provider; they protect nothing.
