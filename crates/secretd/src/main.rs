@@ -22,23 +22,54 @@ struct Args {
     check: bool,
 }
 
-fn trusted_uids(cfg_user: &str) -> Vec<u32> {
-    let mut v = vec![0, nix::unistd::geteuid().as_raw()];
-    if let Ok(Some(u)) = nix::unistd::User::from_name(cfg_user) {
-        v.push(u.uid.as_raw());
-    }
-    v
-}
-
 fn load_config(path: &std::path::Path) -> Result<Config> {
-    // The daemon user is not known before parsing; accept root, the daemon's
-    // default user and ourselves as owners.
-    let uids = trusted_uids("secretd");
+    // Owners accepted: root, the invoking user, and the daemon user named in
+    // the file itself (`daemon.user`).
+    let uids = [0, nix::unistd::geteuid().as_raw()];
     Config::load(path, &uids, &SystemResolver).map_err(|e| anyhow!("{e}"))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Few threads on purpose: the unit sets TasksMax, and the only blocking
+    // work is one scrypt unseal at a time plus the odd name lookup.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .max_blocking_threads(8)
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?
+        .block_on(run())
+}
+
+/// File descriptors the daemon may need at the configured limits: a socket
+/// and a pidfd per client connection, the approval connections, plus headroom
+/// for listeners, the audit log, the store and outbound notification calls.
+fn nofile_needed(cfg: &Config) -> u64 {
+    2 * cfg.limits.max_conns_total as u64 + cfg.approval.max_connections as u64 + 64
+}
+
+fn warn_if_nofile_low(cfg: &Config) {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rl` is a valid out-pointer for getrlimit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+        let need = nofile_needed(cfg);
+        #[allow(clippy::unnecessary_cast)] // rlim_t is u32 on 32-bit targets
+        let cur = rl.rlim_cur as u64;
+        if cur < need {
+            tracing::warn!(
+                "RLIMIT_NOFILE is {} but the configured limits can need {need} descriptors; \
+                 raise LimitNOFILE= in the unit or lower limits.max_conns_total / \
+                 approval.max_connections",
+                rl.rlim_cur
+            );
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -55,6 +86,7 @@ async fn main() -> Result<()> {
     for w in &cfg.warnings {
         tracing::warn!("config: {w}");
     }
+    warn_if_nofile_low(&cfg);
     if args.check {
         println!("configuration OK");
         return Ok(());
@@ -67,7 +99,11 @@ async fn main() -> Result<()> {
         None => {
             let l = runtime::bind_unix(&cfg.daemon.socket, cfg.daemon.socket_mode)?;
             if nix::unistd::geteuid().is_root() {
-                runtime::chown_to_user(&cfg.daemon.socket, &cfg.daemon.user)?;
+                runtime::chown_to_user(
+                    &cfg.daemon.socket,
+                    &cfg.daemon.user,
+                    cfg.daemon.socket_group.as_deref(),
+                )?;
             }
             l
         }

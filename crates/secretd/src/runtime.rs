@@ -88,11 +88,23 @@ pub fn bind_unix(path: &Path, mode: u32) -> io::Result<UnixListener> {
     Ok(l)
 }
 
-pub fn chown_to_user(path: &Path, user: &str) -> io::Result<()> {
+/// Give `path` to `user`, and to `group` if given (else the user's primary
+/// group). The client socket uses a dedicated group so that connecting to it
+/// does not imply any access to the daemon's credential files.
+pub fn chown_to_user(path: &Path, user: &str, group: Option<&str>) -> io::Result<()> {
     let u = nix::unistd::User::from_name(user)
         .map_err(io::Error::other)?
         .ok_or_else(|| io::Error::other(format!("no such user {user:?}")))?;
-    nix::unistd::chown(path, Some(u.uid), Some(u.gid)).map_err(io::Error::other)
+    let gid = match group {
+        Some(g) => {
+            nix::unistd::Group::from_name(g)
+                .map_err(io::Error::other)?
+                .ok_or_else(|| io::Error::other(format!("no such group {g:?}")))?
+                .gid
+        }
+        None => u.gid,
+    };
+    nix::unistd::chown(path, Some(u.uid), Some(gid)).map_err(io::Error::other)
 }
 
 /// If running as root, drop to `user` (supplementary groups included) and

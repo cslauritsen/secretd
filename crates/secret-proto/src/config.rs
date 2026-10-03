@@ -128,6 +128,12 @@ pub struct DaemonCfg {
     pub request_timeout_secs: u64,
     /// Mode of the client socket: 0o660 or 0o666 (`socket_mode = 0o660`).
     pub socket_mode: u32,
+    /// Group that owns the client socket when secretd binds it itself (under
+    /// systemd the `.socket` unit's `SocketGroup=` decides). Members of this
+    /// group may connect; give it a dedicated group (`secretd-clients`), not
+    /// the group that can read the daemon's credential files. Default: the
+    /// daemon user's primary group.
+    pub socket_group: Option<String>,
 }
 
 impl Default for DaemonCfg {
@@ -140,6 +146,7 @@ impl Default for DaemonCfg {
             audit_log: "/var/log/secretd/audit.jsonl".into(),
             request_timeout_secs: 300,
             socket_mode: 0o660,
+            socket_group: None,
         }
     }
 }
@@ -378,6 +385,12 @@ impl Config {
                 return err(format!("daemon.{n} must be an absolute path"));
             }
         }
+        if d.socket_group
+            .as_deref()
+            .is_some_and(|g| g.trim().is_empty())
+        {
+            return err("daemon.socket_group must not be empty");
+        }
         if d.socket_mode == 0o666 {
             warnings.push(
                 "daemon.socket_mode is 0o666: any local user can connect (ACLs still apply)".into(),
@@ -608,17 +621,37 @@ impl Config {
         })
     }
 
-    /// Read, permission-check and parse a config file.  `trusted_uids` are the
-    /// uids allowed to own the file (normally root and the daemon user).
+    /// Read, permission-check and parse a config file.
+    ///
+    /// The file must be owned by one of `trusted_uids` (callers pass root and
+    /// their own euid) or by the daemon user named *in the file* (`daemon.user`,
+    /// default `secretd`), and must not be group/world writable. The file is
+    /// opened once and the checks use that descriptor, so the file that was
+    /// checked is the file that was read. Naming the daemon user inside the
+    /// file is circular by nature: the path itself must be one only the
+    /// administrator can write (`/etc/secretd`); the check catches
+    /// misconfigured ownership, it is not a defence against a hostile path.
     pub fn load(
         path: &Path,
         trusted_uids: &[u32],
         resolver: &dyn NameResolver,
     ) -> Result<Config, ConfigError> {
-        check_file_perms(path, trusted_uids)?;
-        let text = std::fs::read_to_string(path)
+        use std::io::Read;
+        let mut f = std::fs::File::open(path)
             .map_err(|e| ConfigError(format!("cannot read {}: {e}", path.display())))?;
-        Config::parse(&text, resolver)
+        let md = f
+            .metadata()
+            .map_err(|e| ConfigError(format!("cannot stat {}: {e}", path.display())))?;
+        let mut text = String::new();
+        f.read_to_string(&mut text)
+            .map_err(|e| ConfigError(format!("cannot read {}: {e}", path.display())))?;
+        let cfg = Config::parse(&text, resolver)?;
+        let mut uids = trusted_uids.to_vec();
+        if let Some(u) = resolver.uid(&cfg.daemon.user) {
+            uids.push(u);
+        }
+        check_metadata_perms(path, &md, &uids)?;
+        Ok(cfg)
     }
 
     pub fn secret(&self, name: &str) -> Option<&SecretAcl> {
@@ -639,9 +672,17 @@ fn issuer_is_loopback(u: &url::Url) -> bool {
 pub fn check_file_perms(path: &Path, trusted_uids: &[u32]) -> Result<(), ConfigError> {
     let md = std::fs::metadata(path)
         .map_err(|e| ConfigError(format!("cannot stat {}: {e}", path.display())))?;
+    check_metadata_perms(path, &md, trusted_uids)
+}
+
+fn check_metadata_perms(
+    path: &Path,
+    md: &std::fs::Metadata,
+    trusted_uids: &[u32],
+) -> Result<(), ConfigError> {
     if !trusted_uids.contains(&md.uid()) {
         return err(format!(
-            "{} is owned by uid {}, expected root or the secretd user",
+            "{} is owned by uid {}, expected root, the invoking user or the daemon user (daemon.user)",
             path.display(),
             md.uid()
         ));
@@ -863,6 +904,52 @@ owner_emails = ["Owner@Example.com"]
         assert_eq!(c.daemon.socket_mode, 0o660);
         assert_eq!(c.approval.external_host, "secretd.example.com");
         assert_eq!(c.notify.attempts, 3);
+    }
+
+    #[test]
+    fn ownership_check_uses_the_configured_daemon_user() {
+        use std::os::unix::fs::PermissionsExt;
+        // Needs root to give the file to another uid.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("not root; skipping");
+            return;
+        }
+        struct Svc;
+        impl NameResolver for Svc {
+            fn uid(&self, n: &str) -> Option<u32> {
+                (n == "svc").then_some(54321)
+            }
+            fn gid(&self, _: &str) -> Option<u32> {
+                None
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.toml");
+        let write = |daemon_user: &str| {
+            std::fs::write(&p, format!("[daemon]\nuser = \"{daemon_user}\"\n{}", BASE)).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+            std::os::unix::fs::chown(&p, Some(54321), None).unwrap();
+        };
+        // Owned by `svc`, which is the configured daemon user: accepted even
+        // though only root is passed as trusted (no hard-coded "secretd").
+        write("svc");
+        assert!(Config::load(&p, &[0], &Svc).is_ok());
+        // Same owner but the file names a different daemon user: rejected.
+        write("other");
+        let e = Config::load(&p, &[0], &Svc).unwrap_err();
+        assert!(e.0.contains("owned by uid 54321"), "{e}");
+        // A file owned by a user called "secretd" is no longer special.
+        struct Secretd;
+        impl NameResolver for Secretd {
+            fn uid(&self, n: &str) -> Option<u32> {
+                (n == "secretd").then_some(54321)
+            }
+            fn gid(&self, _: &str) -> Option<u32> {
+                None
+            }
+        }
+        write("svc");
+        assert!(Config::load(&p, &[0], &Secretd).is_err());
     }
 
     #[test]

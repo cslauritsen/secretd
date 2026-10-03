@@ -366,3 +366,94 @@ mod admin {
         assert!(String::from_utf8_lossy(&o.stderr).contains("admin socket"));
     }
 }
+
+#[test]
+fn root_run_hands_the_store_to_the_daemon_user() {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("not root; skipping");
+        return;
+    }
+    // Any existing unprivileged account will do as the "daemon user".
+    let nobody = std::process::Command::new("id")
+        .args(["-u", "nobody"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let Some(nobody) = nobody else {
+        eprintln!("no 'nobody' user; skipping");
+        return;
+    };
+    let e = Env::new();
+    let cfg = std::fs::read_to_string(e.path("config.toml"))
+        .unwrap()
+        .replace("[daemon]\n", "[daemon]\nuser = \"nobody\"\n");
+    std::fs::write(e.path("config.toml"), cfg).unwrap();
+    let pf = e.pf();
+    let owner = |e: &Env| std::fs::metadata(e.path("store.age")).unwrap().uid();
+
+    let o = e.run(&["--passphrase-file", &pf, "init"], None);
+    ok(&o);
+    assert_eq!(owner(&e), nobody, "init");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("running as root"));
+    ok(&e.run(&["--passphrase-file", &pf, "add", "db"], Some(b"v1\n")));
+    assert_eq!(owner(&e), nobody, "add");
+    let p2 = e.path("pass2").display().to_string();
+    ok(&e.run(
+        &[
+            "--passphrase-file",
+            &pf,
+            "--new-passphrase-file",
+            &p2,
+            "rotate-passphrase",
+        ],
+        None,
+    ));
+    assert_eq!(owner(&e), nobody, "rotate-passphrase");
+    ok(&e.run(&["--passphrase-file", &p2, "remove", "db"], None));
+    assert_eq!(owner(&e), nobody, "remove");
+    assert_eq!(
+        std::fs::metadata(e.path("store.age")).unwrap().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn check_config_flags_credentials_readable_by_the_socket_group() {
+    use std::os::unix::fs::MetadataExt;
+    let e = Env::new();
+    let gid = std::fs::metadata(e.path("oidc-secret")).unwrap().gid();
+    // Resolve the file's group name via the system database.
+    let name = std::process::Command::new("getent")
+        .args(["group", &gid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.split(':').next().map(str::to_string))
+        .filter(|s| !s.is_empty());
+    let Some(group) = name else {
+        eprintln!("cannot resolve group name; skipping");
+        return;
+    };
+    let cfg = std::fs::read_to_string(e.path("config.toml"))
+        .unwrap()
+        .replace(
+            "[daemon]\n",
+            &format!("[daemon]\nsocket_group = \"{group}\"\n"),
+        );
+    std::fs::write(e.path("config.toml"), cfg).unwrap();
+    // Owner-only: fine. Group-readable by the socket group: flagged.
+    let o = e.run(&["check-config"], None);
+    ok(&o);
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("client socket group"));
+    std::fs::set_permissions(
+        e.path("oidc-secret"),
+        std::fs::Permissions::from_mode(0o640),
+    )
+    .unwrap();
+    let o = e.run(&["check-config"], None);
+    ok(&o);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("client socket group"));
+}

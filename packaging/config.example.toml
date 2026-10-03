@@ -1,7 +1,9 @@
 # /etc/secretd/config.toml
 #
 # Ownership: root:secretd, mode 0640 (secretd refuses a config that is not owned by
-# root or the secretd user, or that is group/world writable).
+# root, the invoking user or `daemon.user`, or that is group/world writable). The config
+# holds no credentials; the files it points to (tokens, OIDC client secret) are
+# secretd:secretd 0400, NOT readable by the socket group secretd-clients.
 # Reload ACLs, limits and timeouts with `systemctl reload secretd` (SIGHUP). Changes to
 # sockets, the listen address, notifier and OIDC settings need a restart.
 
@@ -13,9 +15,12 @@ store = "/var/lib/secretd/store.age"
 audit_log = "/var/log/secretd/audit.jsonl"
 # Server-side maximum (and default) wait for owner approval, in seconds.
 request_timeout_secs = 300
-# Client socket mode when secretd binds the socket itself (ignored under socket
-# activation, where the .socket unit decides). 0o660 or 0o666.
+# Client socket mode and group when secretd binds the socket itself (both ignored
+# under socket activation, where the .socket unit decides: SocketMode=/SocketGroup=).
+# Members of socket_group may connect. Use a dedicated group, never the group that can
+# read /etc/secretd. 0o660 or 0o666.
 socket_mode = 0o660
+socket_group = "secretd-clients"
 
 [limits]
 max_pending_per_uid = 3
@@ -24,12 +29,19 @@ max_gets_per_uid_per_min = 10
 max_conns_per_uid = 8
 max_conns_total = 128
 idle_timeout_secs = 30
+# A client connection is closed after this many rejections (rate limit, ACL miss,
+# changed caller, malformed request) that never reached the owner.
+max_rejections_per_conn = 8
+# Idle timeout of an admin socket connection (`secretctl approve` waits for you to
+# type the passphrase on this connection).
+admin_idle_timeout_secs = 600
 
 [notify]
 # "ntfy" (POST to a topic URL) or "webhook" (JSON POST, optionally HMAC signed).
 kind = "ntfy"
 url = "https://ntfy.example.com/secretd-alerts"
-# Bearer token for ntfy, read from a file (never inline). root:secretd 0640.
+# Bearer token for ntfy, read from a file (never inline). Owned by secretd, mode 0400
+# (or deliver it with systemd LoadCredential=): only the daemon user may read it.
 auth_token_file = "/etc/secretd/ntfy.token"
 # For kind = "webhook": file with the HMAC-SHA256 key used for X-Secretd-Signature.
 # hmac_secret_file = "/etc/secretd/webhook.key"
@@ -49,10 +61,18 @@ trusted_proxies = ["127.0.0.1/32", "::1/128"]
 # allow_non_loopback = true
 # Failed approval/login attempts per source IP per minute before HTTP 429.
 max_failed_attempts_per_min = 5
+# /auth/login starts per source IP per minute before HTTP 429.
+max_login_starts_per_min = 10
+# Connection cap, header-read timeout and per-request timeout of the listener. The
+# request timeout must comfortably exceed one scrypt unseal (about 1 s by default).
+max_connections = 64
+header_read_timeout_secs = 10
+request_timeout_secs = 30
 
 [approval.oidc]
 issuer = "https://accounts.google.com"
 client_id = "xxxxxxxx.apps.googleusercontent.com"
+# secretd:secretd 0400
 client_secret_file = "/etc/secretd/oidc-client-secret"
 # Defaults to <external_url>/auth/callback; must be registered in Google Cloud Console.
 redirect_url = "https://secretd.example.com/auth/callback"

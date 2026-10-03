@@ -27,9 +27,20 @@ pub fn run(cli: &Cli) -> Result<()> {
     if let Some(p) = &cfg.notify.hmac_secret_file {
         secret_files.push(("notify.hmac_secret_file", p));
     }
+    let socket_gid = cfg.daemon.socket_group.as_deref().and_then(|g| {
+        secret_proto::config::NameResolver::gid(&secret_proto::config::SystemResolver, g)
+    });
     for (label, p) in secret_files {
         match std::fs::metadata(p) {
             Ok(md) => {
+                if socket_gid == Some(md.gid()) && md.mode() & 0o040 != 0 {
+                    warnings.push(format!(
+                        "{label} {} is readable by the client socket group (gid {}): every member \
+                         allowed to connect could read it; make it owner-only (0400)",
+                        p.display(),
+                        md.gid()
+                    ));
+                }
                 if md.mode() & 0o077 != 0 {
                     warnings.push(format!(
                         "{label} {} is accessible by group/others (mode {:o}); use 0600/0640",

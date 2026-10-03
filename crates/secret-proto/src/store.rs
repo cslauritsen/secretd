@@ -31,11 +31,19 @@ pub enum StoreError {
     Corrupt,
     #[error("unsupported store format")]
     Format,
+    #[error("store requires an excessive scrypt work factor (limit 2^{MAX_WORK_FACTOR})")]
+    ExcessiveWork,
     #[error("no such secret")]
     NoSuchSecret,
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+/// Largest scrypt work factor (log2 N) the daemon will compute on decrypt. At
+/// r = 8, N = 2^22 needs 4 GiB of memory and tens of seconds: far above what
+/// a store written by `secretctl` uses (age's default is 2^18, about 256 MiB),
+/// and a hostile or corrupted store must not be able to demand more.
+pub const MAX_WORK_FACTOR: u8 = 22;
 
 /// One stored secret. The value is zeroized on drop.
 #[derive(Serialize, Deserialize)]
@@ -122,6 +130,10 @@ fn to_secret(p: &Passphrase) -> SecretString {
 }
 
 fn encrypt(plain: &[u8], pass: &Passphrase, wf: WorkFactor) -> Result<Vec<u8>, StoreError> {
+    if wf.is_some_and(|n| n > MAX_WORK_FACTOR) {
+        // A store we could not open again.
+        return Err(StoreError::ExcessiveWork);
+    }
     let mut recipient = age::scrypt::Recipient::new(to_secret(pass));
     if let Some(n) = wf {
         recipient.set_work_factor(n);
@@ -143,11 +155,12 @@ fn decrypt(cipher: &[u8], pass: &Passphrase) -> Result<Zeroizing<Vec<u8>>, Store
         return Err(StoreError::Format);
     }
     let mut ident = age::scrypt::Identity::new(to_secret(pass));
-    ident.set_max_work_factor(26);
+    ident.set_max_work_factor(MAX_WORK_FACTOR);
     let mut reader = dec
         .decrypt(std::iter::once(&ident as &dyn age::Identity))
         .map_err(|e| match e {
             age::DecryptError::DecryptionFailed => StoreError::WrongPassphrase,
+            age::DecryptError::ExcessiveWork { .. } => StoreError::ExcessiveWork,
             _ => StoreError::Format,
         })?;
     // Capacity is at least the ciphertext length so reading never reallocates
@@ -319,6 +332,44 @@ mod tests {
         s.insert("c", Entry::from_bytes(b"gamma-value"));
         save(&path, &pw("correct horse"), &s, WF).unwrap();
         path
+    }
+
+    /// A syntactically valid age scrypt header demanding work factor 2^`log_n`.
+    /// age checks the factor before running scrypt, so this is cheap to read.
+    fn hostile_store(log_n: u8) -> Vec<u8> {
+        let mut v = b"age-encryption.org/v1\n-> scrypt AAAAAAAAAAAAAAAAAAAAAA ".to_vec();
+        v.extend_from_slice(log_n.to_string().as_bytes());
+        v.extend_from_slice(b"\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n--- ");
+        v.extend_from_slice(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n");
+        v.extend_from_slice(&[0u8; 64]);
+        v
+    }
+
+    #[test]
+    fn excessive_work_factor_is_refused_before_any_scrypt_runs() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("store.age");
+        // 2^26 was the old limit (64 GiB of scrypt memory); 2^23 is over the new one.
+        for n in [23u8, 26] {
+            std::fs::write(&path, hostile_store(n)).unwrap();
+            let t0 = std::time::Instant::now();
+            let r = load(&path, &pw("x"));
+            assert!(matches!(r, Err(StoreError::ExcessiveWork)), "2^{n}: {r:?}");
+            assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+            let mut p = pw("x");
+            let r = unseal_one(&path, &mut p, "a");
+            assert!(matches!(r, Err(StoreError::ExcessiveWork)));
+        }
+    }
+
+    #[test]
+    fn work_factor_limit_is_22_and_enforced_on_write() {
+        assert_eq!(MAX_WORK_FACTOR, 22);
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("store.age");
+        let r = create(&path, &pw("x"), Some(23));
+        assert!(matches!(r, Err(StoreError::ExcessiveWork)));
+        assert!(!path.exists());
     }
 
     #[test]

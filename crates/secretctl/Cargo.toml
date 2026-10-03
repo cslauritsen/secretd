@@ -16,6 +16,7 @@ clap.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
 libc.workspace = true
+nix = { version = "0.29", default-features = false, features = ["user", "fs"] }
 rpassword = "7"
 
 [dev-dependencies]

@@ -13,6 +13,7 @@ pub fn init(cli: &Cli) -> Result<()> {
     }
     let pass = new_passphrase(cli.passphrase_file.as_ref(), "New store passphrase")?;
     store::create(&path, &pass, cli.work_factor).context("creating store")?;
+    fix_store_owner(cli, &path);
     eprintln!("created empty store {}", path.display());
     Ok(())
 }
@@ -32,6 +33,7 @@ pub fn add(cli: &Cli, name: &str, file: Option<&Path>) -> Result<()> {
     let existed = secrets.get(name).is_some();
     secrets.insert(name, Entry::from_bytes(&value));
     store::save(&path, &pass, &secrets, cli.work_factor).context("writing store")?;
+    fix_store_owner(cli, &path);
     eprintln!(
         "{} secret {name:?}",
         if existed { "replaced" } else { "added" }
@@ -52,6 +54,7 @@ pub fn remove(cli: &Cli, name: &str) -> Result<()> {
         bail!("no such secret {name:?} in the store");
     }
     store::save(&path, &pass, &secrets, cli.work_factor).context("writing store")?;
+    fix_store_owner(cli, &path);
     eprintln!("removed secret {name:?}");
     Ok(())
 }
@@ -109,6 +112,7 @@ pub fn rotate(cli: &Cli) -> Result<()> {
         bail!("new passphrase is identical to the old one");
     }
     store::save(&path, &new, &secrets, cli.work_factor).context("writing store")?;
+    fix_store_owner(cli, &path);
     eprintln!(
         "re-encrypted {} secret(s) under the new passphrase",
         secrets.len()

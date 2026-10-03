@@ -37,6 +37,28 @@ fn service_unit_is_hardened() {
     // users' /proc/<pid>/exe; nothing else may be granted.
     assert!(has_line(&s, "CapabilityBoundingSet=CAP_SYS_PTRACE"));
     assert!(has_line(&s, "AmbientCapabilities=CAP_SYS_PTRACE"));
+    // Same-uid memory/descriptor access is blocked even though the daemon keeps
+    // CAP_SYS_PTRACE, and the unit bounds descriptors, memory and tasks.
+    assert!(has_line(
+        &s,
+        "SystemCallFilter=~ptrace process_vm_readv process_vm_writev pidfd_getfd"
+    ));
+    let limit = |key: &str| -> String {
+        s.lines()
+            .find_map(|l| l.trim().strip_prefix(key))
+            .unwrap_or_else(|| panic!("service unit lacks {key}"))
+            .to_string()
+    };
+    // Default config: 2 fds per connection (socket + pidfd) for 128 connections,
+    // 64 approval connections, 64 headroom.
+    let nofile: u64 = limit("LimitNOFILE=").parse().unwrap();
+    assert!(
+        nofile >= 2 * 128 + 64 + 64,
+        "LimitNOFILE={nofile} has no headroom"
+    );
+    assert!(!limit("LimitMEMLOCK=").is_empty());
+    assert!(!limit("MemoryMax=").is_empty());
+    assert!(!limit("TasksMax=").is_empty());
     for forbidden in [
         "PrivateUsers=yes",
         "ProtectProc=invisible",
@@ -52,6 +74,10 @@ fn socket_units() {
     assert!(has_line(&c, "ListenStream=/run/secretd/secretd.sock"));
     assert!(has_line(&c, "FileDescriptorName=secretd"));
     assert!(has_line(&c, "SocketMode=0660"));
+    // A dedicated group, distinct from the daemon's own group (which can read
+    // /etc/secretd).
+    assert!(has_line(&c, "SocketGroup=secretd-clients"));
+    assert!(!has_line(&c, "SocketGroup=secretd"));
     let a = read("secretd-admin.socket");
     assert!(has_line(&a, "ListenStream=/run/secretd/admin.sock"));
     assert!(has_line(&a, "FileDescriptorName=admin"));
@@ -67,4 +93,22 @@ fn proxy_examples_forward_only_the_documented_paths() {
     assert!(n.contains("return 404;"));
     let c = read("Caddyfile.example");
     assert!(c.contains("/approve/* /auth/* /healthz"));
+}
+
+#[test]
+fn clients_group_is_dedicated() {
+    let su = read("sysusers.d/secretd.conf");
+    assert!(su.lines().any(|l| l.trim() == "g secretd-clients -"));
+    // The daemon user must not be a member of the clients group.
+    assert!(!su
+        .lines()
+        .any(|l| l.starts_with("m secretd secretd-clients")));
+    let cfg = read("config.example.toml");
+    assert!(cfg.contains("socket_group = \"secretd-clients\""));
+    // Credential files are for the daemon user only.
+    assert!(cfg.contains("secretd:secretd 0400") || cfg.contains("mode 0400"));
+    assert!(
+        !cfg.contains("root:secretd 0640 ("),
+        "credential files must not be group-readable"
+    );
 }
