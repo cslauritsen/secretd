@@ -121,3 +121,21 @@ Choices the specification left open, recorded as simply as possible.
   makes a single attempt with `--passphrase-file`.
 - Tests use RSA key pairs committed under `crates/secretd/tests/common/keys/` that exist only for
   the mock OIDC provider; they protect nothing.
+
+## Limits, audit, re-verification (milestone 4)
+
+- Rate-limit windows use a sliding 60 s window of attempt timestamps per uid (tokio `Instant`,
+  so tests can use paused time). Every `secret.get` that reaches the limiter counts, including
+  ones that later fail the ACL.
+- Connection caps are enforced right after `SO_PEERCRED`: an over-cap connection receives one
+  `RATE_LIMITED` error line (id `null`) and is closed. The idle timeout only applies while no
+  request is in flight, so a request waiting for approval is not dropped.
+- Caller re-verification at release compares `/proc/<pid>/exe` and the stat start time with the
+  values captured at connect, then re-checks the ACL against the *current* config (so a SIGHUP
+  that removes access also stops requests that are already pending; the client sees `NOT_FOUND`).
+- Audit writes are synchronous with a per-write flush (no fsync per event, to keep approvals
+  quick); a write error fails the request closed with `INTERNAL`. Order of events for a release
+  is `request_received`, `notified`, `approved`, `released`.
+- Besides the in-process tests, `tests/binary.rs` starts the real `secretd` binary (real sockets,
+  real `SO_PEERCRED` and `/proc`) with `daemon.user = "root"`, which makes the privilege drop a
+  no-op so the test also works as an unprivileged user.

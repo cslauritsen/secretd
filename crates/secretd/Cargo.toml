@@ -44,4 +44,5 @@ url = "2"
 tempfile.workspace = true
 secret-client = { path = "../secret-client" }
 jsonwebtoken = "9"
+tokio = { version = "1", features = ["test-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json", "form"] }

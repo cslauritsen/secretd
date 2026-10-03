@@ -360,6 +360,14 @@ impl Conn {
         Some(serde_json::from_str(&line).unwrap())
     }
 
+    /// Like `recv` but gives up after `ms` milliseconds.
+    pub async fn recv_timeout(&mut self, ms: u64) -> Option<Response> {
+        tokio::time::timeout(std::time::Duration::from_millis(ms), self.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
     pub async fn call(&mut self, method: &str, params: Value) -> Response {
         self.send(method, params).await;
         self.recv().await.expect("connection closed")
