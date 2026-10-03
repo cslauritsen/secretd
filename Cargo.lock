@@ -2505,10 +2505,31 @@ dependencies = [
 [[package]]
 name = "secret"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "libc",
+ "secret-client",
+ "secret-proto",
+ "secretd",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroize",
+]
 
 [[package]]
 name = "secret-client"
 version = "0.1.0"
+dependencies = [
+ "secret-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "zeroize",
+]
 
 [[package]]
 name = "secret-proto"

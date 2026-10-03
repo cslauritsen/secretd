@@ -139,3 +139,25 @@ Choices the specification left open, recorded as simply as possible.
 - Besides the in-process tests, `tests/binary.rs` starts the real `secretd` binary (real sockets,
   real `SO_PEERCRED` and `/proc`) with `daemon.user = "root"`, which makes the privilege drop a
   no-op so the test also works as an unprivileged user.
+
+## Client library and CLI (milestone 5)
+
+- `secret-client` is synchronous. Responses are read into zeroizing buffers (no `BufReader`
+  copy) and the value is parsed straight into a `Zeroizing<String>`; `SecretValue` zeroizes on
+  drop and its `Debug` prints only the length. An async API was not added (optional in the spec).
+- `secret` socket path: `--socket`, else `$SECRETD_SOCKET`, else `/run/secretd/secretd.sock`.
+- `secret get` always prints "waiting for owner approval..." to stderr; a trailing newline is
+  added only when stdout is a terminal. Exit codes follow the spec; `CALLER_CHANGED`,
+  `DECRYPT_FAILED`, `INTERNAL` and connection errors all exit 1.
+- `inject` tokens: whitespace inside the braces is spaces and tabs only. A single backslash
+  immediately before a well-formed token escapes it (`\\{{ secret:A }}` therefore yields a
+  literal backslash followed by the literal token, because
+  only the last backslash escapes). Malformed tokens pass through unchanged.
+- `inject` reads the whole template into memory (limit 64 MiB), requests each distinct name once
+  and sequentially over one connection, buffers the output, and writes it only after every lookup
+  succeeded. A template without tokens never contacts the daemon. Default `--reason` is
+  `secret inject`.
+- `-o FILE`: checked for existence *before* any approval is requested; created with mode 0600 via
+  `create_new`; with `--force` it is written to a 0600 temp file in the same directory and renamed.
+- The `secret` crate's integration tests run the real binary against the in-process daemon core
+  with the real `SO_PEERCRED`/`/proc` providers (ACL pins the binary's own path and uid).
