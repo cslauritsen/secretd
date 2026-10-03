@@ -22,7 +22,8 @@ pub fn unlock(ptr: *const u8, len: usize) {
 }
 
 /// Disable core dumps and ptrace-style memory inspection by non-root peers:
-/// `RLIMIT_CORE=0` and `PR_SET_DUMPABLE=0`.  Returns true if both succeeded.
+/// `RLIMIT_CORE=0` plus `PR_SET_DUMPABLE=0` on Linux or `PT_DENY_ATTACH` on
+/// macOS.  Returns true if both succeeded.
 pub fn disable_core_dumps() -> bool {
     let lim = libc::rlimit {
         rlim_cur: 0,
@@ -31,7 +32,12 @@ pub fn disable_core_dumps() -> bool {
     // SAFETY: plain syscalls with valid arguments.
     unsafe {
         let a = libc::setrlimit(libc::RLIMIT_CORE, &lim) == 0;
+        #[cfg(target_os = "linux")]
         let b = libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) == 0;
+        #[cfg(target_os = "macos")]
+        let b = libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) == 0;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let b = false;
         a && b
     }
 }

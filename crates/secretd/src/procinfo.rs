@@ -22,9 +22,103 @@ pub trait ProcReader: Send + Sync {
     fn read(&self, pid: u32) -> io::Result<ProcInfo>;
 }
 
-/// Reads the real `/proc`.
+/// Reads the real `/proc` (Linux) or libproc/sysctl (macOS).
 pub struct RealProcReader;
 
+#[cfg(target_os = "macos")]
+impl ProcReader for RealProcReader {
+    fn read(&self, pid: u32) -> io::Result<ProcInfo> {
+        // Executable path.
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: buffer is valid for `buf.len()` bytes.
+        let n =
+            unsafe { libc::proc_pidpath(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        if n <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let exe = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
+
+        // Start time (microseconds since the epoch) from the BSD info.
+        // SAFETY: zeroed POD struct, size passed matches.
+        let mut bsd: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let sz = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid as i32,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut bsd as *mut libc::proc_bsdinfo).cast(),
+                sz,
+            )
+        };
+        if got != sz {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such process"));
+        }
+        let start_time = bsd.pbi_start_tvsec * 1_000_000 + bsd.pbi_start_tvusec;
+
+        let cmdline = sanitize::clean(&macos_cmdline(pid)?, CMDLINE_MAX);
+        Ok(ProcInfo {
+            exe,
+            cmdline,
+            start_time,
+        })
+    }
+}
+
+/// Arguments via `sysctl(KERN_PROCARGS2)`: argc, exec path, NULs, then argv.
+#[cfg(target_os = "macos")]
+fn macos_cmdline(pid: u32) -> io::Result<String> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size: libc::size_t = 0;
+    // SAFETY: standard two-step sysctl size query then fetch.
+    unsafe {
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: buffer has `size` bytes.
+    unsafe {
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    buf.truncate(size);
+    if buf.len() < 4 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "short procargs"));
+    }
+    let argc = i32::from_ne_bytes(buf[..4].try_into().unwrap()).max(0) as usize;
+    let rest = &buf[4..];
+    // Skip the exec path, then the NUL padding before argv[0].
+    let after_exe = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    let rest = &rest[after_exe..];
+    let start = rest.iter().position(|&b| b != 0).unwrap_or(rest.len());
+    let args: Vec<String> = rest[start..]
+        .split(|&b| b == 0)
+        .take(argc)
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .filter(|a| !a.is_empty())
+        .collect();
+    Ok(args.join(" "))
+}
+
+#[cfg(target_os = "linux")]
 impl ProcReader for RealProcReader {
     fn read(&self, pid: u32) -> io::Result<ProcInfo> {
         use std::io::Read;
@@ -56,6 +150,7 @@ impl ProcReader for RealProcReader {
 
 /// Field 22 of `/proc/<pid>/stat`. The comm field (2) may contain spaces and
 /// parentheses, so parse after the last `)`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn parse_start_time(stat: &str) -> Option<u64> {
     let rest = &stat[stat.rfind(')')? + 1..];
     // rest starts at field 3 (state); starttime is field 22 => index 19.

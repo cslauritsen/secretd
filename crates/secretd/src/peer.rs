@@ -5,12 +5,15 @@
 //! logic can be exercised without multiple real users.
 
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::Mutex;
 use tokio::net::UnixStream;
 
 /// `SO_PEERPIDFD` (Linux 6.5+): a pidfd for the process that created the
 /// peer socket. Not exported by every libc version, so spelled out here.
+#[cfg(target_os = "linux")]
 const SO_PEERPIDFD: libc::c_int = 77;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +35,13 @@ pub trait PeerCredProvider: Send + Sync {
 }
 
 /// `getsockopt(SO_PEERPIDFD)`; `None` when unsupported (ENOPROTOOPT, EINVAL).
+/// macOS has no pidfd: always `None`, callers fall back to start-time checks.
+#[cfg(not(target_os = "linux"))]
+pub fn peer_pidfd(_stream: &UnixStream) -> Option<OwnedFd> {
+    None
+}
+
+#[cfg(target_os = "linux")]
 pub fn peer_pidfd(stream: &UnixStream) -> Option<OwnedFd> {
     let mut fd: libc::c_int = -1;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -53,7 +63,18 @@ pub fn peer_pidfd(stream: &UnixStream) -> Option<OwnedFd> {
     Some(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn pidfd_alive(_fd: BorrowedFd<'_>) -> bool {
+    true
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pidfd_pid(_fd: BorrowedFd<'_>) -> Option<u32> {
+    None
+}
+
 /// True while the process behind `fd` has not exited (signal 0 probe).
+#[cfg(target_os = "linux")]
 pub fn pidfd_alive(fd: BorrowedFd<'_>) -> bool {
     // SAFETY: pidfd_send_signal(fd, 0, NULL, 0) only probes for existence.
     let rc = unsafe {
@@ -69,6 +90,7 @@ pub fn pidfd_alive(fd: BorrowedFd<'_>) -> bool {
 }
 
 /// The pid a pidfd refers to, from `/proc/self/fdinfo/<fd>`.
+#[cfg(target_os = "linux")]
 pub fn pidfd_pid(fd: BorrowedFd<'_>) -> Option<u32> {
     let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).ok()?;
     info.lines()
@@ -116,11 +138,12 @@ impl PeerCredProvider for StaticPeerCred {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn pidfd_of_a_socketpair_peer_is_this_process_when_supported() {
         let (a, _b) = UnixStream::pair().unwrap();
@@ -133,6 +156,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn pidfd_liveness_tracks_the_process() {
         let mut child = std::process::Command::new("sleep")

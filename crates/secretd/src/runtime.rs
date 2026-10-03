@@ -120,7 +120,12 @@ pub fn drop_privileges(user: &str) -> io::Result<()> {
         return Ok(());
     }
     let cname = std::ffi::CString::new(user).map_err(io::Error::other)?;
-    nix::unistd::initgroups(&cname, u.gid).map_err(io::Error::other)?;
+    // nix gates `initgroups` off on macOS, so call libc directly.
+    // SAFETY: `cname` is a valid NUL-terminated string. The gid parameter is
+    // `c_int` on macOS and `gid_t` elsewhere.
+    if unsafe { libc::initgroups(cname.as_ptr(), u.gid.as_raw() as _) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     nix::unistd::setgid(u.gid).map_err(io::Error::other)?;
     nix::unistd::setuid(u.uid).map_err(io::Error::other)?;
     if nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).is_ok() {
