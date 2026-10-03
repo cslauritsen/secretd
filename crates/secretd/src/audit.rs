@@ -3,8 +3,8 @@
 
 use serde::Serialize;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use time::format_description::well_known::Rfc3339;
 
@@ -32,10 +32,34 @@ pub struct AuditEvent {
     pub detail: Option<String>,
 }
 
+/// Every event carries an `outcome` (spec section 9). This is the default for
+/// each event type; call sites override it with something more specific.
+pub fn default_outcome(event: &str) -> &'static str {
+    match event {
+        "request_received" => "received",
+        "acl_denied" => "denied",
+        "rate_limited" => "limited",
+        "notified" => "sent",
+        "notify_failed" => "failed",
+        "approve_attempt" => "attempt",
+        "approved" => "approved",
+        "denied" => "denied",
+        "timeout" => "timeout",
+        "client_disconnected" => "cancelled",
+        "decrypt_failed" => "failed",
+        "released" => "released",
+        "caller_changed" => "denied",
+        "aborted" => "aborted",
+        "admin_action" => "ok",
+        _ => "ok",
+    }
+}
+
 impl AuditEvent {
     pub fn new(event: &'static str) -> Self {
         AuditEvent {
             event,
+            outcome: Some(default_outcome(event).to_string()),
             ..Default::default()
         }
     }
@@ -70,26 +94,53 @@ struct Line<'a> {
 
 pub struct Audit {
     sink: Mutex<Box<dyn Write + Send>>,
+    /// Where the log lives, so SIGHUP can reopen it (log rotation).
+    path: Option<PathBuf>,
+}
+
+/// Open the log for appending with mode 0640 regardless of the process umask
+/// (the unit sets `UMask=0077`, which would otherwise yield 0600), also
+/// correcting the mode of a file that already exists.
+fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o640)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+    Ok(f)
 }
 
 impl Audit {
     /// Open (creating, mode 0640) the audit file for appending.
     pub fn open(path: &Path) -> std::io::Result<Audit> {
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o640)
-            .open(path)?;
-        Ok(Audit::from_writer(Box::new(f)))
+        Ok(Audit {
+            sink: Mutex::new(Box::new(open_log(path)?)),
+            path: Some(path.to_path_buf()),
+        })
     }
 
     pub fn from_writer(w: Box<dyn Write + Send>) -> Audit {
         Audit {
             sink: Mutex::new(w),
+            path: None,
         }
     }
 
-    /// Write one event.  An error means the caller must fail closed.
+    /// Reopen the log file (after rotation). On failure the old handle stays
+    /// in use. A no-op for writer-backed logs.
+    pub fn reopen(&self) -> std::io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let f = open_log(path)?;
+        *self.sink.lock().unwrap_or_else(|e| e.into_inner()) = Box::new(f);
+        Ok(())
+    }
+
+    /// Write one event with a single `write` of the complete line.  An error
+    /// means the caller must fail closed.
     pub fn log(&self, ev: &AuditEvent) -> std::io::Result<()> {
         let ts = time::OffsetDateTime::now_utc()
             .format(&Rfc3339)
@@ -99,5 +150,44 @@ impl Audit {
         let mut w = self.sink.lock().unwrap_or_else(|e| e.into_inner());
         w.write_all(&line)?;
         w.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_event_has_an_outcome() {
+        for ev in [
+            "request_received",
+            "acl_denied",
+            "rate_limited",
+            "notified",
+            "notify_failed",
+            "approve_attempt",
+            "approved",
+            "denied",
+            "timeout",
+            "client_disconnected",
+            "decrypt_failed",
+            "released",
+            "caller_changed",
+            "aborted",
+            "admin_action",
+        ] {
+            let e = AuditEvent::new(ev);
+            assert!(
+                e.outcome.as_deref().is_some_and(|o| !o.is_empty()),
+                "{ev} has no default outcome"
+            );
+            if ev != "admin_action" {
+                assert_ne!(
+                    default_outcome(ev),
+                    "ok",
+                    "{ev} fell through to the catch-all"
+                );
+            }
+        }
     }
 }

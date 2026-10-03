@@ -352,7 +352,7 @@ async fn audit_log_format_and_event_sequence() {
     assert_eq!(
         ev,
         vec![
-            "request_received",
+            // An ACL miss is only the (coalesced) `acl_denied`: no request_received.
             "acl_denied",
             "request_received",
             "notified",
@@ -374,15 +374,20 @@ async fn audit_log_format_and_event_sequence() {
         assert_eq!(l["gid"], 100);
         assert_eq!(l["pid"], PID);
         assert_eq!(l["exe"], PSQL);
+        // Spec section 9: every event carries an outcome.
+        assert!(
+            l["outcome"].as_str().is_some_and(|o| !o.is_empty()),
+            "no outcome on {l}"
+        );
     }
-    assert_eq!(lines[1]["outcome"], "acl");
-    assert_eq!(lines[1]["secret_name"], "other-user-only");
+    assert_eq!(lines[0]["outcome"], "acl");
+    assert_eq!(lines[0]["secret_name"], "other-user-only");
     assert!(
-        lines[2]["request_id"].is_null(),
+        lines[1]["request_id"].is_null(),
         "request_received precedes id assignment"
     );
-    assert_eq!(lines[3]["request_id"].as_str().unwrap().len(), 32);
-    assert_eq!(lines[5]["outcome"], "retry");
+    assert_eq!(lines[2]["request_id"].as_str().unwrap().len(), 32);
+    assert_eq!(lines[4]["outcome"], "retry");
     // Never values, passphrases, tokens or client reasons.
     let raw = h.audit_raw();
     for bad in ["hunter2", "bad-pass-xyz", PASS, "SECRET-REASON-TEXT"] {
@@ -488,4 +493,99 @@ async fn audit_failure_on_wrong_passphrase_grants_no_further_guesses() {
     assert_eq!(out, ApproveOutcome::Internal);
     assert_eq!(err_kind(&c.recv().await.unwrap()), "INTERNAL");
     assert_eq!(h.core.pending_count(), 0);
+}
+
+fn count(h: &Harness, ev: &str) -> usize {
+    h.audit_events().iter().filter(|e| *e == ev).count()
+}
+
+#[tokio::test]
+async fn rejection_flood_is_coalesced_into_summary_lines() {
+    let h = Harness::start(Opts {
+        limits: "max_gets_per_uid_per_min = 2\nmax_rejections_per_conn = 100000".into(),
+        ..Opts::default()
+    })
+    .await;
+    h.core.set_coalesce_window(Duration::from_secs(2));
+    let mut c = h.connect().await;
+    // Two ACL misses (unknown name), then a flood of rate-limited requests.
+    for _ in 0..2 {
+        assert_eq!(err_kind(&c.get("no-such").await), "NOT_FOUND");
+    }
+    for _ in 0..300 {
+        assert_eq!(err_kind(&c.get("no-such").await), "RATE_LIMITED");
+    }
+    // One full line each so far; the other 1 + 299 events are only counted.
+    assert_eq!(count(&h, "acl_denied"), 1);
+    assert_eq!(count(&h, "rate_limited"), 1);
+    assert_eq!(count(&h, "request_received"), 0);
+    pause(2100).await;
+    h.core.flush_audit_summaries(false);
+    let lines = h.audit_lines();
+    let sum = |ev: &str| {
+        lines
+            .iter()
+            .filter(|l| l["event"] == ev && l["detail"].is_string())
+            .map(|l| l["detail"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let rl = sum("rate_limited");
+    assert_eq!(rl.len(), 1, "{lines:?}");
+    assert!(rl[0].contains("299 further"), "{}", rl[0]);
+    let acl = sum("acl_denied");
+    assert_eq!(acl.len(), 1);
+    assert!(acl[0].contains("1 further"), "{}", acl[0]);
+    // Summaries still carry the uid and an outcome, never names or reasons.
+    for l in lines.iter().filter(|l| l["detail"].is_string()) {
+        assert_eq!(l["uid"], 1000);
+        assert!(l["outcome"].is_string());
+        assert!(l["secret_name"].is_null());
+    }
+    // The next window starts with a full line again.
+    assert_eq!(err_kind(&c.get("no-such").await), "RATE_LIMITED");
+    assert_eq!(
+        count(&h, "rate_limited"),
+        3,
+        "full line + summary + new full line"
+    );
+}
+
+#[tokio::test]
+async fn connection_is_closed_after_its_rejection_budget() {
+    let h = Harness::start(Opts {
+        limits: "max_rejections_per_conn = 3".into(),
+        ..Opts::default()
+    })
+    .await;
+    let mut c = h.connect().await;
+    for _ in 0..3 {
+        assert_eq!(err_kind(&c.get("no-such").await), "NOT_FOUND");
+    }
+    assert!(c.recv().await.is_none(), "closed after the budget");
+    // Malformed requests count too, and a fresh connection starts anew.
+    let mut d = h.connect().await;
+    for _ in 0..3 {
+        d.send_raw(b"{not json}\n").await;
+        assert!(d.recv().await.is_some());
+    }
+    assert!(d.recv().await.is_none());
+    let mut e = h.connect().await;
+    assert_eq!(err_kind(&e.get("no-such").await), "NOT_FOUND");
+}
+
+#[tokio::test]
+async fn requests_that_reach_the_owner_do_not_use_the_rejection_budget() {
+    let h = Harness::start(Opts {
+        limits: "max_rejections_per_conn = 2".into(),
+        ..Opts::default()
+    })
+    .await;
+    let mut c = h.connect().await;
+    for _ in 0..4 {
+        c.send("secret.get", json!({"name": "db-password"})).await;
+        let n = h.notifier.wait_for(1).await;
+        h.core.deny(&n.last().unwrap().request_id, admin());
+        assert_eq!(err_kind(&c.recv().await.unwrap()), "DENIED");
+        h.notifier.seen.lock().unwrap().clear();
+    }
 }

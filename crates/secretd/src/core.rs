@@ -13,6 +13,7 @@ use secret_proto::store::{self, Passphrase, StoreError};
 use secret_proto::{valid_secret_name, Encoding, MAX_REASON_CHARS};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::io;
 use std::net::IpAddr;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex, RwLock};
@@ -141,9 +142,24 @@ struct State {
     conns_total: usize,
 }
 
+/// Default window over which repeated rejections are folded into one summary line.
+pub const COALESCE_WINDOW: Duration = Duration::from_secs(60);
+const COALESCE_MAX_KEYS: usize = 4096;
+
+/// One (event, outcome, subject) bucket of the audit coalescer.
+struct Slot {
+    start: Instant,
+    suppressed: u64,
+    template: AuditEvent,
+}
+
+type CoalesceKey = (&'static str, String, String);
+
 pub struct Core {
     cfg: RwLock<Arc<Config>>,
     state: Mutex<State>,
+    coalesce: Mutex<HashMap<CoalesceKey, Slot>>,
+    coalesce_window: Mutex<Duration>,
     audit: Audit,
     notifier: Arc<dyn Notifier>,
     procs: Arc<dyn ProcReader>,
@@ -206,6 +222,8 @@ impl Core {
         Arc::new(Core {
             cfg: RwLock::new(Arc::new(cfg)),
             state: Mutex::new(State::default()),
+            coalesce: Mutex::new(HashMap::new()),
+            coalesce_window: Mutex::new(COALESCE_WINDOW),
             audit,
             notifier,
             procs,
@@ -246,6 +264,138 @@ impl Core {
         ev.pid = Some(caller.pid);
         ev.exe = caller.proc.as_ref().map(|p| p.exe.clone());
         self.audit(&ev)
+    }
+
+    fn rejection_event(
+        &self,
+        event: &'static str,
+        name: &str,
+        outcome: &str,
+        caller: &Caller,
+    ) -> AuditEvent {
+        let mut ev = AuditEvent::new(event).secret(name).outcome(outcome);
+        ev.uid = Some(caller.uid);
+        ev.gid = Some(caller.gid);
+        ev.pid = Some(caller.pid);
+        ev.exe = caller.proc.as_ref().map(|p| p.exe.clone());
+        ev
+    }
+
+    /// Reopen the audit log file (SIGHUP, after log rotation).
+    pub fn reopen_audit(&self) -> io::Result<()> {
+        self.audit.reopen()
+    }
+
+    fn window(&self) -> Duration {
+        *self
+            .coalesce_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Test hook: shorten the coalescing window.
+    #[doc(hidden)]
+    pub fn set_coalesce_window(&self, d: Duration) {
+        *self
+            .coalesce_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = d;
+    }
+
+    fn summary_for(slot: &Slot, window: Duration) -> AuditEvent {
+        let mut ev = slot.template.clone();
+        ev.secret_name = None;
+        ev.request_id = None;
+        ev.pid = None;
+        ev.exe = None;
+        ev.detail = Some(format!(
+            "summary: {} further event(s) suppressed in {}s window",
+            slot.suppressed,
+            window.as_secs().max(1)
+        ));
+        ev
+    }
+
+    /// Audit a rejection that anyone local can trigger at will (rate limit,
+    /// ACL miss, changed caller, HTTP failure limiter). The first event per
+    /// `(event, outcome, subject)` in each window is written in full; the
+    /// rest only bump a counter, flushed as one summary line per window. This
+    /// bounds the audit volume a local user can cause. A write error is
+    /// returned only for lines actually written.
+    pub fn audit_coalesced(&self, ev: AuditEvent, subject: &str) -> io::Result<()> {
+        let now = Instant::now();
+        let window = self.window();
+        let key: CoalesceKey = (
+            ev.event,
+            ev.outcome.clone().unwrap_or_default(),
+            subject.to_string(),
+        );
+        let mut summaries = Vec::new();
+        let write_now = {
+            let mut c = self.coalesce.lock().unwrap_or_else(|e| e.into_inner());
+            if c.len() >= COALESCE_MAX_KEYS && !c.contains_key(&key) {
+                for (_, slot) in c.drain() {
+                    if slot.suppressed > 0 {
+                        summaries.push(Self::summary_for(&slot, window));
+                    }
+                }
+            }
+            match c.get_mut(&key) {
+                Some(slot) if now.duration_since(slot.start) < window => {
+                    slot.suppressed += 1;
+                    false
+                }
+                Some(slot) => {
+                    if slot.suppressed > 0 {
+                        summaries.push(Self::summary_for(slot, window));
+                    }
+                    slot.start = now;
+                    slot.suppressed = 0;
+                    slot.template = ev.clone();
+                    true
+                }
+                None => {
+                    c.insert(
+                        key,
+                        Slot {
+                            start: now,
+                            suppressed: 0,
+                            template: ev.clone(),
+                        },
+                    );
+                    true
+                }
+            }
+        };
+        for s in &summaries {
+            let _ = self.audit(s);
+        }
+        if write_now {
+            self.audit(&ev)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Write out summaries for buckets whose window has elapsed (all of them
+    /// when `force`, e.g. at shutdown). Called periodically by the daemon.
+    pub fn flush_audit_summaries(&self, force: bool) {
+        let now = Instant::now();
+        let window = self.window();
+        let mut out = Vec::new();
+        {
+            let mut c = self.coalesce.lock().unwrap_or_else(|e| e.into_inner());
+            c.retain(|_, slot| {
+                let due = force || now.duration_since(slot.start) >= window;
+                if due && slot.suppressed > 0 {
+                    out.push(Self::summary_for(slot, window));
+                }
+                !due
+            });
+        }
+        for s in &out {
+            let _ = self.audit(s);
+        }
     }
 
     // ------------------------------------------------------------ identity
@@ -361,30 +511,26 @@ impl Core {
             .filter(|r| !r.is_empty());
         let cfg = self.config();
 
+        let subject = caller.uid.to_string();
+
         // Re-read /proc now: the connection may have been inherited by (or
         // outlived) the process we looked at when it was accepted. Any change
         // of executable or start time, or the process being gone, is refused.
         if caller.proc.is_some() && !self.verify_caller(caller) {
-            let _ = self.audit_for(
-                AuditEvent::new("caller_changed")
-                    .secret(&name)
-                    .outcome("at_request"),
-                caller,
+            // Refusing is the safe direction; the audit result is only logged.
+            let _ = self.audit_coalesced(
+                self.rejection_event("caller_changed", &name, "at_request", caller),
+                &subject,
             );
             return Err(RpcError::new(ErrorKind::CallerChanged));
         }
 
-        self.audit_for(AuditEvent::new("request_received").secret(&name), caller)
-            .map_err(|_| internal())?;
-
         // Per-uid attempt rate limit comes first and applies to every name,
         // so a rate-limit response reveals nothing about ACLs.
         if !self.record_get_attempt(caller.uid, cfg.limits.max_gets_per_uid_per_min) {
-            self.audit_for(
-                AuditEvent::new("rate_limited")
-                    .secret(&name)
-                    .outcome("attempt_rate"),
-                caller,
+            self.audit_coalesced(
+                self.rejection_event("rate_limited", &name, "attempt_rate", caller),
+                &subject,
             )
             .map_err(|_| internal())?;
             return Err(RpcError::new(ErrorKind::RateLimited));
@@ -396,13 +542,19 @@ impl Core {
             } else {
                 "acl"
             };
-            self.audit_for(
-                AuditEvent::new("acl_denied").secret(&name).outcome(why),
-                caller,
+            self.audit_coalesced(
+                self.rejection_event("acl_denied", &name, why, caller),
+                &subject,
             )
             .map_err(|_| internal())?;
             return Err(RpcError::new(ErrorKind::NotFound));
         }
+
+        // Only requests that can actually reach the owner are logged one by
+        // one (and fail closed when the log is dead): rejections above are
+        // coalesced, and are bounded per minute by the attempt limiter below.
+        self.audit_for(AuditEvent::new("request_received").secret(&name), caller)
+            .map_err(|_| internal())?;
         let secret_cfg = cfg.secret(&name).ok_or_else(internal)?;
         let proc = caller.proc.as_ref().ok_or_else(internal)?;
 
@@ -440,9 +592,9 @@ impl Core {
             };
             if let Some(why) = limited {
                 drop(st);
-                self.audit_for(
-                    AuditEvent::new("rate_limited").secret(&name).outcome(why),
-                    caller,
+                self.audit_coalesced(
+                    self.rejection_event("rate_limited", &name, why, caller),
+                    &subject,
                 )
                 .map_err(|_| internal())?;
                 return Err(RpcError::new(ErrorKind::RateLimited));

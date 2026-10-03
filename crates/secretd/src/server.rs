@@ -162,6 +162,10 @@ async fn handle_client(core: Arc<Core>, stream: UnixStream, mut caller: Caller) 
     core.resolve_username(&mut caller);
     let mut lr = LineReader::new(rd);
     let idle = Duration::from_secs(core.config().limits.idle_timeout_secs.max(1));
+    // Rejections that never involved the owner (malformed, unknown method,
+    // rate limited, ACL miss, changed caller). A connection that keeps
+    // producing them is closed instead of being served indefinitely.
+    let mut rejections = 0usize;
 
     loop {
         let line = match tokio::time::timeout(idle, lr.next_line()).await {
@@ -179,7 +183,10 @@ async fn handle_client(core: Arc<Core>, stream: UnixStream, mut caller: Caller) 
         let req = match parse_request(&line) {
             Ok(r) => r,
             Err((id, e)) => {
-                if send(&mut wr, &Response::err(id, e)).await.is_err() {
+                rejections += 1;
+                if send(&mut wr, &Response::err(id, e)).await.is_err()
+                    || rejections >= core.config().limits.max_rejections_per_conn
+                {
                     return;
                 }
                 continue;
@@ -193,6 +200,7 @@ async fn handle_client(core: Arc<Core>, stream: UnixStream, mut caller: Caller) 
                 let params: Result<GetParams, _> = serde_json::from_value(req.params);
                 match params {
                     Err(_) => {
+                        rejections += 1;
                         send(
                             &mut wr,
                             &Response::err(id, RpcError::new(ErrorKind::InvalidParams)),
@@ -208,7 +216,20 @@ async fn handle_client(core: Arc<Core>, stream: UnixStream, mut caller: Caller) 
                                 Err(e) => Err(e),
                             }
                         }
-                        Err(e) => send(&mut wr, &Response::err(id, e)).await,
+                        Err(e) => {
+                            if matches!(
+                                e.kind(),
+                                Some(
+                                    ErrorKind::RateLimited
+                                        | ErrorKind::NotFound
+                                        | ErrorKind::CallerChanged
+                                        | ErrorKind::InvalidParams
+                                )
+                            ) {
+                                rejections += 1;
+                            }
+                            send(&mut wr, &Response::err(id, e)).await
+                        }
                     },
                 }
             }
@@ -224,6 +245,7 @@ async fn handle_client(core: Arc<Core>, stream: UnixStream, mut caller: Caller) 
                 send(&mut wr, &Response::ok(id, json!(r))).await
             }
             _ => {
+                rejections += 1;
                 send(
                     &mut wr,
                     &Response::err(id, RpcError::new(ErrorKind::MethodNotFound)),
@@ -231,7 +253,7 @@ async fn handle_client(core: Arc<Core>, stream: UnixStream, mut caller: Caller) 
                 .await
             }
         };
-        if ok.is_err() {
+        if ok.is_err() || rejections >= core.config().limits.max_rejections_per_conn {
             return;
         }
     }
@@ -270,7 +292,8 @@ async fn handle_admin(core: Arc<Core>, stream: UnixStream, peer: Arc<dyn PeerCre
     let (rd, mut wr) = stream.into_split();
     let mut lr = LineReader::new(rd);
     loop {
-        let line = match tokio::time::timeout(Duration::from_secs(120), lr.next_line()).await {
+        let admin_idle = Duration::from_secs(core.config().limits.admin_idle_timeout_secs.max(1));
+        let line = match tokio::time::timeout(admin_idle, lr.next_line()).await {
             Ok(Ok(Line::Line(l))) => l,
             _ => return,
         };

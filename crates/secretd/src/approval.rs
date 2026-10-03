@@ -293,10 +293,12 @@ impl AppState {
     }
 
     fn rate_limited_response(&self, ip: IpAddr) -> Response {
-        self.audit(
+        // Coalesced: a limited address can keep hammering at will.
+        let _ = self.core.audit_coalesced(
             AuditEvent::new("rate_limited")
                 .outcome("http_failed_attempts")
                 .source(Some(ip)),
+            &ip.to_string(),
         );
         let mut r = simple_page(
             StatusCode::TOO_MANY_REQUESTS,

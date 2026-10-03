@@ -105,16 +105,26 @@ async fn main() -> Result<()> {
     let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut summaries = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         tokio::select! {
-            _ = hup.recv() => match load_config(&args.config) {
-                Ok(c) => { core.set_config(c); tracing::info!("configuration reloaded"); }
-                Err(e) => tracing::error!("reload failed, keeping old config: {e}"),
+            _ = hup.recv() => {
+                match load_config(&args.config) {
+                    Ok(c) => { core.set_config(c); tracing::info!("configuration reloaded"); }
+                    Err(e) => tracing::error!("reload failed, keeping old config: {e}"),
+                }
+                // Log rotation: reopen the audit file on the same signal.
+                match core.reopen_audit() {
+                    Ok(()) => tracing::info!("audit log reopened"),
+                    Err(e) => tracing::error!("audit log reopen failed, keeping old handle: {e}"),
+                }
             },
+            _ = summaries.tick() => core.flush_audit_summaries(false),
             _ = term.recv() => break,
             _ = int.recv() => break,
         }
     }
+    core.flush_audit_summaries(true);
     tracing::info!("shutting down");
     Ok(())
 }

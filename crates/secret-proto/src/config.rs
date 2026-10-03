@@ -133,6 +133,11 @@ pub struct LimitsCfg {
     pub max_conns_per_uid: usize,
     pub max_conns_total: usize,
     pub idle_timeout_secs: u64,
+    /// Rejections (rate limit, ACL miss, changed caller, malformed request)
+    /// after which a client connection is closed.
+    pub max_rejections_per_conn: usize,
+    /// Idle timeout of an admin socket connection (no request in flight).
+    pub admin_idle_timeout_secs: u64,
 }
 
 impl Default for LimitsCfg {
@@ -144,6 +149,8 @@ impl Default for LimitsCfg {
             max_conns_per_uid: 8,
             max_conns_total: 128,
             idle_timeout_secs: 30,
+            max_rejections_per_conn: 8,
+            admin_idle_timeout_secs: 600,
         }
     }
 }
@@ -351,7 +358,14 @@ impl Config {
 
         // limits
         let l = &raw.limits;
-        if l.max_pending_per_uid == 0 || l.max_pending_total == 0 || l.max_conns_per_uid == 0 {
+        if l.max_pending_per_uid == 0
+            || l.max_pending_total == 0
+            || l.max_conns_per_uid == 0
+            || l.max_conns_total == 0
+            || l.max_gets_per_uid_per_min == 0
+            || l.max_rejections_per_conn == 0
+            || l.admin_idle_timeout_secs == 0
+        {
             return err("limits must be non-zero");
         }
 
