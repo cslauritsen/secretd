@@ -44,3 +44,36 @@ Choices the specification left open, recorded as simply as possible.
 - Config ownership check: owner must be root, the daemon user, or (for `secretctl`) the
   invoking user, and the file must not be group/world writable.
 - Secret names are `[A-Za-z0-9._/-]+`, at most 256 bytes.
+
+## Daemon core (milestone 2)
+
+- Peer credentials: `PeerCredProvider` trait. The real provider uses tokio's
+  `UnixStream::peer_cred`, which is a `getsockopt(SO_PEERCRED)` on Linux. Tests inject
+  `StaticPeerCred`. `/proc` access is behind a `ProcReader` trait (real and in-memory
+  implementations) so caller re-verification can be tested without real processes.
+- Everything the daemon does is in the `secretd` library (`Core` + `server` + `runtime`);
+  `main.rs` only wires it up. Integration tests run the library in-process on a temp
+  socket instead of spawning the binary.
+- A connection whose `/proc` lookup failed stays open (so `server.ping` works) but every
+  `secret.get` is answered `NOT_FOUND` and `secret.list` is empty ("treated as denied").
+- `secret.get` with a syntactically invalid name returns `INVALID_PARAMS`; valid-looking
+  but unknown/forbidden names return `NOT_FOUND` with an identical error object.
+- The per-uid attempt rate limit is checked before the ACL and applies to every name so
+  a `RATE_LIMITED` reply never reveals ACL state. Pending caps / duplicate suppression are
+  checked after the ACL (they can only be hit by callers that passed it, apart from the
+  global cap, which is a documented minor side channel).
+- `timeout_secs` is clamped to `[1, daemon.request_timeout_secs]`; absent means the maximum.
+- The release response line is serialised straight into a pre-sized `Zeroizing<Vec<u8>>`
+  so the value is not copied into ordinary heap buffers by the server.
+- Notifications (no `id`) are ignored without a reply. One request per connection is in
+  flight at a time; bytes pipelined while a request waits stay buffered for the next one.
+  While waiting, the connection task watches the socket for EOF to cancel the request.
+- Audit events: `request_received` is written for every syntactically valid `secret.get`
+  before any other check. `released` is written before the value is handed to the client; if
+  it cannot be written the request fails with `INTERNAL`. Residual edge: if the client's
+  timeout fires in the instant between `released` being audited and delivery, the audit shows
+  `released` although the client saw `TIMEOUT`.
+- Process start: sockets are bound (or inherited via `LISTEN_FDS`, matched by
+  `LISTEN_FDNAMES` `secretd`/`admin`, else fd 3 is the client socket) while privileged, then
+  root is dropped to `daemon.user`, then the audit log is opened. Config reload (SIGHUP)
+  swaps ACLs, limits and timeouts; listen addresses, notifier and OIDC settings need a restart.

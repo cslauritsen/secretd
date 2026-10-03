@@ -1,14 +1,12 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! secretd: a local secrets-release daemon.
+//!
+//! The daemon library is split so tests can run everything in-process with an
+//! injectable peer-credential provider, `/proc` reader and notifier.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod audit;
+pub mod core;
+pub mod notify;
+pub mod peer;
+pub mod procinfo;
+pub mod runtime;
+pub mod server;
