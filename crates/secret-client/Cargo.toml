@@ -1,0 +1,16 @@
+[package]
+name = "secret-client"
+description = "Rust client for the secretd JSON-RPC protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+secret-proto = { path = "../secret-proto" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
