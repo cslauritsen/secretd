@@ -292,7 +292,7 @@ allow_exes = ["/usr/bin/psql"]
 
 ## 17. Non-goals (v1)
 
-Network-reachable secret access (Unix socket only), non-Linux platforms, grant caching or TTL leases, secret versioning/history, multi-owner or quorum approval, HSM/TPM integration, `secret run`.
+Network-reachable secret access (Unix socket only), non-Linux platforms, grant caching or TTL leases, secret versioning/history, multi-owner or quorum approval, HSM/TPM integration, `secret run`. (Home Assistant and FIFO support are v1.1 extensions in §19-§20.)
 
 ## 18. Decisions and open questions
 
@@ -304,3 +304,122 @@ Resolved:
 Passkeys are not required; whatever sign-in methods Google offers (including passkeys) are sufficient (§7.2).
 
 Note: Google OIDC needs an HTTPS redirect URI on a real hostname (or `localhost`), so the reverse proxy must front a real domain with a valid certificate.
+
+## 19. Home Assistant channel (v1.1 extension)
+
+Adds Home Assistant (HA) as an additional notification and approval channel. The existing web/OIDC path (§7.2) and admin socket (§7.3) remain; which channels are enabled is a per-deployment choice.
+
+### 19.1 Channels
+- Introduce a channel abstraction: each enabled channel can (a) announce a pending request and (b) deliver an approve/deny decision plus the passphrase. Channels are `web` (§7.2), `admin` (§7.3) and `homeassistant`.
+- `[channels] enabled = ["web", "admin", "homeassistant"]`; at least one approval channel must be enabled, and `check-config` refuses to start otherwise.
+- A request may be resolved through any enabled channel. The first valid resolution wins; the others are told the request is closed (HA notification cleared, web URL gives 410).
+- A request fails with `INTERNAL` only if **every** enabled notification channel fails to announce it. A single channel failing is audited but not fatal.
+- If HA is the only channel, no HTTP listener or OIDC configuration is required.
+
+### 19.2 Connection to HA
+- Config:
+  ```toml
+  [homeassistant]
+  url = "http://homeassistant.local:8123"
+  token_file = "/etc/secretd/ha.token"          # long-lived access token, secretd-only (0400)
+  notify_service = "notify.mobile_app_owner_phone"
+  passphrase_entity = "input_text.secretd_passphrase"
+  owner_user_ids = ["<ha-user-id>"]             # allowlist, see 19.4
+  allow_insecure_http = false
+  ```
+- Use HA's WebSocket API (`/api/websocket`) for events and service calls, authenticated with the token. Reconnect with exponential backoff (1s up to 60s). While disconnected the channel is unavailable, which counts as a notification failure for new requests and is audited.
+- The token is sent over the network, so require an `https://` URL unless the host is loopback or `allow_insecure_http = true` is set explicitly (warn at startup, since a LAN-only HA is common). Never log the token.
+- Pin HA's CA/cert via an optional `ca_file`.
+
+### 19.3 Flow
+1. On a new pending request, call `notify_service` with the same details as §5 step 4 (secret name, uid/user, pid, exe, sanitized cmdline, labelled client reason, expiry, request id) and `data.tag = <request_id>`. Add two actions: `SECRETD_APPROVE_<request_id>_<approval_token>` and `SECRETD_DENY_<request_id>_<approval_token>`. The approval token is the same 256-bit per-request token as §5 and is **not** shown in the notification text.
+2. The owner types the passphrase into `passphrase_entity` (an `input_text` helper with `mode: password`, `max: 255`), then taps **Approve**. Passphrases longer than 255 characters are not supported on this channel; `check-config` documents this.
+3. On the `mobile_app_notification_action` event, secretd validates the action id (constant-time token compare, request still pending, event origin passes 19.4).
+   - **Deny:** resolve as denied, clear the notification.
+   - **Approve:** read the current state of `passphrase_entity`, then **immediately** call `input_text.set_value` with an empty string, whether or not decryption succeeds. If the entity was empty, do not attempt unseal. Re-notify "enter the passphrase first, then tap Approve" and keep the request pending. This does not count as a failed attempt.
+4. Run the normal approve path (§5 steps 6-7, including caller re-verification and the 3-attempt limit). On a wrong passphrase, send a follow-up notification with the attempts left, using the same tag.
+5. On success, failure or timeout, clear the notification (`message: clear_notification`, same tag).
+- Only one approval is processed at a time on this channel, since all requests share one entity. If a second Approve arrives while one is being processed, answer it with a "busy, try again" notification.
+
+### 19.4 Authorization of HA events
+- HA event context carries `user_id` for events caused by an authenticated user. Accept an action event only if `context.user_id` is present and in `owner_user_ids`. Events with a missing or non-listed user are ignored and audited (`ha_event_rejected`, with the user id if present, never the action id).
+- **Verify during implementation** that the Companion app's `mobile_app_notification_action` event reliably carries `context.user_id`. If it does not, document the weaker model (anyone who can fire events on the HA bus can still not approve without the per-request token, which only the notification contains) and add `ha_require_user_id = false` as an explicit opt-out. Record the finding in `docs/DECISIONS.md`.
+- The passphrase entity is read only in response to a valid Approve action for a pending request. Never read it on state changes.
+
+### 19.5 Security considerations
+- The passphrase transits HA: it is in the entity's state, the HA event bus and WebSocket, and may be written by the **recorder/history/logbook**. Anyone with admin access to HA can read it while it is set. This weakens the "owner device only" model and must be documented prominently in the README.
+- Required documentation: exclude `passphrase_entity` from `recorder`, `history` and `logbook` (give the YAML), use `mode: password`, keep HA behind its own strong auth/MFA, and use HTTPS to HA.
+- secretd must clear the entity immediately after reading it (step 3) and on request timeout/deny/disconnect. If clearing fails, retry and audit `ha_clear_failed`; do not release the secret until the clear has been attempted.
+- At startup, query the entity's current state. If it is non-empty, clear it and audit (a stale passphrase must not linger).
+- Notification text contains no passphrase and no approval token.
+- Audit events add a `channel` field (`web`, `admin`, `homeassistant`) to every approval-related event; new events: `ha_connected`, `ha_disconnected`, `ha_event_rejected`, `ha_clear_failed`.
+
+### 19.6 Tests
+- Mock HA WebSocket server: auth, reconnect with backoff, service calls recorded, event injection.
+- Approve with entity filled, approve with entity empty (re-prompt, no attempt consumed), deny, wrong passphrase then right, timeout clears notification.
+- Entity cleared after every read (verify via mock), including on wrong passphrase and on decrypt failure.
+- Event from a user not in `owner_user_ids`, a missing user id, a wrong token, an already-resolved request, and a second concurrent Approve (busy).
+- First-resolution-wins across channels (HA approve while web page is open → web gives 410).
+- Startup clears a stale non-empty entity.
+
+## 20. Named-pipe (FIFO) secrets (v1.1 extension)
+
+Lets a legacy program read a secret by opening a named pipe. A process opening the FIFO for reading triggers the same notification and approval flow as `secret.get`, and on approval the secret is written to the pipe.
+
+### 20.1 Config
+```toml
+[[fifo]]
+path = "/run/secretd/pipes/db-password"
+secret = "db-password"        # must exist in [[secret]]
+owner = "app"                 # user that may read; also the pipe's owner
+group = "app"
+mode = "0440"                 # default 0440; 0640/0660 only for owner/group use
+enforce_acl = false           # see 20.3
+```
+
+- `secretd` creates the FIFO at startup (`mkfifo`, then `fchown`/`chmod` to the configured values, ignoring umask) in a directory that is owned by the daemon user and not writable by others. If the path already exists it must be a FIFO owned by the daemon user, not a symlink (`lstat`); otherwise refuse to start. `O_NOFOLLOW` where available. Remove the FIFO on clean shutdown.
+- Access control is the FIFO's owner/group/mode. Permission to open the pipe is the first gate. The daemon user needs no extra privilege to create it.
+- Multiple `[[fifo]]` entries may map to the same secret.
+
+### 20.2 Detecting a reader
+- Keep the FIFO armed by repeatedly attempting `open(O_WRONLY | O_NONBLOCK)`: it fails with `ENXIO` until a reader exists and succeeds as soon as one opens. Poll (e.g. every 100-250 ms) or use `inotify` `IN_OPEN` to avoid busy polling. The wait must be cancellable at shutdown or SIGHUP reload. Do not use a blocking `open` that cannot be interrupted.
+- Ignore `SIGPIPE` process-wide; handle `EPIPE` on write as "reader went away".
+- When a reader is detected, start a pending request exactly as for `secret.get`, with the channel list from §19.1, with these differences:
+  - There is no `SO_PEERCRED` for pipes. Identify readers by scanning `/proc/*/fd/*` for entries resolving to the FIFO's `(st_dev, st_ino)`, excluding secretd itself, and keeping those whose `/proc/<pid>/fdinfo/<fd>` flags show read access. Capture pid, uid, gid, exe, sanitized cmdline and start time for each (same as §3.2). This needs the same `/proc` access as §3.2.
+  - The notification and audit entry say `via FIFO <path>` and mark the identities **best-effort** (a process may not be found because of a race or because it closed the fd).
+  - `reason` is `"read of <fifo path>"`.
+- The reader's open or read blocks while the owner approves. That is expected. Document that readers must tolerate blocking (up to the request timeout).
+
+### 20.3 Policy and verification
+- Per-request limits (§8) apply, keyed on the FIFO path: at most 1 pending request per FIFO, plus a per-FIFO attempt limit (default 10 per minute) and the global caps. After a denial or timeout, wait a cool-down (default 5 s) before re-arming to avoid notification spam from a program that retries in a loop. A new request is not started while one is pending for the same FIFO.
+- **Ambiguity rule:** if more than one distinct reader process holds the FIFO open for reading at request creation or at release, deny with audit `fifo_ambiguous`. A single write goes to one reader nondeterministically.
+- **Identity rule:** if `enforce_acl = true`, the single identified reader must satisfy the secret's ACL (§6: uid/gid and exe). If no reader can be identified, deny with audit `fifo_reader_unknown`. If `enforce_acl = false` (default), identification is informational for the owner and the FIFO's file permissions are the gate.
+- **Re-verification at release:** just before writing, re-scan; if the reader set differs from the snapshot (a different pid, exe or start time, or no readers left), abort with audit `caller_changed` and write nothing.
+- The same single-use approval rules apply: one approval releases the secret to exactly one open of the FIFO.
+
+### 20.4 Delivery
+- On approval, unseal and obtain the one secret (§4, `unseal_one`). Write the **raw** value (base64 secrets are decoded first) with no added newline, using a non-blocking write loop with a deadline (default 5 s) so a stuck reader cannot hold the secret in memory indefinitely. Then close the write end so the reader sees EOF, zeroize the value, and re-arm after the cool-down.
+- Handle `EPIPE`/`EAGAIN` timeouts: audit `aborted`, never retry the write on a later open.
+- Audit `released` only after the full value was written; if only part was written, audit `aborted` with the byte count (never the data).
+- A secret larger than the pipe buffer (64 KiB default) is supported through the loop; it is not required to be atomic.
+
+### 20.5 Security notes (document in README/HARDENING)
+- Any process allowed by file permissions can trigger a notification and, if approved, receives the secret. Without `enforce_acl` there is no exe pinning. Use a dedicated user/group, `0440`, and a private directory.
+- Reader identification by `/proc` scan is racy and best-effort. The owner's approval is still the real gate.
+- Same-uid readers can race to open the FIFO between the identified reader and the write, which the re-verification step narrows but cannot eliminate. A reader that is not the one the owner saw may get the secret if it opens the pipe at the right moment; the ambiguity check covers readers already present at release time.
+- The FIFO directory must not be reachable by untrusted users, and the daemon's systemd unit needs `ReadWritePaths` for it.
+
+### 20.6 Tests
+- Reader detection: open for read triggers a notification; no reader means no request; shutdown cancels the wait.
+- Approve → reader receives the exact bytes and then EOF; deny/timeout → EOF with no data; reader exits before approval → abort, nothing written, audited.
+- Identity capture (pid/uid/exe) in the notification; `enforce_acl` allow and deny; unknown-reader and two-readers (ambiguous) denial; reader-set change between request and release.
+- FIFO setup: refuses a symlink, a non-FIFO, wrong owner; sets owner/group/mode regardless of umask; cleans up on shutdown.
+- Cool-down and per-FIFO limits; binary secrets are written raw; large secret is written in full; stuck reader hits the write deadline.
+- Audit never contains the secret.
+
+## 21. Milestones for the extensions
+
+7. Channel abstraction: refactor notification and approval into channels without changing behavior (existing tests must still pass).
+8. Home Assistant channel (§19) with the mock HA server and docs on recorder exclusion.
+9. FIFO secrets (§20) with `[[fifo]]` config, `secretctl check-config` support, packaging (`ReadWritePaths`, tmpfiles) and docs.
+10. Security review of both extensions.
