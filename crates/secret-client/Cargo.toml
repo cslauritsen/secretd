@@ -1,0 +1,6 @@
+[package]
+name = "secret-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,0 +1,6 @@
+[package]
+name = "secretd"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

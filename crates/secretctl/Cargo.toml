@@ -1,0 +1,23 @@
+[package]
+name = "secretctl"
+description = "Admin CLI for secretd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "secretctl"
+path = "src/main.rs"
+
+[dependencies]
+secret-proto = { path = "../secret-proto", features = ["server"] }
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+libc.workspace = true
+rpassword = "7"
+
+[dev-dependencies]
+tempfile.workspace = true
