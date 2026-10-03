@@ -552,7 +552,8 @@ impl Core {
 
         // Only requests that can actually reach the owner are logged one by
         // one (and fail closed when the log is dead): rejections above are
-        // coalesced, and are bounded per minute by the attempt limiter below.
+        // coalesced, and the attempt limiter above bounds how many requests per
+        // minute and uid get this far.
         self.audit_for(AuditEvent::new("request_received").secret(&name), caller)
             .map_err(|_| internal())?;
         let secret_cfg = cfg.secret(&name).ok_or_else(internal)?;

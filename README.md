@@ -16,8 +16,12 @@ time.
 ```
 
 * Always sealed: the passphrase is never stored; every release needs a fresh approval.
-* The caller is identified by the kernel (`SO_PEERCRED`) plus `/proc/<pid>/exe`, and is
-  re-verified at release time (pid reuse / exec-after-connect gives `CALLER_CHANGED`).
+* The caller is identified by the kernel (`SO_PEERCRED`, plus `SO_PEERPIDFD` where available)
+  and `/proc/<pid>/exe`, snapshotted at accept, re-checked when each request arrives and again at
+  release time (pid reuse / exec-after-connect gives `CALLER_CHANGED`). **Executable pinning is
+  defence in depth, not a boundary:** a process running as an allowed uid can run an allowed binary
+  (or win a connect/fork/exec race) and pass the ACL. The owner's per-request approval and passphrase
+  are the real gate, so give secrets to dedicated uids and read the caller details on the approval page.
 * Per-secret ACLs (uid / gid / executable path), per-uid rate limits, an append-only audit log.
 * Owner authentication is Google OIDC restricted to an email allowlist; `secretd` itself speaks
   plain HTTP on loopback and sits behind a TLS-terminating reverse proxy.
@@ -43,18 +47,24 @@ sudo install -m0644 packaging/secretd.service packaging/secretd.socket \
 sudo install -m0644 packaging/tmpfiles.d/secretd.conf /etc/tmpfiles.d/
 sudo install -m0644 packaging/sysusers.d/secretd.conf /etc/sysusers.d/
 sudo systemd-sysusers && sudo systemd-tmpfiles --create
+# Who may ask for secrets: members of the dedicated socket group (NOT the `secretd` group).
+sudo usermod -aG secretd-clients alice
 ```
+
+The client socket belongs to `secretd-clients`, a group created by `sysusers.d` that is separate
+from the `secretd` group which can read `/etc/secretd`: being allowed to connect never implies read
+access to the daemon's files. (The ACLs in the config still decide what each caller may request.)
 
 ## Quickstart
 
 1. **Google OIDC client.** In Google Cloud Console create an OAuth client (type *Web
    application*) with the authorized redirect URI `https://secretd.example.com/auth/callback`.
    Save the client secret to `/etc/secretd/oidc-client-secret`
-   (`chown root:secretd`, `chmod 0640`). Google requires a real hostname with a valid
+   (`chown secretd:secretd`, `chmod 0400`; credential files must be readable by the daemon user only). Google requires a real hostname with a valid
    certificate, hence the reverse proxy below.
 2. **Push channel.** Pick an [ntfy](https://ntfy.sh) topic (use a long random name or an
    access-controlled topic) and install the ntfy app on your phone. Put an access token, if any,
-   in `/etc/secretd/ntfy.token`.
+   in `/etc/secretd/ntfy.token` (`secretd:secretd`, `0400`).
 3. **Config.** `sudo install -m0640 -o root -g secretd packaging/config.example.toml
    /etc/secretd/config.toml`, then set `external_url`, `oidc.client_id`, `owner_emails`,
    `notify.url` and your `[[secret]]` ACLs. Validate it:
@@ -62,7 +72,12 @@ sudo systemd-sysusers && sudo systemd-tmpfiles --create
    sudo secretctl check-config
    ```
 4. **Create the store and add secrets** (stop the daemon first; `secretctl` edits the file
-   directly and prompts for the passphrase with echo disabled):
+   directly and prompts for the passphrase with echo disabled). **Run these as the `secretd`
+   user** (`sudo -u secretd`), so the store is owned by the account the daemon runs as. If run as
+   root, `secretctl` chowns the store to the daemon user (`daemon.user`) afterwards and warns, but
+   the supported way is `sudo -u secretd`. Only the terminal approval commands (`pending`, `approve`,
+   `deny`) need root, because the admin socket accepts uid 0 only. `--passphrase-file` is for
+   automation and tests, not for real stores.
    ```sh
    sudo -u secretd secretctl init
    echo -n 's3cret' | sudo -u secretd secretctl add db-password   # or no-echo prompt
@@ -90,6 +105,9 @@ sudo systemd-sysusers && sudo systemd-tmpfiles --create
    passphrase and press **Approve** (or **Deny**). Over SSH you can instead run
    `sudo secretctl pending` and `sudo secretctl approve <id>` / `deny <id>` (admin socket,
    root only, passphrase prompt with echo disabled).
+
+   Keep the client connection open while waiting: a client that half-closes its write side after
+   sending the request (`shutdown(SHUT_WR)`) is treated as gone and the request is cancelled.
 
 `secret` exit codes: `0` ok, `1` generic, `2` not found / not permitted, `3` denied, `4` timeout,
 `5` rate limited. `secret inject` writes nothing and exits non-zero if any lookup fails; with
@@ -147,6 +165,16 @@ secretd.example.com {
 (default loopback); keep the proxy on the same host, or list its address and set
 `allow_non_loopback = true` if `secretd` must listen elsewhere.
 
+## Audit log and limits
+
+`/var/log/secretd/audit.jsonl` (mode `0640`, JSON lines, every event has an `outcome`) is reopened
+on `SIGHUP`: rotate with `mv audit.jsonl audit.jsonl.1 && systemctl reload secretd`. Repeated
+rejections (`rate_limited`, `acl_denied`, `caller_changed`, HTTP limiter hits) are written once per
+60 s window per uid/IP followed by a summary line with a count; real approvals are logged
+individually and fail closed if the log cannot be written. The unit bounds descriptors, memory
+(`MemoryMax=1G`: one scrypt derivation needs about 256 MiB at the default work factor, and stores
+above work factor 2^22 are refused) and tasks; raise `LimitNOFILE` if you raise the connection limits.
+
 ## Approval model
 
 An approval needs three things: the unguessable per-request link (delivered by push), a valid
@@ -161,7 +189,7 @@ denial, client disconnect: HTTP 410).
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-SECRETD_TEST_MULTIUID=1 cargo test -p secret --test cli multiuid   # needs root + setpriv
+SECRETD_TEST_MULTIUID=1 cargo test --workspace                    # needs root + setpriv
 ```
 
 The integration tests run the daemon in-process with an injectable peer-credential provider,
