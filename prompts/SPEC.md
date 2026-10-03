@@ -151,11 +151,11 @@ Note: exe matching is a defense-in-depth measure, not a sandbox boundary. A proc
 - **Owner authentication is Google OIDC only.** There are no local passwords, bearer tokens, or basic-auth credentials.
   - Flow: authorization code with PKCE, plus `state` and `nonce`. Use the `openidconnect` crate against `https://accounts.google.com` (discovery document). Request scopes `openid email`.
   - Validate the ID token fully: signature against Google's JWKS, `iss`, `aud` equal to the configured client id, `exp`, `nonce`, `email_verified == true`. Match on the `email` claim (case-insensitive, exact) against `owner_emails`, a configured allowlist. Not on the `hd` claim alone. Anything not on the list gets a generic 403 and an audit event.
-  - **Fresh authentication per approval:** send `prompt=login` and `max_age=0`, and verify the `auth_time` claim is within the last 5 minutes. A stale browser session is not enough to approve a request.
+  - **OIDC is a session gate, not a per-request step.** Once the owner has signed in, the session is reused across requests until it expires. Do not force re-authentication (no `prompt=login` / `max_age`). The per-request control is the passphrase, which must be entered for every approval.
   - **Passkeys:** not required or enforced by `secretd`. Sign-in method is Google's concern; the owner may use a passkey if their Google account offers it. If an `amr` claim is present, record it in the audit log but do not rely on it.
-  - After login, issue a short-lived server-side session (default 10 minutes, `HttpOnly`, `Secure`, `SameSite=Lax`, bound to the request id so it cannot approve other requests).
+  - After login, issue a server-side session (default 1 hour via `session_ttl_secs`, absolute expiry, `HttpOnly`, `Secure`, `SameSite=Lax`). The session identifies the owner only. It authorizes viewing and acting on pending requests, but never releases a secret without the passphrase. Sessions are in-memory only and lost on restart.
   - `secretd` stores no Google tokens beyond validating the ID token. Discard the access and refresh tokens (do not request offline access).
-- Approval therefore needs three things: the unguessable per-request token (delivered via push), a fresh Google sign-in as an allowlisted email, and the store passphrase, which is the actual decryption key.
+- Approval therefore needs three things: the unguessable per-request token (delivered via push), a valid Google-authenticated session for an allowlisted email, and the store passphrase (entered every time), which is the actual decryption key.
 - Rate-limit failed attempts per source IP (e.g., 5 per minute, then 429).
 - Never log tokens, passphrases, ID tokens, or secret values. Never put the passphrase in a URL.
 
@@ -245,7 +245,7 @@ client_id = "xxxxxxxx.apps.googleusercontent.com"
 client_secret_file = "/etc/secretd/oidc-client-secret"
 redirect_url = "https://secretd.example.com/auth/callback"
 owner_emails = ["owner@example.com"]
-max_auth_age_secs = 300
+session_ttl_secs = 3600
 
 [[secret]]
 name = "db-password"
@@ -264,7 +264,7 @@ allow_exes = ["/usr/bin/psql"]
 ## 14. Testing requirements
 
 - Unit tests: framing, JSON-RPC parsing/errors, token parsing for `inject` (including chunk-boundary splits and escapes), ACL evaluation, age store encrypt/decrypt round trip, wrong-passphrase and tamper detection, and a check that unseal returns only the requested secret and the passphrase buffer is zeroized.
-- OIDC tests use a mock OIDC provider (local issuer with a test JWKS): reject bad signature, wrong `aud`/`iss`, expired token, wrong `nonce`, `email_verified=false`, an email not on the allowlist, and a stale `auth_time`.
+- OIDC tests use a mock OIDC provider (local issuer with a test JWKS): reject bad signature, wrong `aud`/`iss`, expired token, wrong `nonce`, `email_verified=false`, an email not on the allowlist, and an expired or missing session.
 - Integration tests (spawn the daemon on a temp socket, using a mock ntfy HTTP server and driving the approval endpoint over HTTP):
   - approve flow returns the secret; deny returns `DENIED`; timeout returns `TIMEOUT`;
   - ACL miss is indistinguishable from an unknown name;
@@ -298,7 +298,7 @@ Network-reachable secret access (Unix socket only), non-Linux platforms, grant c
 
 Resolved:
 1. One passphrase per age-encrypted store. It unseals the store for a single request, then everything is discarded (§4).
-2. Owner authentication is Google OIDC only, restricted to an email allowlist, with fresh sign-in per approval (§7.2). The owner then supplies the passphrase. The earlier `owner_auth_token_file` design is removed.
+2. Owner authentication is Google OIDC only, restricted to an email allowlist, with a reusable session (§7.2). The owner supplies the passphrase on every approval. The earlier `owner_auth_token_file` design is removed.
 3. `secretd` has no TLS code and needs no cert or key. It listens on loopback (or behind a TLS-terminating reverse proxy) and trusts forwarded headers only from configured proxies (§7.2).
 
 Passkeys are not required; whatever sign-in methods Google offers (including passkeys) are sufficient (§7.2).
