@@ -140,3 +140,54 @@ async fn admin_socket_requires_uid_zero() {
     let r = admin.call("admin.deny", json!({"wrong": 1})).await;
     assert_eq!(r.error.unwrap().code, -32602);
 }
+
+struct Switch(Arc<std::sync::atomic::AtomicBool>);
+impl std::io::Write for Switch {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(std::io::Error::other("disk full"))
+        } else {
+            Ok(b.len())
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn admin_actions_follow_audit_log_health() {
+    let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let h = Harness::start(Opts {
+        audit_writer: Some(Box::new(Switch(dead.clone()))),
+        ..Opts::default()
+    })
+    .await;
+    let (path, _) = start_admin(&h, 0).await;
+    let mut client = h.connect().await;
+    client
+        .send("secret.get", json!({"name": "db-password"}))
+        .await;
+    let n = h.notifier.wait_for(1).await;
+    let id = n[0].request_id.clone();
+    let mut admin = Conn::connect(&path).await;
+
+    dead.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Approving and listing must not proceed without an audit trail.
+    let r = admin
+        .call(
+            "admin.approve",
+            json!({"request_id": id, "passphrase": PASS}),
+        )
+        .await;
+    assert_eq!(err_kind(&r), "INTERNAL");
+    assert_eq!(h.core.pending_count(), 1, "approve did not proceed");
+    let r = admin.call("admin.pending", json!({})).await;
+    assert_eq!(err_kind(&r), "INTERNAL");
+    // Denying is the fail-safe direction: it happens, and says it was not logged.
+    let r = admin.call("admin.deny", json!({"request_id": id})).await;
+    let res = r.result.expect("deny proceeds");
+    assert_eq!(res["ok"], true);
+    assert!(res["warning"].as_str().unwrap().contains("audit"));
+    assert_eq!(err_kind(&client.recv().await.unwrap()), "DENIED");
+}

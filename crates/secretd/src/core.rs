@@ -43,7 +43,14 @@ pub struct Released {
 }
 
 enum Outcome {
-    Released(Released),
+    /// The secret, plus a channel on which the waiting request handler
+    /// confirms that the `released` audit event was written (so the owner is
+    /// only told "released" when that is true).
+    Released {
+        rel: Released,
+        source_ip: Option<IpAddr>,
+        ack: oneshot::Sender<bool>,
+    },
     Denied,
     DecryptFailed,
     CallerChanged,
@@ -81,6 +88,9 @@ pub enum ApproveOutcome {
     Gone,
     /// Another approval of the same request is in progress.
     Busy,
+    /// The client stopped waiting (timeout, disconnect) while the store was
+    /// being unsealed; nothing was released.
+    Aborted,
     /// Caller identity changed; request aborted with `CALLER_CHANGED`.
     CallerChanged,
     /// The secret is not in the store (config/store mismatch).
@@ -91,7 +101,12 @@ pub enum ApproveOutcome {
 #[derive(Debug, PartialEq, Eq)]
 pub enum DenyOutcome {
     Denied,
+    /// Denied, but the audit log could not be written (reported, not hidden).
+    DeniedUnaudited,
     Gone,
+    /// An approval of this request is being processed right now; it can no
+    /// longer be denied (the client will receive the secret or an abort).
+    Busy,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -128,6 +143,11 @@ pub struct Core {
     audit: Audit,
     notifier: Arc<dyn Notifier>,
     procs: Arc<dyn ProcReader>,
+    /// Serialises unsealing: one scrypt derivation can need hundreds of MiB.
+    unseal_gate: tokio::sync::Semaphore,
+    /// Test hook: artificial delay inside the blocking unseal task, to widen
+    /// the race window between approve and deny/timeout/disconnect.
+    unseal_delay: Mutex<Duration>,
 }
 
 /// Decrements the connection counters when dropped.
@@ -185,7 +205,15 @@ impl Core {
             audit,
             notifier,
             procs,
+            unseal_gate: tokio::sync::Semaphore::new(1),
+            unseal_delay: Mutex::new(Duration::ZERO),
         })
+    }
+
+    /// Test hook: make every unseal take at least `d` longer.
+    #[doc(hidden)]
+    pub fn set_unseal_delay(&self, d: Duration) {
+        *self.unseal_delay.lock().unwrap_or_else(|e| e.into_inner()) = d;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -412,50 +440,84 @@ impl Core {
             approval_url: format!("{}/approve/{id}?t={token}", cfg.approval.external_url),
         };
 
-        let work = async {
+        let notify_fut = async {
             if let Err(e) = self.notifier.notify(&notification).await {
                 tracing::error!("{e}");
                 return Err(());
             }
-            if self
-                .audit_for(
-                    AuditEvent::new("notified").request(&id).secret(&name),
-                    caller,
-                )
-                .is_err()
-            {
-                return Err(());
-            }
-            Ok((&mut rx).await)
+            self.audit_for(
+                AuditEvent::new("notified").request(&id).secret(&name),
+                caller,
+            )
+            .map_err(|_| ())
         };
-        tokio::pin!(work);
+        tokio::pin!(notify_fut);
         tokio::pin!(disconnect);
 
         enum Done {
-            Notify(Result<Result<Outcome, oneshot::error::RecvError>, ()>),
+            Outcome(Option<Outcome>),
+            NotifyFailed,
             Timeout,
             Gone,
         }
-        let done = tokio::select! {
-            r = &mut work => Done::Notify(r),
-            _ = tokio::time::sleep_until(deadline) => Done::Timeout,
-            _ = &mut disconnect => Done::Gone,
+        // The owner cannot act before `notified` is audited, so the outcome
+        // channel is only polled afterwards (keeps the audit order stable).
+        let mut notified = false;
+        let mut done = loop {
+            tokio::select! {
+                r = &mut notify_fut, if !notified => match r {
+                    Ok(()) => notified = true,
+                    Err(()) => break Done::NotifyFailed,
+                },
+                o = &mut rx, if notified => break Done::Outcome(o.ok()),
+                _ = tokio::time::sleep_until(deadline) => break Done::Timeout,
+                _ = &mut disconnect => break Done::Gone,
+            }
         };
+        // Close the channel before deciding: from here on an approver's
+        // `send` fails (and the owner is told), unless it already succeeded,
+        // in which case the outcome is honoured. This makes "who won" atomic.
+        if matches!(done, Done::Timeout | Done::Gone) {
+            rx.close();
+            if let Ok(o) = rx.try_recv() {
+                done = Done::Outcome(Some(o));
+            }
+        }
 
         match done {
-            Done::Notify(Ok(Ok(outcome))) => match outcome {
-                Outcome::Released(r) => Ok(r),
+            Done::Outcome(Some(outcome)) => match outcome {
+                Outcome::Released {
+                    rel,
+                    source_ip,
+                    ack,
+                } => {
+                    let audited = self
+                        .audit_for(
+                            AuditEvent::new("released")
+                                .request(&id)
+                                .secret(&name)
+                                .source(source_ip),
+                            caller,
+                        )
+                        .is_ok();
+                    let _ = ack.send(audited);
+                    if audited {
+                        Ok(rel)
+                    } else {
+                        Err(internal())
+                    }
+                }
                 Outcome::Denied => Err(RpcError::new(ErrorKind::Denied)),
                 Outcome::DecryptFailed => Err(RpcError::new(ErrorKind::DecryptFailed)),
                 Outcome::CallerChanged => Err(RpcError::new(ErrorKind::CallerChanged)),
                 Outcome::NotFound => Err(RpcError::new(ErrorKind::NotFound)),
                 Outcome::Internal => Err(internal()),
             },
-            Done::Notify(Ok(Err(_))) => {
+            Done::Outcome(None) => {
                 self.remove(&id);
                 Err(internal())
             }
-            Done::Notify(Err(())) => {
+            Done::NotifyFailed => {
                 self.remove(&id);
                 let _ = self.audit_for(
                     AuditEvent::new("notify_failed").request(&id).secret(&name),
@@ -576,29 +638,71 @@ impl Core {
         }
     }
 
-    /// Owner denies the request.
+    /// Owner denies the request. A request whose approval is being processed
+    /// (store unsealing) can no longer be denied.
     pub fn deny(&self, id: &str, source: Source) -> DenyOutcome {
-        let Some(mut p) = self.remove(id) else {
-            return DenyOutcome::Gone;
+        let mut p = {
+            let mut st = self.lock();
+            match st.pending.get(id) {
+                None => return DenyOutcome::Gone,
+                Some(p) if p.expires <= Instant::now() => {
+                    st.pending.remove(id);
+                    return DenyOutcome::Gone;
+                }
+                Some(p) if p.busy => return DenyOutcome::Busy,
+                Some(_) => {}
+            }
+            st.pending.remove(id).expect("checked above")
         };
-        if p.expires <= Instant::now() {
-            return DenyOutcome::Gone;
-        }
-        let _ = self.audit_for(
-            AuditEvent::new("denied")
-                .request(id)
-                .secret(&p.secret)
-                .source(source.ip()),
-            &p.caller,
-        );
+        let audited = self
+            .audit_for(
+                AuditEvent::new("denied")
+                    .request(id)
+                    .secret(&p.secret)
+                    .source(source.ip()),
+                &p.caller,
+            )
+            .is_ok();
         if let Some(tx) = p.tx.take() {
             let _ = tx.send(Outcome::Denied);
         }
-        DenyOutcome::Denied
+        // Denial is the fail-safe direction, so it proceeds even when the
+        // audit log is dead; the caller is told that it was not recorded.
+        if audited {
+            DenyOutcome::Denied
+        } else {
+            DenyOutcome::DeniedUnaudited
+        }
+    }
+
+    /// Re-read `/proc/<pid>` and compare with the connect-time snapshot
+    /// (and, where available, check the pidfd still refers to a live process).
+    fn verify_caller(&self, caller: &Caller) -> bool {
+        let Some(orig) = &caller.proc else {
+            return false;
+        };
+        match self.procs.read(caller.pid) {
+            Ok(now) => orig.exe == now.exe && orig.start_time == now.start_time,
+            Err(_) => false,
+        }
+    }
+
+    /// Remove the request and deliver `outcome`; false if the client is no
+    /// longer waiting.
+    fn conclude(&self, id: &str, tx: oneshot::Sender<Outcome>, outcome: Outcome) -> bool {
+        self.remove(id);
+        tx.send(outcome).is_ok()
     }
 
     /// Owner approves with the store passphrase: re-verify the caller, unseal
     /// the store for this one secret, release it to the waiting client.
+    ///
+    /// The request stays in the registry (counting against the caps) while
+    /// the store is unsealed, but its reply sender is *taken out* and held
+    /// here, so only this call can answer the client. A timeout or
+    /// disconnect in that window makes the final delivery fail, which is
+    /// reported truthfully (`Aborted`, audit `aborted`); a deny is refused as
+    /// `Busy`.
     pub async fn approve(
         &self,
         id: &str,
@@ -606,24 +710,29 @@ impl Core {
         source: Source,
     ) -> ApproveOutcome {
         // Claim the request.
-        let (caller, name) = {
+        let (caller, name, attempts, tx) = {
             let mut st = self.lock();
             match st.pending.get_mut(id) {
                 Some(p) if p.expires > Instant::now() => {
                     if p.busy {
                         return ApproveOutcome::Busy;
                     }
+                    let Some(tx) = p.tx.take() else {
+                        return ApproveOutcome::Gone;
+                    };
                     p.busy = true;
-                    (p.caller.clone(), p.secret.clone())
+                    (p.caller.clone(), p.secret.clone(), p.attempts, tx)
                 }
                 _ => return ApproveOutcome::Gone,
             }
         };
         let cfg = self.config();
 
+        // Record the attempt before doing anything with the passphrase. This
+        // is *not* an approval: that is audited only after the store opened.
         if self
             .audit_for(
-                AuditEvent::new("approved")
+                AuditEvent::new("approve_attempt")
                     .request(id)
                     .secret(&name)
                     .source(source.ip()),
@@ -631,24 +740,23 @@ impl Core {
             )
             .is_err()
         {
-            self.finish(id, Outcome::Internal);
+            self.conclude(id, tx, Outcome::Internal);
             return ApproveOutcome::Internal;
         }
 
         // Re-verify the caller (pid reuse / exec-after-connect) and the ACL.
-        let verified = match (&caller.proc, self.procs.read(caller.pid)) {
-            (Some(orig), Ok(now)) => orig.exe == now.exe && orig.start_time == now.start_time,
-            _ => false,
-        };
-        if !verified {
+        if !self.verify_caller(&caller) {
+            // The request is aborted either way (fail-safe), so a dead audit
+            // log is only logged (Core::audit reports the error).
             let _ = self.audit_for(
                 AuditEvent::new("caller_changed")
                     .request(id)
                     .secret(&name)
+                    .outcome("at_release")
                     .source(source.ip()),
                 &caller,
             );
-            self.finish(id, Outcome::CallerChanged);
+            self.conclude(id, tx, Outcome::CallerChanged);
             return ApproveOutcome::CallerChanged;
         }
         if !Self::allowed(&cfg, &caller, &name) {
@@ -659,18 +767,24 @@ impl Core {
                     .outcome("acl_changed"),
                 &caller,
             );
-            self.finish(id, Outcome::NotFound);
+            self.conclude(id, tx, Outcome::NotFound);
             return ApproveOutcome::Gone;
         }
 
         // Unseal on a blocking thread; the passphrase is zeroized inside.
         let store_path = cfg.daemon.store.clone();
         let want = name.clone();
+        let delay = *self.unseal_delay.lock().unwrap_or_else(|e| e.into_inner());
+        let permit = self.unseal_gate.acquire().await;
         let res = tokio::task::spawn_blocking(move || {
             let mut pass = passphrase;
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
             store::unseal_one(&store_path, &mut pass, &want)
         })
         .await;
+        drop(permit);
 
         match res {
             Ok(Ok(entry)) => {
@@ -680,9 +794,10 @@ impl Core {
                     encoding: entry.encoding,
                 };
                 drop(entry);
+                // The passphrase opened the store: this is the approval.
                 if self
                     .audit_for(
-                        AuditEvent::new("released")
+                        AuditEvent::new("approved")
                             .request(id)
                             .secret(&name)
                             .source(source.ip()),
@@ -690,40 +805,68 @@ impl Core {
                     )
                     .is_err()
                 {
-                    self.finish(id, Outcome::Internal);
+                    self.conclude(id, tx, Outcome::Internal);
                     return ApproveOutcome::Internal;
                 }
-                self.finish(id, Outcome::Released(released));
-                ApproveOutcome::Released
+                // Hand the value to the waiting handler. If it has already
+                // given up the send fails and nothing was released.
+                self.remove(id);
+                let (ack, ack_rx) = oneshot::channel();
+                let sent = tx.send(Outcome::Released {
+                    rel: released,
+                    source_ip: source.ip(),
+                    ack,
+                });
+                if sent.is_err() {
+                    let _ = self.audit_for(
+                        AuditEvent::new("aborted")
+                            .request(id)
+                            .secret(&name)
+                            .outcome("client_gone")
+                            .source(source.ip()),
+                        &caller,
+                    );
+                    return ApproveOutcome::Aborted;
+                }
+                // The handler audits `released` and confirms; only then is
+                // the owner told that the secret was released.
+                match ack_rx.await {
+                    Ok(true) => ApproveOutcome::Released,
+                    _ => ApproveOutcome::Internal,
+                }
             }
             Ok(Err(StoreError::WrongPassphrase)) => {
-                let remaining = {
-                    let mut st = self.lock();
-                    match st.pending.get_mut(id) {
-                        Some(p) => {
-                            p.attempts += 1;
-                            p.busy = false;
-                            Some(MAX_ATTEMPTS.saturating_sub(p.attempts))
-                        }
-                        None => None,
-                    }
-                };
-                let Some(remaining) = remaining else {
-                    return ApproveOutcome::Gone;
-                };
-                let _ = self.audit_for(
-                    AuditEvent::new("decrypt_failed")
-                        .request(id)
-                        .secret(&name)
-                        .outcome(if remaining == 0 { "final" } else { "retry" })
-                        .source(source.ip()),
-                    &caller,
-                );
+                let remaining = MAX_ATTEMPTS.saturating_sub(attempts + 1);
+                let audited = self
+                    .audit_for(
+                        AuditEvent::new("decrypt_failed")
+                            .request(id)
+                            .secret(&name)
+                            .outcome(if remaining == 0 { "final" } else { "retry" })
+                            .source(source.ip()),
+                        &caller,
+                    )
+                    .is_ok();
+                if !audited {
+                    // Do not grant further guesses we cannot record.
+                    self.conclude(id, tx, Outcome::Internal);
+                    return ApproveOutcome::Internal;
+                }
                 if remaining == 0 {
-                    self.finish(id, Outcome::DecryptFailed);
-                    ApproveOutcome::Failed
-                } else {
-                    ApproveOutcome::WrongPassphrase { remaining }
+                    self.conclude(id, tx, Outcome::DecryptFailed);
+                    return ApproveOutcome::Failed;
+                }
+                // Put the reply sender back and allow a retry, unless the
+                // request was cancelled meanwhile.
+                let mut st = self.lock();
+                match st.pending.get_mut(id) {
+                    Some(p) => {
+                        p.attempts = attempts + 1;
+                        p.busy = false;
+                        p.tx = Some(tx);
+                        ApproveOutcome::WrongPassphrase { remaining }
+                    }
+                    None => ApproveOutcome::Gone,
                 }
             }
             Ok(Err(StoreError::NoSuchSecret)) => {
@@ -736,7 +879,7 @@ impl Core {
                         .source(source.ip()),
                     &caller,
                 );
-                self.finish(id, Outcome::NotFound);
+                self.conclude(id, tx, Outcome::NotFound);
                 ApproveOutcome::NotInStore
             }
             Ok(Err(e)) => {
@@ -749,22 +892,13 @@ impl Core {
                         .source(source.ip()),
                     &caller,
                 );
-                self.finish(id, Outcome::Internal);
+                self.conclude(id, tx, Outcome::Internal);
                 ApproveOutcome::Internal
             }
             Err(e) => {
                 tracing::error!("unseal task failed: {e}");
-                self.finish(id, Outcome::Internal);
+                self.conclude(id, tx, Outcome::Internal);
                 ApproveOutcome::Internal
-            }
-        }
-    }
-
-    /// Resolve a pending request: remove it and wake the waiting client.
-    fn finish(&self, id: &str, outcome: Outcome) {
-        if let Some(mut p) = self.remove(id) {
-            if let Some(tx) = p.tx.take() {
-                let _ = tx.send(outcome);
             }
         }
     }

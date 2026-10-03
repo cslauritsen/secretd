@@ -293,11 +293,21 @@ async fn handle_admin(core: Arc<Core>, stream: UnixStream, peer: Arc<dyn PeerCre
 }
 
 async fn admin_dispatch(core: &Arc<Core>, req: &Request) -> Result<Value, RpcError> {
-    let _ = core.audit(
-        &crate::audit::AuditEvent::new("admin_action")
-            .outcome(&req.method)
-            .detail("admin socket"),
-    );
+    let audited = core
+        .audit(
+            &crate::audit::AuditEvent::new("admin_action")
+                .outcome(&req.method)
+                .detail("admin socket"),
+        )
+        .is_ok();
+    // Fail closed: listing and approving need a working audit log. Denying is
+    // the fail-safe direction, so it proceeds and reports the gap instead.
+    if !audited && req.method != "admin.deny" {
+        return Err(RpcError::with_message(
+            ErrorKind::Internal,
+            "audit log unavailable; refusing to proceed",
+        ));
+    }
     match req.method.as_str() {
         "admin.pending" => Ok(json!({ "pending": core.pending_list() })),
         "admin.deny" => {
@@ -305,6 +315,14 @@ async fn admin_dispatch(core: &Arc<Core>, req: &Request) -> Result<Value, RpcErr
                 .map_err(|_| RpcError::new(ErrorKind::InvalidParams))?;
             match core.deny(&p.request_id, Source::Admin) {
                 DenyOutcome::Denied => Ok(json!({ "ok": true })),
+                DenyOutcome::DeniedUnaudited => Ok(json!({
+                    "ok": true,
+                    "warning": "denied, but the audit log could not be written"
+                })),
+                DenyOutcome::Busy => Err(RpcError::with_message(
+                    ErrorKind::Internal,
+                    "an approval of this request is in progress; it can no longer be denied",
+                )),
                 DenyOutcome::Gone => Err(RpcError::with_message(
                     ErrorKind::NotFound,
                     "no such pending request",
@@ -330,6 +348,10 @@ async fn admin_dispatch(core: &Arc<Core>, req: &Request) -> Result<Value, RpcErr
                 ApproveOutcome::Gone | ApproveOutcome::Busy => Err(RpcError::with_message(
                     ErrorKind::NotFound,
                     "no such pending request",
+                )),
+                ApproveOutcome::Aborted => Err(RpcError::with_message(
+                    ErrorKind::NotFound,
+                    "the client stopped waiting while the store was being opened; nothing was released",
                 )),
                 ApproveOutcome::CallerChanged => Err(RpcError::new(ErrorKind::CallerChanged)),
                 ApproveOutcome::NotInStore => Err(RpcError::with_message(

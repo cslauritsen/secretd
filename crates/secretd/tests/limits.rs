@@ -356,8 +356,9 @@ async fn audit_log_format_and_event_sequence() {
             "acl_denied",
             "request_received",
             "notified",
-            "approved",
+            "approve_attempt",
             "decrypt_failed",
+            "approve_attempt",
             "approved",
             "released",
             "request_received",
@@ -430,11 +431,12 @@ async fn audit_failure_fails_closed_at_request_time() {
 
 #[tokio::test]
 async fn audit_failure_before_release_withholds_the_secret() {
-    // Writes: request_received, notified, approved succeed; `released` fails.
+    // Writes: request_received, notified, approve_attempt, approved succeed;
+    // `released` fails.
     let h = Harness::start(Opts {
         audit_writer: Some(Box::new(FailAfter {
             n: Arc::new(AtomicUsize::new(0)),
-            ok_writes: 3,
+            ok_writes: 4,
         })),
         ..Opts::default()
     })
@@ -465,4 +467,25 @@ async fn audit_failure_on_approval_aborts_request() {
     let out = h.core.approve(&n[0].request_id, pw(PASS), admin()).await;
     assert_eq!(out, ApproveOutcome::Internal);
     assert_eq!(err_kind(&c.recv().await.unwrap()), "INTERNAL");
+}
+
+#[tokio::test]
+async fn audit_failure_on_wrong_passphrase_grants_no_further_guesses() {
+    // Writes: request_received, notified, approve_attempt succeed;
+    // `decrypt_failed` fails, so the retry we could not record is refused.
+    let h = Harness::start(Opts {
+        audit_writer: Some(Box::new(FailAfter {
+            n: Arc::new(AtomicUsize::new(0)),
+            ok_writes: 3,
+        })),
+        ..Opts::default()
+    })
+    .await;
+    let mut c = h.connect().await;
+    c.send("secret.get", json!({"name": "db-password"})).await;
+    let n = h.notifier.wait_for(1).await;
+    let out = h.core.approve(&n[0].request_id, pw("wrong"), admin()).await;
+    assert_eq!(out, ApproveOutcome::Internal);
+    assert_eq!(err_kind(&c.recv().await.unwrap()), "INTERNAL");
+    assert_eq!(h.core.pending_count(), 0);
 }

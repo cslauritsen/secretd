@@ -543,6 +543,16 @@ async fn post_approve(
     match action.as_str() {
         "deny" => match st.core.deny(&id, Source::Http(ip)) {
             DenyOutcome::Denied => simple_page(StatusCode::OK, "Denied", "The request was denied."),
+            DenyOutcome::DeniedUnaudited => simple_page(
+                StatusCode::OK,
+                "Denied (not logged)",
+                "The request was denied, but the audit log could not be written.",
+            ),
+            DenyOutcome::Busy => simple_page(
+                StatusCode::CONFLICT,
+                "Approval in progress",
+                "An approval of this request is being processed and can no longer be denied.",
+            ),
             DenyOutcome::Gone => gone(),
         },
         "approve" => {
@@ -586,6 +596,12 @@ async fn post_approve(
                     )
                 }
                 ApproveOutcome::Gone => gone(),
+                ApproveOutcome::Aborted => simple_page(
+                    StatusCode::GONE,
+                    "Not released",
+                    "The requesting process stopped waiting (timed out, disconnected or \
+                     cancelled) while the store was being opened. Nothing was released.",
+                ),
                 ApproveOutcome::Busy => simple_page(
                     StatusCode::CONFLICT,
                     "Busy",
