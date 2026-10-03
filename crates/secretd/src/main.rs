@@ -94,9 +94,11 @@ async fn main() -> Result<()> {
         "approval endpoint on {} (plain HTTP; terminate TLS in a reverse proxy)",
         approval_cfg.listen
     );
-    tokio::spawn(secretd::approval::serve(
+    let serve_opts = secretd::approval::ServeOpts::from_cfg(&approval_cfg);
+    tokio::spawn(secretd::approval::serve_with(
         http_listener,
         secretd::approval::router(core.clone(), approval_cfg, oidc),
+        serve_opts,
     ));
     let peer: Arc<dyn secretd::peer::PeerCredProvider> = Arc::new(RealPeerCred);
     tokio::spawn(server::serve_clients(core.clone(), client_l, peer.clone()));

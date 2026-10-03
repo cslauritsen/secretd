@@ -9,14 +9,14 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Extension, Router};
 use hmac::{Hmac, Mac};
 use secret_proto::config::ApprovalCfg;
 use secret_proto::rpc::PendingInfo;
 use secret_proto::sanitize;
 use sha2::Sha256;
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -26,12 +26,16 @@ pub const SESSION_COOKIE: &str = "__Host-sd_session";
 pub const LOGIN_COOKIE: &str = "__Host-sd_login";
 const LOGIN_TTL: Duration = Duration::from_secs(600);
 const MAX_STATES: usize = 1000;
+/// Login states one source address may have outstanding; the oldest is
+/// evicted for a new one (so an attacker only ever displaces itself).
+const MAX_LOGIN_STATES_PER_IP: usize = 5;
 
 struct Session {
     expires: Instant,
 }
 
 struct LoginState {
+    ip: IpAddr,
     pkce_verifier: Zeroizing<String>,
     nonce: String,
     /// Validated `/approve/<id>?t=<token>` to return to.
@@ -39,12 +43,100 @@ struct LoginState {
     created: Instant,
 }
 
+/// Outstanding OIDC logins. Bounded globally and per source address; when a
+/// bound is hit the *oldest* entry is evicted rather than refusing the new
+/// login, so flooding cannot lock the owner out (it can only make its own
+/// pending logins, and the oldest ones overall, expire early).
+struct LoginStore {
+    by_state: HashMap<String, LoginState>,
+    max_total: usize,
+    max_per_ip: usize,
+}
+
+impl LoginStore {
+    fn new(max_total: usize, max_per_ip: usize) -> Self {
+        LoginStore {
+            by_state: HashMap::new(),
+            max_total,
+            max_per_ip,
+        }
+    }
+
+    fn evict_oldest(&mut self, ip: Option<IpAddr>) {
+        let victim = self
+            .by_state
+            .iter()
+            .filter(|(_, v)| ip.is_none_or(|i| v.ip == i))
+            .min_by_key(|(_, v)| v.created)
+            .map(|(k, _)| k.clone());
+        if let Some(k) = victim {
+            self.by_state.remove(&k);
+        }
+    }
+
+    fn insert(&mut self, state: String, login: LoginState, now: Instant) {
+        self.by_state
+            .retain(|_, v| now.duration_since(v.created) < LOGIN_TTL);
+        while self.by_state.values().filter(|v| v.ip == login.ip).count() >= self.max_per_ip {
+            self.evict_oldest(Some(login.ip));
+        }
+        while self.by_state.len() >= self.max_total {
+            self.evict_oldest(None);
+        }
+        self.by_state.insert(state, login);
+    }
+
+    fn take(&mut self, state: &str) -> Option<LoginState> {
+        self.by_state.remove(state)
+    }
+}
+
+/// Sliding one-minute window of events per source address.
+struct IpWindow {
+    hits: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+    max: usize,
+}
+
+impl IpWindow {
+    fn new(max: usize) -> Self {
+        IpWindow {
+            hits: Mutex::new(HashMap::new()),
+            max,
+        }
+    }
+
+    /// Record one event; false (and not recorded) if `ip` is over its budget.
+    fn allow(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut m = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        if m.len() > 10_000 {
+            m.retain(|_, q| {
+                q.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+                !q.is_empty()
+            });
+        }
+        let q = m.entry(ip).or_default();
+        while q
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(60))
+        {
+            q.pop_front();
+        }
+        if q.len() >= self.max {
+            return false;
+        }
+        q.push_back(now);
+        true
+    }
+}
+
 pub struct AppState {
     core: Arc<Core>,
     cfg: ApprovalCfg,
     oidc: Arc<OidcClient>,
     sessions: Mutex<HashMap<String, Session>>,
-    logins: Mutex<HashMap<String, LoginState>>,
+    logins: Mutex<LoginStore>,
+    login_starts: IpWindow,
     failures: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
     csrf_key: [u8; 32],
 }
@@ -52,12 +144,14 @@ pub struct AppState {
 pub fn router(core: Arc<Core>, cfg: ApprovalCfg, oidc: Arc<OidcClient>) -> Router {
     let mut csrf_key = [0u8; 32];
     getrandom::getrandom(&mut csrf_key).expect("OS randomness available");
+    let login_limit = cfg.max_login_starts_per_min as usize;
     let state = Arc::new(AppState {
         core,
         cfg,
         oidc,
         sessions: Mutex::new(HashMap::new()),
-        logins: Mutex::new(HashMap::new()),
+        logins: Mutex::new(LoginStore::new(MAX_STATES, MAX_LOGIN_STATES_PER_IP)),
+        login_starts: IpWindow::new(login_limit),
         failures: Mutex::new(HashMap::new()),
         csrf_key,
     });
@@ -72,13 +166,79 @@ pub fn router(core: Arc<Core>, cfg: ApprovalCfg, oidc: Arc<OidcClient>) -> Route
         .with_state(state)
 }
 
-/// Serve the router on `listener` until the task is dropped.
+/// Connection-level limits of the approval listener.
+#[derive(Debug, Clone, Copy)]
+pub struct ServeOpts {
+    /// Simultaneous connections; further ones are closed straight away.
+    pub max_connections: usize,
+    /// Time to receive complete request headers (also bounds idle keep-alive).
+    pub header_read_timeout: Duration,
+    /// Upper bound for the lifetime of one connection.
+    pub max_lifetime: Duration,
+}
+
+impl Default for ServeOpts {
+    fn default() -> Self {
+        ServeOpts {
+            max_connections: 64,
+            header_read_timeout: Duration::from_secs(10),
+            max_lifetime: Duration::from_secs(300),
+        }
+    }
+}
+
+impl ServeOpts {
+    pub fn from_cfg(cfg: &ApprovalCfg) -> Self {
+        ServeOpts {
+            max_connections: cfg.max_connections,
+            header_read_timeout: Duration::from_secs(cfg.header_read_timeout_secs),
+            max_lifetime: Duration::from_secs(cfg.request_timeout_secs.saturating_mul(10).max(60)),
+        }
+    }
+}
+
+/// Serve the router on `listener` with the default connection limits.
 pub async fn serve(listener: tokio::net::TcpListener, app: Router) -> std::io::Result<()> {
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
+    serve_with(listener, app, ServeOpts::default()).await
+}
+
+/// Serve the router with an explicit connection cap and timeouts: at most
+/// `max_connections` connections are served at once (extra ones are closed at
+/// accept), a client must deliver its request headers within
+/// `header_read_timeout` (slowloris), and no connection lives longer than
+/// `max_lifetime`. Per-request time is bounded by the router's own timeout.
+pub async fn serve_with(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    opts: ServeOpts,
+) -> std::io::Result<()> {
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use hyper_util::service::TowerToHyperService;
+    let slots = Arc::new(tokio::sync::Semaphore::new(opts.max_connections));
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!("approval accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            tracing::warn!("approval listener at its connection cap; dropping {peer}");
+            drop(stream);
+            continue;
+        };
+        let app = app.clone().layer(Extension(ConnectInfo(peer)));
+        tokio::spawn(async move {
+            let _permit = permit;
+            let conn = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(opts.header_read_timeout)
+                .serve_connection(TokioIo::new(stream), TowerToHyperService::new(app));
+            let _ = tokio::time::timeout(opts.max_lifetime, conn).await;
+        });
+    }
 }
 
 // ------------------------------------------------------------ middleware
@@ -86,15 +246,53 @@ pub async fn serve(listener: tokio::net::TcpListener, app: Router) -> std::io::R
 const BASE_CSP: &str =
     "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
+/// Canonical form of a `Host` header / `external_host`: lower-case, IPv6
+/// literals in compressed form, no trailing dot, default port dropped.
+fn host_key(h: &str) -> Option<(String, Option<u16>)> {
+    let h = h.trim().to_ascii_lowercase();
+    let (host, port) = if let Some(rest) = h.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']')?;
+        let port = match after {
+            "" => None,
+            a => Some(a.strip_prefix(':')?.parse::<u16>().ok()?),
+        };
+        let ip: Ipv6Addr = inner.parse().ok()?;
+        (format!("[{ip}]"), port)
+    } else {
+        match h.rsplit_once(':') {
+            Some((a, p)) if !a.contains(':') => (a.to_string(), Some(p.parse::<u16>().ok()?)),
+            Some(_) => return None,
+            None => (h.clone(), None),
+        }
+    };
+    let host = host.trim_end_matches('.').to_string();
+    (!host.is_empty()).then_some((host, port.filter(|p| *p != 443)))
+}
+
+fn host_matches(header: &str, external_host: &str) -> bool {
+    match (host_key(header), host_key(external_host)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 async fn guard(State(st): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    // Bounds the whole request including reading a body that is dripped in.
+    let limit = Duration::from_secs(st.cfg.request_timeout_secs);
+    match tokio::time::timeout(limit, guard_inner(&st, req, next)).await {
+        Ok(r) => r,
+        Err(_) => with_headers((StatusCode::REQUEST_TIMEOUT, "request timeout").into_response()),
+    }
+}
+
+async fn guard_inner(st: &AppState, req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     if path != "/healthz" {
         let host = req
             .headers()
             .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .map(str::to_ascii_lowercase);
-        if host.as_deref() != Some(&st.cfg.external_host.to_ascii_lowercase()) {
+            .and_then(|h| h.to_str().ok());
+        if !host.is_some_and(|h| host_matches(h, &st.cfg.external_host)) {
             return with_headers((StatusCode::BAD_REQUEST, "bad host").into_response());
         }
     }
@@ -293,10 +491,14 @@ impl AppState {
     }
 
     fn rate_limited_response(&self, ip: IpAddr) -> Response {
+        self.rate_limited_for(ip, "http_failed_attempts")
+    }
+
+    fn rate_limited_for(&self, ip: IpAddr, why: &str) -> Response {
         // Coalesced: a limited address can keep hammering at will.
         let _ = self.core.audit_coalesced(
             AuditEvent::new("rate_limited")
-                .outcome("http_failed_attempts")
+                .outcome(why)
                 .source(Some(ip)),
             &ip.to_string(),
         );
@@ -525,6 +727,12 @@ async fn post_approve(
         }
         TokenCheck::Mismatch => {
             st.fail(ip);
+            st.audit(
+                AuditEvent::new("admin_action")
+                    .request(&id)
+                    .outcome("bad_approval_token")
+                    .source(Some(ip)),
+            );
             return simple_page(StatusCode::FORBIDDEN, "Forbidden", "Access denied.");
         }
         TokenCheck::Ok => {}
@@ -653,6 +861,11 @@ async fn auth_login(
         },
         None => None,
     };
+    // Every login start counts, whether or not it later completes: each one
+    // costs an upstream discovery lookup and a server-side state entry.
+    if !st.login_starts.allow(ip) {
+        return st.rate_limited_for(ip, "http_login_rate");
+    }
     let req = match st.oidc.start().await {
         Ok(r) => r,
         Err(e) => {
@@ -664,27 +877,17 @@ async fn auth_login(
             );
         }
     };
-    {
-        let mut l = st.logins.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        l.retain(|_, v| now.duration_since(v.created) < LOGIN_TTL);
-        if l.len() >= MAX_STATES {
-            return simple_page(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Busy",
-                "Too many sign-ins in progress.",
-            );
-        }
-        l.insert(
-            req.state.clone(),
-            LoginState {
-                pkce_verifier: req.pkce_verifier,
-                nonce: req.nonce,
-                next,
-                created: now,
-            },
-        );
-    }
+    st.logins.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        req.state.clone(),
+        LoginState {
+            ip,
+            pkce_verifier: req.pkce_verifier,
+            nonce: req.nonce,
+            next,
+            created: Instant::now(),
+        },
+        Instant::now(),
+    );
     let mut r = redirect(&req.url);
     set_cookie(&mut r, LOGIN_COOKIE, &req.state, LOGIN_TTL.as_secs());
     r
@@ -719,7 +922,7 @@ async fn auth_callback(
         .logins
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(state);
+        .take(state);
     let Some(login) = login else {
         return forbidden(&st, "unknown_state");
     };
@@ -804,6 +1007,87 @@ mod tests {
             esc("<a href=\"x\">&'"),
             "&lt;a href=&quot;x&quot;&gt;&amp;&#39;"
         );
+    }
+
+    fn login(ip: &str, created: Instant) -> LoginState {
+        LoginState {
+            ip: ip.parse().unwrap(),
+            pkce_verifier: Zeroizing::new("v".into()),
+            nonce: "n".into(),
+            next: None,
+            created,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn login_store_evicts_oldest_instead_of_refusing() {
+        let mut st = LoginStore::new(3, 2);
+        let t0 = Instant::now();
+        let step = |n: u64| t0 + Duration::from_secs(n);
+        // Global cap: the fourth insert evicts the globally oldest entry.
+        st.insert("a".into(), login("10.0.0.1", step(1)), step(1));
+        st.insert("b".into(), login("10.0.0.2", step(2)), step(2));
+        st.insert("c".into(), login("10.0.0.3", step(3)), step(3));
+        st.insert("d".into(), login("10.0.0.4", step(4)), step(4));
+        assert!(st.take("a").is_none(), "oldest evicted");
+        for k in ["b", "c", "d"] {
+            assert!(st.take(k).is_some(), "{k} kept");
+        }
+        // Per-IP cap: one address can only displace its own oldest entries.
+        let mut st = LoginStore::new(100, 2);
+        st.insert("v".into(), login("10.0.0.9", step(1)), step(1));
+        st.insert("x1".into(), login("10.0.0.1", step(2)), step(2));
+        st.insert("x2".into(), login("10.0.0.1", step(3)), step(3));
+        st.insert("x3".into(), login("10.0.0.1", step(4)), step(4));
+        assert!(st.take("x1").is_none(), "attacker's own oldest evicted");
+        assert!(st.take("x2").is_some() && st.take("x3").is_some());
+        assert!(st.take("v").is_some(), "other addresses are untouched");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn login_store_drops_expired_entries() {
+        let mut st = LoginStore::new(10, 10);
+        let t0 = Instant::now();
+        st.insert("old".into(), login("10.0.0.1", t0), t0);
+        let later = t0 + LOGIN_TTL + Duration::from_secs(1);
+        st.insert("new".into(), login("10.0.0.1", later), later);
+        assert!(st.take("old").is_none());
+        assert!(st.take("new").is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ip_window_limits_per_address() {
+        let w = IpWindow::new(2);
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        assert!(w.allow(a) && w.allow(a));
+        assert!(!w.allow(a));
+        assert!(w.allow(b));
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(w.allow(a));
+    }
+
+    #[test]
+    fn host_matching_handles_ipv6_and_ports() {
+        // Plain names: case, default port, trailing dot.
+        assert!(host_matches("Secretd.Test", "secretd.test"));
+        assert!(host_matches("secretd.test:443", "secretd.test"));
+        assert!(host_matches("secretd.test.", "secretd.test"));
+        assert!(!host_matches("secretd.test:8443", "secretd.test"));
+        assert!(!host_matches("evil.test", "secretd.test"));
+        assert!(!host_matches("", "secretd.test"));
+        // IPv6 external hosts as the url crate renders them.
+        assert!(host_matches("[::1]:8443", "[::1]:8443"));
+        assert!(host_matches("[0:0:0:0:0:0:0:1]:8443", "[::1]:8443"));
+        assert!(host_matches("[0000:0000::0001]:8443", "[::1]:8443"));
+        assert!(host_matches("[2001:DB8::1]", "[2001:db8:0:0:0:0:0:1]"));
+        assert!(host_matches("[::1]:443", "[::1]"));
+        assert!(!host_matches("[::1]:8444", "[::1]:8443"));
+        assert!(!host_matches("[::2]:8443", "[::1]:8443"));
+        assert!(!host_matches("::1:8443", "[::1]:8443"), "unbracketed v6");
+        assert!(!host_matches("[::1", "[::1]"));
+        assert!(!host_matches("[::1]x", "[::1]"));
+        assert!(!host_matches("[::1]:99999", "[::1]"));
     }
 
     #[test]

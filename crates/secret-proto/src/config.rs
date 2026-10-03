@@ -62,6 +62,14 @@ struct RawApproval {
     allow_non_loopback: bool,
     #[serde(default = "default_fail_limit")]
     max_failed_attempts_per_min: u32,
+    #[serde(default = "default_login_limit")]
+    max_login_starts_per_min: u32,
+    #[serde(default = "default_max_connections")]
+    max_connections: usize,
+    #[serde(default = "default_header_timeout")]
+    header_read_timeout_secs: u64,
+    #[serde(default = "default_request_timeout")]
+    request_timeout_secs: u64,
     oidc: RawOidc,
 }
 
@@ -86,6 +94,18 @@ fn default_proxies() -> Vec<String> {
 }
 fn default_fail_limit() -> u32 {
     5
+}
+fn default_login_limit() -> u32 {
+    10
+}
+fn default_max_connections() -> usize {
+    64
+}
+fn default_header_timeout() -> u64 {
+    10
+}
+fn default_request_timeout() -> u64 {
+    30
 }
 fn default_issuer() -> String {
     "https://accounts.google.com".into()
@@ -276,6 +296,14 @@ pub struct ApprovalCfg {
     pub trusted_proxies: Vec<Cidr>,
     pub allow_non_loopback: bool,
     pub max_failed_attempts_per_min: u32,
+    /// `/auth/login` starts per source IP per minute before HTTP 429.
+    pub max_login_starts_per_min: u32,
+    /// Simultaneous HTTP connections; further ones are closed at accept.
+    pub max_connections: usize,
+    /// Time a client has to send complete request headers.
+    pub header_read_timeout_secs: u64,
+    /// Time a whole request (headers, body, handler) may take.
+    pub request_timeout_secs: u64,
     pub oidc: OidcCfg,
 }
 
@@ -426,9 +454,26 @@ impl Config {
             .map(|s| Cidr::parse(s))
             .collect::<Result<Vec<_>, _>>()?;
 
+        if a.max_connections == 0
+            || a.header_read_timeout_secs == 0
+            || a.request_timeout_secs == 0
+            || a.max_login_starts_per_min == 0
+        {
+            return err("approval connection limits and timeouts must be non-zero");
+        }
+
         let o = &a.oidc;
-        if !(o.issuer.starts_with("https://") || o.issuer.starts_with("http://")) {
-            return err("approval.oidc.issuer must be a URL");
+        let issuer = url::Url::parse(&o.issuer)
+            .map_err(|_| ConfigError("approval.oidc.issuer is not a valid URL".into()))?;
+        match issuer.scheme() {
+            "https" => {}
+            // Plain http is tolerated only towards this machine (local mock
+            // providers); a network issuer over http would let anyone on the
+            // path forge the discovery document and the signing keys.
+            "http" if issuer_is_loopback(&issuer) => warnings.push(
+                "approval.oidc.issuer uses plain http (loopback only; for local testing)".into(),
+            ),
+            _ => return err("approval.oidc.issuer must be an https:// URL"),
         }
         if o.client_id.trim().is_empty() {
             return err("approval.oidc.client_id is empty");
@@ -552,6 +597,10 @@ impl Config {
                 trusted_proxies,
                 allow_non_loopback: a.allow_non_loopback,
                 max_failed_attempts_per_min: a.max_failed_attempts_per_min,
+                max_login_starts_per_min: a.max_login_starts_per_min,
+                max_connections: a.max_connections,
+                header_read_timeout_secs: a.header_read_timeout_secs,
+                request_timeout_secs: a.request_timeout_secs,
                 oidc,
             },
             secrets,
@@ -574,6 +623,15 @@ impl Config {
 
     pub fn secret(&self, name: &str) -> Option<&SecretAcl> {
         self.secrets.iter().find(|s| s.name == name)
+    }
+}
+
+fn issuer_is_loopback(u: &url::Url) -> bool {
+    match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     }
 }
 
@@ -725,6 +783,48 @@ owner_emails = ["Owner@Example.com"]
         assert_eq!(c.approval.external_host, "x.example.com:8444");
         let b = BASE.replace("https://secretd.example.com", "https://x.example.com/sub");
         assert!(Config::parse(&b, &R).is_err());
+    }
+
+    #[test]
+    fn oidc_issuer_must_be_https() {
+        let t = |iss: &str| {
+            Config::parse(
+                &BASE.replace(
+                    "[approval.oidc]\n",
+                    &format!("[approval.oidc]\nissuer = \"{iss}\"\n"),
+                ),
+                &R,
+            )
+        };
+        assert!(t("https://accounts.google.com").is_ok());
+        assert!(t("http://accounts.google.com").is_err());
+        assert!(t("http://idp.example.com:8080").is_err());
+        assert!(t("ftp://idp.example.com").is_err());
+        assert!(t("not a url").is_err());
+        // Loopback http is allowed for local mock providers, with a warning.
+        for l in [
+            "http://127.0.0.1:9000",
+            "http://localhost:9000",
+            "http://[::1]:9",
+        ] {
+            let c = t(l).unwrap();
+            assert!(c.warnings.iter().any(|w| w.contains("plain http")), "{l}");
+        }
+        // Look-alike hosts are not loopback.
+        assert!(t("http://127.0.0.1.evil.example").is_err());
+    }
+
+    #[test]
+    fn zero_limits_are_rejected() {
+        assert!(parse("[limits]\nmax_conns_total = 0\n").is_err());
+        assert!(parse("[limits]\nmax_conns_per_uid = 0\n").is_err());
+        assert!(parse("[limits]\nadmin_idle_timeout_secs = 0\n").is_err());
+        assert!(parse("[limits]\nmax_conns_total = 1\n").is_ok());
+        assert!(Config::parse(
+            &BASE.replace("[approval]\n", "[approval]\nmax_connections = 0\n"),
+            &R
+        )
+        .is_err());
     }
 
     #[test]
