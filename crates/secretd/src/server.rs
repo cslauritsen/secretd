@@ -1,7 +1,7 @@
 //! Unix socket servers: the client socket (`secret.*`, `server.ping`) and the
 //! admin socket (`admin.*`).  Newline-delimited JSON-RPC 2.0, async I/O.
 
-use crate::core::{ApproveOutcome, Core, DenyOutcome, Released, Source};
+use crate::core::{ApproveOutcome, Caller, Core, DenyOutcome, Released, Source};
 use crate::peer::PeerCredProvider;
 use secret_proto::rpc::{
     parse_request, AdminApproveParams, AdminDenyParams, ErrorKind, GetParams, ListResult,
@@ -116,6 +116,10 @@ fn release_line(id: &Value, r: &Released) -> Zeroizing<Vec<u8>> {
 }
 
 /// Accept loop for the client socket.
+///
+/// Peer credentials and the `/proc` snapshot are taken right here, inline,
+/// as the first thing done with a new connection (before it is handed to a
+/// task, before any cap is checked), to minimise the connect/fork/exec window.
 pub async fn serve_clients(
     core: Arc<Core>,
     listener: UnixListener,
@@ -130,25 +134,24 @@ pub async fn serve_clients(
                 continue;
             }
         };
+        let cred = match peer.peer_cred(&stream) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("SO_PEERCRED failed: {e}");
+                continue;
+            }
+        };
+        let caller = core.capture(cred, peer.peer_pidfd(&stream));
         let core = core.clone();
-        let peer = peer.clone();
         tokio::spawn(async move {
-            handle_client(core, stream, peer).await;
+            handle_client(core, stream, caller).await;
         });
     }
 }
 
-async fn handle_client(core: Arc<Core>, stream: UnixStream, peer: Arc<dyn PeerCredProvider>) {
-    // Credentials come from the kernel, read immediately.
-    let cred = match peer.peer_cred(&stream) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("SO_PEERCRED failed: {e}");
-            return;
-        }
-    };
+async fn handle_client(core: Arc<Core>, stream: UnixStream, mut caller: Caller) {
     let (rd, mut wr) = stream.into_split();
-    let Some(_guard) = core.acquire_conn(cred.uid) else {
+    let Some(_guard) = core.acquire_conn(caller.uid) else {
         let _ = send(
             &mut wr,
             &Response::err(Value::Null, RpcError::new(ErrorKind::RateLimited)),
@@ -156,7 +159,7 @@ async fn handle_client(core: Arc<Core>, stream: UnixStream, peer: Arc<dyn PeerCr
         .await;
         return;
     };
-    let caller = core.identify(cred);
+    core.resolve_username(&mut caller);
     let mut lr = LineReader::new(rd);
     let idle = Duration::from_secs(core.config().limits.idle_timeout_secs.max(1));
 

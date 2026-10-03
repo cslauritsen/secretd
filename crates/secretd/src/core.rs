@@ -14,6 +14,7 @@ use secret_proto::{valid_secret_name, Encoding, MAX_REASON_CHARS};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::IpAddr;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use time::format_description::well_known::Rfc3339;
@@ -33,6 +34,9 @@ pub struct Caller {
     pub username: String,
     /// `None` when `/proc` resolution failed: every request is then denied.
     pub proc: Option<ProcInfo>,
+    /// `SO_PEERPIDFD` handle, when the kernel provides one: lets a recycled
+    /// pid be told apart from the process that connected.
+    pub pidfd: Option<Arc<OwnedFd>>,
 }
 
 /// A decrypted secret on its way to the client.
@@ -246,9 +250,11 @@ impl Core {
 
     // ------------------------------------------------------------ identity
 
-    /// Build a [`Caller`] from kernel-verified credentials, capturing `/proc`
-    /// details once.
-    pub fn identify(&self, cred: PeerCred) -> Caller {
+    /// First step after `accept`: snapshot the peer's `/proc` identity. This
+    /// is deliberately synchronous and does nothing else (no name lookups, no
+    /// cap checks), to keep the window small in which a process can connect,
+    /// fork and exec an allowed binary before the daemon looks.
+    pub fn capture(&self, cred: PeerCred, pidfd: Option<OwnedFd>) -> Caller {
         let proc = match self.procs.read(cred.pid) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -256,18 +262,34 @@ impl Core {
                 None
             }
         };
-        let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(cred.uid))
-            .ok()
-            .flatten()
-            .map(|u| sanitize::clean(&u.name, 64))
-            .unwrap_or_else(|| format!("uid{}", cred.uid));
+        // A pidfd that does not name the SO_PEERCRED pid (pid namespaces) is
+        // not trusted for liveness checks.
+        let pidfd = pidfd.filter(|fd| crate::peer::pidfd_pid(fd.as_fd()) == Some(cred.pid));
         Caller {
             uid: cred.uid,
             gid: cred.gid,
             pid: cred.pid,
-            username,
+            username: String::new(),
             proc,
+            pidfd: pidfd.map(Arc::new),
         }
+    }
+
+    /// Fill in the (possibly slow, NSS-backed) user name.
+    pub fn resolve_username(&self, caller: &mut Caller) {
+        caller.username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(caller.uid))
+            .ok()
+            .flatten()
+            .map(|u| sanitize::clean(&u.name, 64))
+            .unwrap_or_else(|| format!("uid{}", caller.uid));
+    }
+
+    /// Build a [`Caller`] from kernel-verified credentials, capturing `/proc`
+    /// details once.
+    pub fn identify(&self, cred: PeerCred) -> Caller {
+        let mut c = self.capture(cred, None);
+        self.resolve_username(&mut c);
+        c
     }
 
     fn allowed(cfg: &Config, caller: &Caller, name: &str) -> bool {
@@ -289,6 +311,9 @@ impl Core {
 
     /// Names the caller passes the ACL for.
     pub fn list_names(&self, caller: &Caller) -> Vec<String> {
+        if caller.proc.is_some() && !self.verify_caller(caller) {
+            return Vec::new();
+        }
         let cfg = self.config();
         cfg.secrets
             .iter()
@@ -335,6 +360,19 @@ impl Core {
             .map(|r| sanitize::clean(r, MAX_REASON_CHARS))
             .filter(|r| !r.is_empty());
         let cfg = self.config();
+
+        // Re-read /proc now: the connection may have been inherited by (or
+        // outlived) the process we looked at when it was accepted. Any change
+        // of executable or start time, or the process being gone, is refused.
+        if caller.proc.is_some() && !self.verify_caller(caller) {
+            let _ = self.audit_for(
+                AuditEvent::new("caller_changed")
+                    .secret(&name)
+                    .outcome("at_request"),
+                caller,
+            );
+            return Err(RpcError::new(ErrorKind::CallerChanged));
+        }
 
         self.audit_for(AuditEvent::new("request_received").secret(&name), caller)
             .map_err(|_| internal())?;
@@ -681,6 +719,11 @@ impl Core {
         let Some(orig) = &caller.proc else {
             return false;
         };
+        if let Some(fd) = &caller.pidfd {
+            if !crate::peer::pidfd_alive(fd.as_fd()) {
+                return false;
+            }
+        }
         match self.procs.read(caller.pid) {
             Ok(now) => orig.exe == now.exe && orig.start_time == now.start_time,
             Err(_) => false,
