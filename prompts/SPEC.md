@@ -152,7 +152,7 @@ Note: exe matching is a defense-in-depth measure, not a sandbox boundary. A proc
   - Flow: authorization code with PKCE, plus `state` and `nonce`. Use the `openidconnect` crate against `https://accounts.google.com` (discovery document). Request scopes `openid email`.
   - Validate the ID token fully: signature against Google's JWKS, `iss`, `aud` equal to the configured client id, `exp`, `nonce`, `email_verified == true`. Match on the `email` claim (case-insensitive, exact) against `owner_emails`, a configured allowlist. Not on the `hd` claim alone. Anything not on the list gets a generic 403 and an audit event.
   - **Fresh authentication per approval:** send `prompt=login` and `max_age=0`, and verify the `auth_time` claim is within the last 5 minutes. A stale browser session is not enough to approve a request.
-  - **Passkeys:** the intent is for the owner to sign in with a passkey. Google controls the sign-in method, and the ID token does not reliably reveal it, so `secretd` cannot enforce passkeys itself. Document that the owner should enable passkeys, and ideally enforce them via Google account settings (for Workspace, via the "2-Step Verification" / passkey policy). If an `amr` claim is present, record it in the audit log but do not rely on it.
+  - **Passkeys:** not required or enforced by `secretd`. Sign-in method is Google's concern; the owner may use a passkey if their Google account offers it. If an `amr` claim is present, record it in the audit log but do not rely on it.
   - After login, issue a short-lived server-side session (default 10 minutes, `HttpOnly`, `Secure`, `SameSite=Lax`, bound to the request id so it cannot approve other requests).
   - `secretd` stores no Google tokens beyond validating the ID token. Discard the access and refresh tokens (do not request offline access).
 - Approval therefore needs three things: the unguessable per-request token (delivered via push), a fresh Google sign-in as an allowlisted email, and the store passphrase, which is the actual decryption key.
@@ -299,9 +299,8 @@ Network-reachable secret access (Unix socket only), non-Linux platforms, grant c
 Resolved:
 1. One passphrase per age-encrypted store. It unseals the store for a single request, then everything is discarded (§4).
 2. Owner authentication is Google OIDC only, restricted to an email allowlist, with fresh sign-in per approval (§7.2). The owner then supplies the passphrase. The earlier `owner_auth_token_file` design is removed.
-
 3. `secretd` has no TLS code and needs no cert or key. It listens on loopback (or behind a TLS-terminating reverse proxy) and trusts forwarded headers only from configured proxies (§7.2).
 
-Open:
-1. Google cannot be forced to use passkeys from `secretd`'s side (§7.2). Is enforcing them in the Google account settings enough?
+Passkeys are not required; whatever sign-in methods Google offers (including passkeys) are sufficient (§7.2).
+
 Note: Google OIDC needs an HTTPS redirect URI on a real hostname (or `localhost`), so the reverse proxy must front a real domain with a valid certificate.
