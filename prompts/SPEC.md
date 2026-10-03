@@ -81,14 +81,13 @@ Standard JSON-RPC errors (-32700, -32600, -32601, -32602) apply for malformed in
 
 ## 4. Secret store
 
-- Single file, default `/var/lib/secretd/store.enc`, mode `0600`, owned by `secretd`.
-- Format: a versioned header plus an encrypted blob.
-  - KDF: Argon2id (params stored in the header; defaults m=64 MiB, t=3, p=1) deriving a key from the owner's passphrase.
-  - AEAD: XChaCha20-Poly1305 (or AES-256-GCM). Each secret is encrypted individually so one approval decrypts only the requested secret. Use a per-secret random nonce and bind the secret name and store version as AAD.
-  - Metadata that must be readable before decryption (secret names, ACLs) is stored in a plaintext-but-integrity-protected section (an HMAC under a key derived from the passphrase is acceptable; alternatively place the ACLs in the config file instead). **Decision for the implementer:** keep names and ACLs in the config file (`/etc/secretd/config.toml`) and keep only ciphertexts in the store. This avoids needing the key to evaluate ACLs.
-- Writes are atomic (write temp, `fsync`, rename).
-- In-memory handling: use `zeroize` / `secrecy`; call `mlock` on key and plaintext buffers where possible; disable core dumps (`prctl(PR_SET_DUMPABLE, 0)`, `RLIMIT_CORE=0`).
-- Passphrase-derived key is derived on demand per approval and dropped immediately after decrypting the one requested secret.
+- The store is a single [age](https://age-encryption.org) file, default `/var/lib/secretd/store.age`, mode `0600`, owned by `secretd`. It is encrypted to a **single passphrase** using age's scrypt recipient (use the Rust `age` crate; no custom crypto). The plaintext is a serialized map of `name -> {encoding, value}` (e.g., JSON or CBOR).
+- One passphrase per store. There are no per-secret keys.
+- **Unseal-per-request:** `secretd` is always sealed. For each approved request it decrypts the store in memory with the owner-supplied passphrase, extracts only the one requested secret, then immediately zeroizes the passphrase, the decrypted map, and all other secrets. Nothing is cached between requests, and a second request needs a fresh passphrase entry.
+- Names and ACLs are kept in the config file (`/etc/secretd/config.toml`), not the store, so ACLs can be evaluated while sealed. `secretd` should warn if the config and store disagree about which names exist, but must not need the passphrase to start.
+- Writes (done only by `secretctl`) are atomic: write temp, `fsync`, rename.
+- scrypt work factor: use age's default or higher for new stores. Because age uses one scrypt derivation per decrypt, expect roughly 0.5–1s per approval; this is acceptable.
+- In-memory handling: use `zeroize` / `secrecy`; call `mlock` on passphrase and plaintext buffers where possible; disable core dumps (`prctl(PR_SET_DUMPABLE, 0)`, `RLIMIT_CORE=0`). Decryption must run on a blocking thread so it does not stall the async runtime.
 
 ## 5. Approval flow
 
@@ -96,8 +95,8 @@ Standard JSON-RPC errors (-32700, -32600, -32601, -32602) apply for malformed in
 2. `secretd` checks: ACL (§6), rate limits (§8). If it fails, return the error immediately and audit it. No notification is sent for ACL failures.
 3. `secretd` creates a **pending request** with a random 128-bit `request_id` and a separate random 256-bit `approval_token` (both from the OS CSPRNG). It stores caller identity, secret name, reason, created and expiry times.
 4. `secretd` sends a push notification (§7) containing: request id, secret name, caller uid/username, pid, exe path, sanitized cmdline, client-supplied reason (labelled), expiry time, and an approval URL containing the token. **Never** include the secret or any key.
-5. The owner opens the approval URL (§7.2), reviews the details, and either denies, or approves by entering the passphrase.
-6. On approve, `secretd` re-verifies the caller (§3.2), derives the key, decrypts the one secret, zeroizes the key, and returns the value to the waiting client.
+5. The owner opens the approval URL (§7.2) and signs in with Google OIDC. Only after passing that gate (and the allowlist check) does the page show the request details and the Approve (passphrase field) and Deny controls.
+6. On approve, `secretd` re-verifies the caller (§3.2), unseals the store with the passphrase, extracts the one secret, zeroizes the passphrase and everything else decrypted (§4), and returns the value to the waiting client.
 7. On wrong passphrase, return an inline error to the owner and allow up to 3 attempts; after that, the request is denied and audited (`DECRYPT_FAILED` is sent to the client only on final failure).
 8. On deny, timeout, or client disconnect, the pending request is removed. Client disconnect before approval cancels the request, and the approval URL then returns 410 Gone.
 9. Approval tokens are single-use and expire with the request.
@@ -139,15 +138,26 @@ Note: exe matching is a defense-in-depth measure, not a sandbox boundary. A proc
 ### 7.2 Approval HTTPS endpoint
 `secretd` runs an HTTP server (separate listener from the Unix socket) for the owner.
 
-- Must use TLS. Config: cert and key paths, listen address. Provide `secretctl gen-cert` to create a self-signed cert, and print its SHA-256 fingerprint for pinning. Plain HTTP is only allowed when bound to a loopback address (for use behind a reverse proxy) with an explicit config flag.
+- `secretd` does **not** terminate TLS and needs no certificate or key. It serves plain HTTP and must be reachable only via loopback or through a reverse proxy that handles TLS.
+  - Default listen address is `127.0.0.1:8443`. If the configured address is not loopback, refuse to start unless `allow_non_loopback = true` is set (for a proxy on another host or a container network), and log a warning.
+  - `external_url` (an `https://` URL) is mandatory. It is used to build approval links and the OIDC `redirect_url`, and the cookie `Secure` flag is always set based on it, never on the incoming scheme.
+  - Reverse proxy: `trusted_proxies` lists the proxy IPs/CIDRs (default `127.0.0.1/32`, `::1/128`). Use `X-Forwarded-For` for source-IP rate limiting and audit only when the TCP peer is in `trusted_proxies`; otherwise ignore it and use the peer address. Reject requests whose `Host` header does not match `external_url`'s host.
+  - Document an example proxy config (nginx or Caddy) in the README that forwards only `/approve/`, `/auth/` and `/healthz`, and sets `X-Forwarded-For`.
 - Routes:
-  - `GET /approve/<request_id>?t=<approval_token>`: HTML page showing request details with **Approve** (passphrase field) and **Deny** buttons. Constant-time token compare. Response headers: `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, a strict CSP, `X-Frame-Options: DENY`.
-  - `POST /approve/<request_id>`: form fields `t`, `action` (`approve`|`deny`), `passphrase` (for approve), `csrf`. CSRF token is bound to the request id and issued by the GET.
+  - `GET /approve/<request_id>?t=<approval_token>`: if there is no valid owner session, redirect into the OIDC login flow (below) and return here afterwards. Once authenticated, render request details with **Approve** (passphrase field) and **Deny** buttons. Constant-time token compare. Response headers: `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, a strict CSP, `X-Frame-Options: DENY`.
+  - `POST /approve/<request_id>`: form fields `t`, `action` (`approve`|`deny`), `passphrase` (for approve), `csrf`. CSRF token is bound to the request id and session and issued by the GET.
+  - `GET /auth/login`, `GET /auth/callback`: OIDC authorization-code flow (below).
   - `GET /healthz`: unauthenticated, returns `ok` only.
-- Authentication is **two factors**: possession of the unguessable per-request token (delivered via push) **and** the passphrase, which is the actual decryption key. In addition, require an HTTP basic-auth or bearer credential, configured as `owner_auth_token_file`, **if** `require_owner_auth = true` (default true). The push notification URL does not contain this credential; the owner's browser or phone stores it. This keeps a leaked push message insufficient to approve.
+- **Owner authentication is Google OIDC only.** There are no local passwords, bearer tokens, or basic-auth credentials.
+  - Flow: authorization code with PKCE, plus `state` and `nonce`. Use the `openidconnect` crate against `https://accounts.google.com` (discovery document). Request scopes `openid email`.
+  - Validate the ID token fully: signature against Google's JWKS, `iss`, `aud` equal to the configured client id, `exp`, `nonce`, `email_verified == true`. Match on the `email` claim (case-insensitive, exact) against `owner_emails`, a configured allowlist. Not on the `hd` claim alone. Anything not on the list gets a generic 403 and an audit event.
+  - **Fresh authentication per approval:** send `prompt=login` and `max_age=0`, and verify the `auth_time` claim is within the last 5 minutes. A stale browser session is not enough to approve a request.
+  - **Passkeys:** the intent is for the owner to sign in with a passkey. Google controls the sign-in method, and the ID token does not reliably reveal it, so `secretd` cannot enforce passkeys itself. Document that the owner should enable passkeys, and ideally enforce them via Google account settings (for Workspace, via the "2-Step Verification" / passkey policy). If an `amr` claim is present, record it in the audit log but do not rely on it.
+  - After login, issue a short-lived server-side session (default 10 minutes, `HttpOnly`, `Secure`, `SameSite=Lax`, bound to the request id so it cannot approve other requests).
+  - `secretd` stores no Google tokens beyond validating the ID token. Discard the access and refresh tokens (do not request offline access).
+- Approval therefore needs three things: the unguessable per-request token (delivered via push), a fresh Google sign-in as an allowlisted email, and the store passphrase, which is the actual decryption key.
 - Rate-limit failed attempts per source IP (e.g., 5 per minute, then 429).
-- Never log tokens, passphrases, or secret values. Never put the passphrase in a URL.
-- JSON API equivalent for tooling (optional, same auth): `POST /api/v1/requests/<id>/approve`.
+- Never log tokens, passphrases, ID tokens, or secret values. Never put the passphrase in a URL.
 
 ### 7.3 Terminal fallback
 `secretctl pending` lists pending requests and `secretctl approve|deny <id>` lets the owner act locally. These talk to a second Unix socket (`/run/secretd/admin.sock`, mode `0600`, owner `root`, peer uid must be 0 per `SO_PEERCRED`). The passphrase is read with echo disabled and sent over the admin socket. This path is for use over SSH when the HTTPS endpoint is not reachable.
@@ -198,7 +208,7 @@ All commands talk to the admin socket or operate on the store file directly (whe
 - `secretctl list`: names plus ACL summary from config. Never values.
 - `secretctl rotate-passphrase`: decrypt every secret with the old passphrase and re-encrypt with a new one, atomically.
 - `secretctl pending | approve <id> | deny <id>` (see §7.3)
-- `secretctl gen-cert`, `secretctl check-config` (validates config, ACLs, file permissions)
+- `secretctl check-config` (validates config, ACLs, OIDC settings, listen address, file permissions)
 
 Secrets are never accepted as command-line arguments (they would leak via `/proc/*/cmdline` and shell history).
 
@@ -211,7 +221,7 @@ TOML at `/etc/secretd/config.toml`. Example skeleton:
 user = "secretd"
 socket = "/run/secretd/secretd.sock"
 admin_socket = "/run/secretd/admin.sock"
-store = "/var/lib/secretd/store.enc"
+store = "/var/lib/secretd/store.age"
 audit_log = "/var/log/secretd/audit.jsonl"
 request_timeout_secs = 300
 
@@ -225,12 +235,17 @@ url = "https://ntfy.example.com/secretd-alerts"
 auth_token_file = "/etc/secretd/ntfy.token"
 
 [approval]
-listen = "0.0.0.0:8443"
-external_url = "https://secretd.example.com:8443"
-tls_cert = "/etc/secretd/tls.crt"
-tls_key = "/etc/secretd/tls.key"
-require_owner_auth = true
-owner_auth_token_file = "/etc/secretd/owner.token"
+listen = "127.0.0.1:8443"            # plain HTTP; TLS is the reverse proxy's job
+external_url = "https://secretd.example.com"
+trusted_proxies = ["127.0.0.1/32", "::1/128"]
+
+[approval.oidc]
+issuer = "https://accounts.google.com"
+client_id = "xxxxxxxx.apps.googleusercontent.com"
+client_secret_file = "/etc/secretd/oidc-client-secret"
+redirect_url = "https://secretd.example.com/auth/callback"
+owner_emails = ["owner@example.com"]
+max_auth_age_secs = 300
 
 [[secret]]
 name = "db-password"
@@ -248,7 +263,8 @@ allow_exes = ["/usr/bin/psql"]
 
 ## 14. Testing requirements
 
-- Unit tests: framing, JSON-RPC parsing/errors, token parsing for `inject` (including chunk-boundary splits and escapes), ACL evaluation, store encrypt/decrypt round trip, tamper detection, and KDF parameter handling.
+- Unit tests: framing, JSON-RPC parsing/errors, token parsing for `inject` (including chunk-boundary splits and escapes), ACL evaluation, age store encrypt/decrypt round trip, wrong-passphrase and tamper detection, and a check that unseal returns only the requested secret and the passphrase buffer is zeroized.
+- OIDC tests use a mock OIDC provider (local issuer with a test JWKS): reject bad signature, wrong `aud`/`iss`, expired token, wrong `nonce`, `email_verified=false`, an email not on the allowlist, and a stale `auth_time`.
 - Integration tests (spawn the daemon on a temp socket, using a mock ntfy HTTP server and driving the approval endpoint over HTTP):
   - approve flow returns the secret; deny returns `DENIED`; timeout returns `TIMEOUT`;
   - ACL miss is indistinguishable from an unknown name;
@@ -263,7 +279,7 @@ allow_exes = ["/usr/bin/psql"]
 
 ## 15. Suggested crates
 
-`tokio`, `serde`/`serde_json`, `nix` or `rustix` (`getsockopt` `SO_PEERCRED`, `prctl`, `mlock`), `axum` + `rustls` (approval server), `reqwest` (with rustls) for notifications, `argon2`, `chacha20poly1305`, `zeroize`, `secrecy`, `rand`/`getrandom`, `subtle` (constant-time compare), `toml`, `clap`, `tracing`, `thiserror`/`anyhow`, `tempfile` for tests.
+`tokio`, `serde`/`serde_json`, `nix` or `rustix` (`getsockopt` `SO_PEERCRED`, `prctl`, `mlock`), `axum` (approval server, plain HTTP), `reqwest` (with rustls) for outbound notifications and the Google OIDC calls, `age` (scrypt passphrase recipient), `openidconnect`, `tower-sessions` or similar, `zeroize`, `secrecy`, `rand`/`getrandom`, `subtle` (constant-time compare), `toml`, `clap`, `tracing`, `thiserror`/`anyhow`, `tempfile` for tests.
 
 ## 16. Milestones
 
@@ -278,9 +294,14 @@ allow_exes = ["/usr/bin/psql"]
 
 Network-reachable secret access (Unix socket only), non-Linux platforms, grant caching or TTL leases, secret versioning/history, multi-owner or quorum approval, HSM/TPM integration, `secret run`.
 
-## 18. Open questions for the owner
+## 18. Decisions and open questions
 
-Defaults assumed above; confirm or change:
-1. The passphrase typed into the approval page is the store's master passphrase (one KDF for all secrets), not a per-secret key. Should individual secrets support separate passphrases?
-2. Is a self-signed certificate with fingerprint pinning acceptable, or should the spec assume a reverse proxy with a real certificate?
-3. Is the extra `owner_auth_token_file` credential on the HTTPS endpoint acceptable (it makes phone approval need one-time browser setup), or should the unguessable URL plus passphrase be sufficient?
+Resolved:
+1. One passphrase per age-encrypted store. It unseals the store for a single request, then everything is discarded (§4).
+2. Owner authentication is Google OIDC only, restricted to an email allowlist, with fresh sign-in per approval (§7.2). The owner then supplies the passphrase. The earlier `owner_auth_token_file` design is removed.
+
+3. `secretd` has no TLS code and needs no cert or key. It listens on loopback (or behind a TLS-terminating reverse proxy) and trusts forwarded headers only from configured proxies (§7.2).
+
+Open:
+1. Google cannot be forced to use passkeys from `secretd`'s side (§7.2). Is enforcing them in the Google account settings enough?
+Note: Google OIDC needs an HTTPS redirect URI on a real hostname (or `localhost`), so the reverse proxy must front a real domain with a valid certificate.
