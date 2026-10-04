@@ -42,6 +42,13 @@ pub const DEFAULT_ADMIN_SOCKET: &str = "/var/run/secretd/admin.sock";
 #[cfg(not(target_os = "macos"))]
 pub const DEFAULT_ADMIN_SOCKET: &str = "/run/secretd/admin.sock";
 
+/// Default location of the encrypted store (per OS): macOS has no `/var/lib`;
+/// `/var/db` is where daemons keep state there.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_STORE: &str = "/var/db/secretd/store.age";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_STORE: &str = "/var/lib/secretd/store.age";
+
 /// Maximum length of one protocol line (excluding the newline): 64 KiB.
 pub const MAX_LINE_LEN: usize = 64 * 1024;
 

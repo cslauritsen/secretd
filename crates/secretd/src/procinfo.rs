@@ -115,7 +115,7 @@ impl ProcInfoReader for RealProcReader {
         // The start time first: it also fails with ESRCH for a vanished pid,
         // and a pid that is recycled between these calls shows up as a start
         // time that differs from the one captured at connect.
-        let bsd = macos::bsd_info(pid)?;
+        let start_time = macos::start_time_micros(pid)?;
         let exe = macos::pid_path(pid)?;
         // argv is best effort (it needs the same access as the rest, but
         // sysctl can refuse for hardened processes): an unreadable command
@@ -135,7 +135,7 @@ impl ProcInfoReader for RealProcReader {
         Ok(ProcInfo {
             exe,
             cmdline,
-            start_time: start_time_micros(bsd.pbi_start_tvsec, bsd.pbi_start_tvusec),
+            start_time,
         })
     }
 }

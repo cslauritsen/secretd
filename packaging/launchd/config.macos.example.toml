@@ -1,0 +1,40 @@
+# macOS: replace the [daemon] section of packaging/config.example.toml with this one
+# (everything else in that file applies unchanged). Install the result as
+# /etc/secretd/config.toml, owner root:_secretd, mode 0640.
+#
+# Paths on macOS: there is no /run (use /var/run, which macOS clears at boot; secretd
+# recreates /var/run/secretd itself while it is still root), no /var/lib (use /var/db).
+
+[daemon]
+# The account secretd drops to after binding its sockets. Two choices, see docs/HARDENING.md
+# ("macOS"):
+#   "_secretd"  least privilege. Identifying callers of OTHER users then relies on what an
+#               unprivileged process may read (proc_pidpath and the start time usually work,
+#               open descriptors and the command line do not). secretd probes this at
+#               startup and refuses to start when an ACL pins an executable for another
+#               user's processes and they cannot be inspected.
+#   "root"      keep root: every process can be inspected, FIFO reader detection sees all
+#               users. A bigger blast radius if the daemon is compromised.
+user = "_secretd"
+socket = "/var/run/secretd/secretd.sock"
+admin_socket = "/var/run/secretd/admin.sock"
+store = "/var/db/secretd/store.age"
+audit_log = "/var/log/secretd/audit.jsonl"
+request_timeout_secs = 300
+# Members of socket_group may connect (dscl/dseditgroup steps in README.md).
+socket_mode = 0o660
+socket_group = "_secretd-clients"
+
+# Named pipes ([[fifo]]): /var/run/secretd is owned by root, so the daemon (running as
+# _secretd) cannot create pipes there. Use a directory it owns, created by the install steps:
+#
+# [[fifo]]
+# path = "/var/db/secretd-pipes/db"
+# secret = "db"
+# group = "_secretd-clients"   # the readers' group; _secretd must be a member of it too
+# mode = "0640"
+#
+# Reader detection for FIFOs reads other processes' descriptor tables, which macOS only
+# allows for the same user or root: with user = "_secretd", a reader running as another user
+# is not identified (so `enforce_acl = true` refuses it, and without it the request is shown
+# as an unidentified reader).

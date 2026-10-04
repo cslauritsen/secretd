@@ -18,6 +18,22 @@ jobs:
       - name: Real multi-uid SO_PEERCRED test (root + setpriv)
         run: sudo -E env "PATH=$PATH" SECRETD_TEST_MULTIUID=1 cargo test -p secret --test cli multiuid
 
+  # macOS (spec section 22): same checks, with the libproc / LOCAL_PEERPID /
+  # PT_DENY_ATTACH code paths running for real. There is no multi-uid test here
+  # (it needs setpriv, which is util-linux).
+  test-macos:
+    name: test (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
   audit:
     runs-on: ubuntu-latest
     steps:

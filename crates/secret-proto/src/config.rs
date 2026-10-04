@@ -253,7 +253,7 @@ impl Default for DaemonCfg {
             user: "secretd".into(),
             socket: crate::DEFAULT_SOCKET.into(),
             admin_socket: crate::DEFAULT_ADMIN_SOCKET.into(),
-            store: "/var/lib/secretd/store.age".into(),
+            store: crate::DEFAULT_STORE.into(),
             audit_log: "/var/log/secretd/audit.jsonl".into(),
             request_timeout_secs: 300,
             socket_mode: 0o660,

@@ -150,6 +150,64 @@ pub fn bsd_info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
     Ok(info)
 }
 
+/// Start time in microseconds since the epoch, without needing
+/// `proc_pidinfo`: `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)` returns a
+/// `kinfo_proc` to any user, and its first field, `kp_proc.p_un.__p_starttime`,
+/// is a `struct timeval` (`i64` seconds, `i32` microseconds; offset 0 since
+/// the BSD days). libc has no `kinfo_proc`, so only those 12 bytes are read.
+/// Used when `proc_pidinfo` is refused for a process of another user, so that
+/// the start time (the pid-reuse check) does not require root. A unit test
+/// compares both sources on macOS.
+pub fn kern_proc_start_micros(pid: u32) -> io::Result<u64> {
+    let p = pid_arg(pid)?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, p];
+    // `kinfo_proc` is about 650 bytes; leave room for growth.
+    let mut buf = [0u8; 2048];
+    let mut len: libc::size_t = buf.len();
+    // SAFETY: `buf` is valid for `len` bytes.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(last_err("sysctl(KERN_PROC_PID)"));
+    }
+    if len < 16 {
+        // Success with no data: there is no such process.
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "sysctl(KERN_PROC_PID): no such process",
+        ));
+    }
+    let sec = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
+    let usec = i32::from_ne_bytes(buf[8..12].try_into().unwrap());
+    if sec <= 0 || !(0..1_000_000).contains(&usec) {
+        return Err(io::Error::other(
+            "sysctl(KERN_PROC_PID): implausible start time",
+        ));
+    }
+    Ok(crate::procinfo::start_time_micros(sec as u64, usec as u64))
+}
+
+/// The start time of `pid`: `proc_pidinfo` first, `sysctl` when that is
+/// refused (`EPERM`, other user's process).
+pub fn start_time_micros(pid: u32) -> io::Result<u64> {
+    match bsd_info(pid) {
+        Ok(b) => Ok(crate::procinfo::start_time_micros(
+            b.pbi_start_tvsec,
+            b.pbi_start_tvusec,
+        )),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => kern_proc_start_micros(pid),
+        Err(e) => Err(e),
+    }
+}
+
 /// `sysctl(KERN_PROCARGS2)`: the raw argument/environment block of `pid`.
 /// It contains the environment, hence the zeroizing buffer; parse it with
 /// [`crate::procinfo::parse_procargs2`] and drop it.
@@ -356,6 +414,17 @@ mod tests {
         assert_eq!(b.pbi_pid, me);
         assert!(b.pbi_start_tvsec > 0);
         assert_eq!(b.pbi_uid, unsafe { libc::geteuid() });
+    }
+
+    #[test]
+    fn the_sysctl_start_time_agrees_with_proc_pidinfo() {
+        let me = std::process::id();
+        let b = bsd_info(me).unwrap();
+        let want = crate::procinfo::start_time_micros(b.pbi_start_tvsec, b.pbi_start_tvusec);
+        assert_eq!(kern_proc_start_micros(me).unwrap(), want);
+        assert_eq!(start_time_micros(me).unwrap(), want);
+        // And for a process of another user (launchd), whichever source works.
+        assert!(start_time_micros(1).is_ok());
     }
 
     #[test]
