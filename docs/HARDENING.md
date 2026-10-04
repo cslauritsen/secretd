@@ -119,6 +119,40 @@ user can approve (still needing the per-request token, which only the notificati
 Transient copies of the passphrase and of the access token in WebSocket/JSON buffers are not
 zeroized (same class as the HTTP form path).
 
+## Named pipes
+
+| Threat | Control |
+|---|---|
+| Planted or swapped pipe (symlink, other file type, other owner) | `lstat` + refuse; directory must be daemon-owned and not group/other-writable and not a symlink; `O_NOFOLLOW`; every later open is checked to be our inode; a leftover FIFO is replaced, not reused |
+| Wrong owner/mode through the umask | `fchown`/`fchmod` on a descriptor, then verified; modes above `0660` or with `other` bits are config errors; the daemon's own write access is verified |
+| A process that is not the one the owner saw gets the secret | more than one reader process -> `fifo_ambiguous`; release-time re-scan must show the same pid/exe/cmdline/start time or the release aborts (`caller_changed`); somebody must still hold the read end (`POLLERR`); optional `enforce_acl` |
+| Notification flood by a looping reader | one request per pipe, `attempts_per_min` (10), cool-down (5 s, never below 250 ms), global `max_pending_total`, coalesced audit lines for locally triggerable rejections |
+| Stuck or malicious reader holding the secret in memory | non-blocking write with a deadline (`write_deadline_secs`, 5 s), then the value is dropped and the pipe closed; `aborted` with a byte count |
+| Secret in logs | audit lines carry the pipe path, identities and byte counts, never data (asserted in tests) |
+
+New limits: per-pipe `attempts_per_min` (default 10), `cooldown_secs` (5, floor 250 ms),
+`write_deadline_secs` (5), poll interval 100 ms, at most 8 x 25 ms scan retries for a just-opened
+reader; the request itself waits at most `daemon.request_timeout_secs`.
+
+Residual risks (also in the README):
+
+* **Identification is best effort and racy.** The `/proc/*/fd` scan can miss a process (race, or
+  the daemon may not look into it without `CAP_SYS_PTRACE`); a reader that cannot be identified is
+  shown as unknown, and with `enforce_acl = false` the pipe's permission bits are the only gate.
+* **Same-uid races.** A process that may open the pipe can open it between the identified reader and
+  the write; the ambiguity check covers readers present at release time, the re-check narrows the
+  window but cannot close it. The owner's approval is the real gate; give pipes to dedicated users.
+* **Anyone the file permissions admit can trigger a notification** and receives the secret if the owner
+  approves. Use a dedicated user/group, mode `0640`/`0440`-style, and a private directory.
+* **Readers block** for up to the request timeout; programs that cannot tolerate that should not use
+  a pipe. A reader that never reads keeps a large value in memory only until the write deadline.
+* **Re-arm race and the 250 ms floor.** A reader that opens the pipe again within the cool-down waits
+  for it; the floor exists because re-opening the write end instantly can hide EOF from a reader.
+* **The daemon needs write access to every pipe**, which is why the pipe cannot be a read-only (0440)
+  object owned by the reader; see `docs/DECISIONS.md`.
+* The unit's `SystemCallFilter`/`ReadWritePaths` for pipes were reviewed but not run under real
+  systemd (same as the rest of the unit).
+
 ## Known gaps
 
 * **Transient copies (not fixed).** The passphrase passes through the HTTP stack (request body, form

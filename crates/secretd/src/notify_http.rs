@@ -49,15 +49,25 @@ impl HttpNotifier {
         if let Some(d) = &n.description {
             b.push_str(&format!(" ({})", sanitize::clean(d, 120)));
         }
-        b.push_str(&format!(
-            "\nRequest ID: {}\nCaller: uid {} ({}), pid {}\nExecutable: {}\nCommand line: {}\n",
-            n.request_id,
-            n.uid,
-            sanitize::clean(&n.username, 64),
-            n.pid,
-            sanitize::clean(&n.exe, 512),
-            sanitize::clean(&n.cmdline, 256),
-        ));
+        if let Some(via) = &n.via {
+            b.push_str(&format!(
+                "\nRequested {} (caller identity is best effort)",
+                sanitize::clean(via, 600)
+            ));
+        }
+        b.push_str(&format!("\nRequest ID: {}\n", n.request_id));
+        if n.identified {
+            b.push_str(&format!(
+                "Caller: uid {} ({}), pid {}\nExecutable: {}\nCommand line: {}\n",
+                n.uid,
+                sanitize::clean(&n.username, 64),
+                n.pid,
+                sanitize::clean(&n.exe, 512),
+                sanitize::clean(&n.cmdline, 256),
+            ));
+        } else {
+            b.push_str("Caller: unknown (no reader process could be identified)\n");
+        }
         if let Some(r) = &n.reason {
             b.push_str(&format!(
                 "Reason (client-supplied, untrusted): {}\n",
@@ -84,6 +94,8 @@ impl HttpNotifier {
                 "exe": sanitize::clean(&n.exe, 512),
                 "cmdline": sanitize::clean(&n.cmdline, 256),
             },
+            "via": n.via.as_deref().map(|v| sanitize::clean(v, 600)),
+            "caller_identified": n.identified,
             "reason": n.reason.as_deref().map(|r| sanitize::clean(r, 200)),
             "reason_source": "client-supplied, untrusted",
             "expires_at": n.expires_at,

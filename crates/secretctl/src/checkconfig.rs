@@ -105,6 +105,8 @@ pub fn run(cli: &Cli) -> Result<()> {
         }
     }
 
+    check_fifos(&cfg, &mut warnings, &mut errors);
+
     // OIDC / approval summary.
     if let Some(a) = &cfg.approval {
         if a.oidc.issuer != "https://accounts.google.com" {
@@ -145,6 +147,9 @@ pub fn run(cli: &Cli) -> Result<()> {
             cfg.secrets.len(),
             channels.join(", ")
         );
+        if !cfg.fifos.is_empty() {
+            println!("OK: {} named pipe(s)", cfg.fifos.len());
+        }
         if let Some(h) = &cfg.homeassistant {
             println!(
                 "OK: Home Assistant at {} (notify {}, entity {}, {} owner user id(s))",
@@ -165,5 +170,105 @@ pub fn run(cli: &Cli) -> Result<()> {
         Ok(())
     } else {
         bail!("{} error(s) found", errors.len())
+    }
+}
+
+/// Static checks of `[[fifo]]` entries against the file system and the daemon
+/// user, mirroring what `secretd` verifies when it creates the pipes (spec 20.1).
+fn check_fifos(cfg: &Config, warnings: &mut Vec<String>, errors: &mut Vec<String>) {
+    if cfg.fifos.is_empty() {
+        return;
+    }
+    let user = nix::unistd::User::from_name(&cfg.daemon.user)
+        .ok()
+        .flatten();
+    if user.is_none() {
+        warnings.push(format!(
+            "daemon.user {:?} does not exist here: pipe ownership checks skipped",
+            cfg.daemon.user
+        ));
+    }
+    for f in &cfg.fifos {
+        let label = format!("fifo {}", f.path.display());
+        // Directory.
+        if let Some(parent) = f.path.parent() {
+            match std::fs::symlink_metadata(parent) {
+                Err(_) => warnings.push(format!(
+                    "{label}: directory {} does not exist (secretd creates it with mode 0755; \
+                     better: systemd-tmpfiles, see packaging/tmpfiles.d)",
+                    parent.display()
+                )),
+                Ok(md) => {
+                    if md.file_type().is_symlink() || !md.is_dir() {
+                        errors.push(format!(
+                            "{label}: {} is not a directory (or is a symlink)",
+                            parent.display()
+                        ));
+                    }
+                    if let Some(u) = &user {
+                        if !u.uid.is_root() && md.uid() != u.uid.as_raw() {
+                            errors.push(format!(
+                                "{label}: directory {} is owned by uid {}, not by the daemon user {:?}",
+                                parent.display(),
+                                md.uid(),
+                                cfg.daemon.user
+                            ));
+                        }
+                    }
+                    if md.mode() & 0o022 != 0 {
+                        errors.push(format!(
+                            "{label}: directory {} is writable by group or others (mode {:o})",
+                            parent.display(),
+                            md.mode() & 0o7777
+                        ));
+                    }
+                }
+            }
+        }
+        // Something already there.
+        if let Ok(md) = std::fs::symlink_metadata(&f.path) {
+            use std::os::unix::fs::FileTypeExt;
+            if md.file_type().is_symlink() || !md.file_type().is_fifo() {
+                errors.push(format!(
+                    "{label}: the path exists and is not a FIFO (symlink or other file); secretd \
+                     refuses to start"
+                ));
+            }
+        }
+        // Can the daemon user open it for writing? (It must, to answer a reader.)
+        let Some(u) = &user else { continue };
+        if u.uid.is_root() {
+            continue;
+        }
+        let uid = u.uid.as_raw();
+        let owner = f.owner.unwrap_or(uid);
+        if owner != uid {
+            errors.push(format!(
+                "{label}: owner uid {owner} is not the daemon user: an unprivileged daemon cannot \
+                 chown to another user; use the daemon user as owner (readers get access through \
+                 the group) or create the pipe with systemd-tmpfiles"
+            ));
+        }
+        let name = std::ffi::CString::new(cfg.daemon.user.clone()).ok();
+        let in_group = f.gid == u.gid.as_raw()
+            || name
+                .and_then(|n| nix::unistd::getgrouplist(&n, u.gid).ok())
+                .is_some_and(|g| g.iter().any(|x| x.as_raw() == f.gid));
+        let can_write = (owner == uid && f.mode & 0o200 != 0) || (in_group && f.mode & 0o020 != 0);
+        if !can_write {
+            errors.push(format!(
+                "{label}: owner {owner}, group {}, mode {:04o}: the daemon user cannot open it for \
+                 writing (needs the owner write bit as owner, or the group write bit as a member \
+                 of the group), so it could never answer a reader",
+                f.gid, f.mode
+            ));
+        }
+        if !in_group {
+            errors.push(format!(
+                "{label}: the daemon user is not a member of group {}: an unprivileged daemon can \
+                 only set the group of a pipe to a group it belongs to",
+                f.gid
+            ));
+        }
     }
 }

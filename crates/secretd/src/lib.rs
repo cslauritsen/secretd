@@ -7,6 +7,7 @@ pub mod approval;
 pub mod audit;
 pub mod channel;
 pub mod core;
+pub mod fifo;
 pub mod homeassistant;
 pub mod notify;
 pub mod notify_http;

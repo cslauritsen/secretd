@@ -604,15 +604,31 @@ fn approve_page(
     if let Some(d) = description {
         b.push_str(&row("Description", &esc(&sanitize::clean(d, 200))));
     }
-    b.push_str(&row(
-        "Caller",
-        &format!(
-            "uid {} ({}), pid {}",
-            info.uid,
-            esc(&info.username),
-            info.pid
-        ),
-    ));
+    if let Some(via) = &info.via {
+        b.push_str(&row(
+            "Requested",
+            &format!(
+                "{} <span class=\"note\">(caller identity is best effort)</span>",
+                esc(via)
+            ),
+        ));
+    }
+    if info.via.is_some() && info.pid == 0 {
+        b.push_str(&row(
+            "Caller",
+            "unknown (no reader process could be identified)",
+        ));
+    } else {
+        b.push_str(&row(
+            "Caller",
+            &format!(
+                "uid {} ({}), pid {}",
+                info.uid,
+                esc(&info.username),
+                info.pid
+            ),
+        ));
+    }
     b.push_str(&row(
         "Executable",
         &format!("<code>{}</code>", esc(&info.exe)),

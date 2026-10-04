@@ -25,6 +25,9 @@ pub struct Notification {
     /// Set for requests that do not come from a socket client, e.g.
     /// `via FIFO /run/secretd/pipes/db`. The caller identity is then best effort.
     pub via: Option<String>,
+    /// False when no process could be identified (named-pipe requests only);
+    /// `uid`, `username`, `pid` and `exe` are then placeholders.
+    pub identified: bool,
 }
 
 impl std::fmt::Debug for Notification {

@@ -27,7 +27,7 @@ fn service_unit_is_hardened() {
         "MemoryDenyWriteExecute=yes",
         "LockPersonality=yes",
         "SystemCallFilter=@system-service",
-        "ReadWritePaths=/var/lib/secretd /var/log/secretd",
+        "ReadWritePaths=/var/lib/secretd /var/log/secretd -/run/secretd/pipes",
         "User=secretd",
         "Sockets=secretd.socket secretd-admin.socket",
     ] {
@@ -111,4 +111,21 @@ fn clients_group_is_dedicated() {
         !cfg.contains("root:secretd 0640 ("),
         "credential files must not be group-readable"
     );
+}
+
+#[test]
+fn pipe_directory_is_provisioned() {
+    // The named pipes need a daemon-owned directory that nobody else can write
+    // to, and the unit must be allowed to write there.
+    let t = read("tmpfiles.d/secretd.conf");
+    assert!(has_line(&t, "d /run/secretd/pipes 0711 secretd secretd -"));
+    let s = read("secretd.service");
+    assert!(s
+        .lines()
+        .any(|l| l.trim().starts_with("ReadWritePaths=") && l.contains("-/run/secretd/pipes")));
+    // Pipes need mknod: the syscall filter must stay on a group that has it.
+    assert!(has_line(&s, "SystemCallFilter=@system-service"));
+    // The example config documents the pipe and the Home Assistant channel.
+    let c = read("config.example.toml");
+    assert!(c.contains("[[fifo]]") && c.contains("[homeassistant]"));
 }

@@ -25,6 +25,9 @@ time.
 * Per-secret ACLs (uid / gid / executable path), per-uid rate limits, an append-only audit log.
 * Owner authentication is Google OIDC restricted to an email allowlist; `secretd` itself speaks
   plain HTTP on loopback and sits behind a TLS-terminating reverse proxy.
+* Approval channels are selectable (`web`, `admin`, `homeassistant`), and a secret can also be
+  released through a named pipe for legacy programs (see "Channels", "Home Assistant channel" and
+  "Named-pipe (FIFO) secrets" below).
 
 | Crate | Purpose |
 |---|---|
@@ -277,6 +280,60 @@ id if present, never the action id). To find your user id: Developer tools > Eve
 `context.user_id`. `ha_require_user_id = false` is an explicit opt-out for setups whose events carry
 no user id (then only the token protects against other HA users, and `secretd` warns at start-up).
 The app event name is `mobile_app_notification_action` for the Android and current iOS Companion apps.
+
+## Named-pipe (FIFO) secrets
+
+For legacy programs that can only read a file: a pipe that behaves like `secret get`. The program
+opens the pipe for reading; `secretd` notices, starts the same pending request (push notification,
+owner approval with the passphrase), and on approval writes the **raw** value (base64 secrets are
+decoded, no newline is added) into the pipe and closes it, so the reader sees the bytes and then EOF.
+
+```toml
+[[fifo]]
+path = "/run/secretd/pipes/db-password"
+secret = "db-password"      # must exist in [[secret]]; several pipes may share one secret
+group = "app"               # the readers' group (the daemon user must be a member of it)
+mode = "0640"               # owner rw, group r (default); at most 0660, never any `other` access
+enforce_acl = false         # true: the one identified reader must also satisfy the secret's ACL
+# owner = "secretd"         # default: the daemon user
+# attempts_per_min = 10     # reader detections per minute before further ones are refused
+# cooldown_secs = 5         # pause before the pipe is armed again after a request
+# write_deadline_secs = 5   # time allowed to push the value into the pipe
+```
+
+`mode` is an octal string. **The daemon must be able to open the pipe for writing**, so it is the
+owner (default) with the owner write bit, or a member of `group` with the group write bit; readers
+get access through `group`. (An unprivileged daemon can only chown to itself and chgrp to groups it
+belongs to; `secretd` refuses to start, and `secretctl check-config` reports it, if the combination
+cannot work.) The pipe is created at start-up in a directory owned by the daemon user that nobody
+else can write to (`/run/secretd/pipes`, created by the packaged `tmpfiles.d`; the unit has
+`ReadWritePaths` for it), with owner/group/mode set explicitly (the umask plays no role), and removed
+on clean shutdown. An existing path must be a FIFO owned by the daemon user (a leftover is replaced);
+a symlink or any other file makes `secretd` refuse to start. Reload (`SIGHUP`) re-arms the pipes if
+their configuration changed.
+
+What the owner sees: the notification and approval page say `via FIFO <path>` and show the reader's
+pid, uid, executable and command line, found by scanning `/proc/*/fd` for processes that hold the pipe
+open for reading, marked **best effort** (a process can be missed by a race or because the daemon may
+not look into it). Rules: if more than one distinct process has the pipe open for reading, the request
+is denied (`fifo_ambiguous`); with `enforce_acl = true` the single identified reader must pass the
+secret's ACL, and an unidentifiable reader is denied (`fifo_reader_unknown`); just before writing, the
+reader set is checked again and a different process (or none) aborts the release with
+`caller_changed` and writes nothing. A deny, a timeout or a reader that left gives EOF without data.
+After every request the pipe stays closed for `cooldown_secs` (at least 250 ms) and at most
+`attempts_per_min` readers per minute are considered, so a program that retries in a loop cannot
+flood you.
+
+**Readers must tolerate blocking:** their `open` or `read` waits for the owner's approval, up to
+`daemon.request_timeout_secs` (default 300 s), and then sees EOF with no data if nobody approved.
+
+**Security notes.** Any process the file permissions let open the pipe can trigger a notification and,
+if you approve, receives the secret: without `enforce_acl` nothing pins the executable. Use a
+dedicated user/group, a private directory, and the tightest mode that works. Reader identification is
+racy; a same-uid process can race to open the pipe between the identified reader and the write (the
+re-check narrows but cannot close that window, and a reader that opens after the check at the right
+moment can receive the value). Your approval remains the real gate. The packaged unit has not been run
+under real systemd in the development environment (see `docs/HARDENING.md`).
 
 ## Audit log and limits
 

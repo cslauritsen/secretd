@@ -281,6 +281,11 @@ pub struct PendingInfo {
     /// Client supplied, untrusted, sanitised.
     pub reason: Option<String>,
     pub expires_at: String,
+    /// `via FIFO <path>` for named-pipe requests, whose caller identity is
+    /// best effort (all caller fields are then zero/`unknown` if no reader
+    /// process could be identified). Absent for socket clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 /// Admin socket params for `admin.approve`.

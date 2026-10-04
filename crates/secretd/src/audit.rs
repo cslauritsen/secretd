@@ -27,6 +27,9 @@ pub struct AuditEvent {
     pub outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_ip: Option<String>,
+    /// The named pipe a request came through (section 20).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fifo: Option<String>,
     /// Approval channel involved (`web`, `admin`, `homeassistant`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
@@ -54,6 +57,8 @@ pub fn default_outcome(event: &str) -> &'static str {
         "caller_changed" => "denied",
         "aborted" => "aborted",
         "admin_action" => "ok",
+        "fifo_ambiguous" => "denied",
+        "fifo_reader_unknown" => "denied",
         "ha_connected" => "connected",
         "ha_disconnected" => "disconnected",
         "ha_event_rejected" => "rejected",
@@ -89,6 +94,10 @@ impl AuditEvent {
     }
     pub fn channel(mut self, c: secret_proto::config::ChannelKind) -> Self {
         self.channel = Some(c.as_str().to_string());
+        self
+    }
+    pub fn fifo(mut self, path: &str) -> Self {
+        self.fifo = Some(path.to_string());
         self
     }
     pub fn detail(mut self, d: &str) -> Self {
@@ -187,6 +196,8 @@ mod tests {
             "caller_changed",
             "aborted",
             "admin_action",
+            "fifo_ambiguous",
+            "fifo_reader_unknown",
             "ha_connected",
             "ha_disconnected",
             "ha_event_rejected",

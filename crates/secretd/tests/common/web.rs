@@ -282,6 +282,7 @@ pub fn notification_from_click(click: &str) -> secretd::notify::Notification {
         approval_url: click.to_string(),
         approval_token: String::new(),
         via: None,
+        identified: true,
     }
 }
 

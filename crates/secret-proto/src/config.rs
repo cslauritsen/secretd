@@ -29,6 +29,42 @@ struct RawConfig {
     homeassistant: Option<RawHa>,
     #[serde(default, rename = "secret")]
     secrets: Vec<RawSecret>,
+    #[serde(default, rename = "fifo")]
+    fifos: Vec<RawFifo>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFifo {
+    path: PathBuf,
+    secret: String,
+    /// Owner of the pipe (default: the daemon user).
+    owner: Option<IdSpec>,
+    group: IdSpec,
+    /// Octal string, e.g. "0640". A TOML integer is refused on purpose (440 vs 0o440).
+    #[serde(default = "default_fifo_mode")]
+    mode: String,
+    #[serde(default)]
+    enforce_acl: bool,
+    #[serde(default = "default_fifo_attempts")]
+    attempts_per_min: usize,
+    #[serde(default = "default_fifo_cooldown")]
+    cooldown_secs: u64,
+    #[serde(default = "default_fifo_deadline")]
+    write_deadline_secs: u64,
+}
+
+fn default_fifo_mode() -> String {
+    "0640".into()
+}
+fn default_fifo_attempts() -> usize {
+    10
+}
+fn default_fifo_cooldown() -> u64 {
+    5
+}
+fn default_fifo_deadline() -> u64 {
+    5
 }
 
 #[derive(Debug, Deserialize)]
@@ -415,6 +451,27 @@ pub struct HaCfg {
     pub backoff_max_ms: u64,
 }
 
+/// A named-pipe secret (spec section 20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FifoCfg {
+    pub path: PathBuf,
+    /// Name of the secret released through this pipe (exists in `[[secret]]`).
+    pub secret: String,
+    /// `None`: the daemon user (the pipe is then not chown'ed).
+    pub owner: Option<u32>,
+    pub gid: u32,
+    /// Permission bits (octal), at most `0660`.
+    pub mode: u32,
+    /// Require the single identified reader to satisfy the secret's ACL.
+    pub enforce_acl: bool,
+    /// Reader detections per minute before further ones are refused.
+    pub attempts_per_min: usize,
+    /// Seconds to wait after a request ends before the pipe is armed again.
+    pub cooldown_secs: u64,
+    /// Seconds allowed to push the value into the pipe.
+    pub write_deadline_secs: u64,
+}
+
 /// A secret's name, description and resolved ACL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretAcl {
@@ -437,6 +494,7 @@ pub struct Config {
     pub approval: Option<ApprovalCfg>,
     /// Home Assistant settings; present exactly when `homeassistant` is enabled.
     pub homeassistant: Option<HaCfg>,
+    pub fifos: Vec<FifoCfg>,
     pub secrets: Vec<SecretAcl>,
     /// Non-fatal findings from validation.
     pub warnings: Vec<String>,
@@ -649,6 +707,37 @@ impl Config {
             });
         }
 
+        // fifos
+        let mut fifos: Vec<FifoCfg> = Vec::new();
+        for f in &raw.fifos {
+            let id = |spec: &IdSpec, user: bool| -> Result<u32, ConfigError> {
+                match spec {
+                    IdSpec::Num(n) => Ok(*n),
+                    IdSpec::Name(nm) => (if user {
+                        resolver.uid(nm)
+                    } else {
+                        resolver.gid(nm)
+                    })
+                    .ok_or_else(|| {
+                        ConfigError(format!(
+                            "fifo {}: unknown {} {nm:?}",
+                            f.path.display(),
+                            if user { "user" } else { "group" }
+                        ))
+                    }),
+                }
+            };
+            fifos.push(parse_fifo(
+                f,
+                &secrets,
+                &fifos,
+                &raw.daemon,
+                id(&f.group, false)?,
+                f.owner.as_ref().map(|o| id(o, true)).transpose()?,
+                &mut warnings,
+            )?);
+        }
+
         Ok(Config {
             daemon: raw.daemon,
             limits: raw.limits,
@@ -657,6 +746,7 @@ impl Config {
             notify,
             approval,
             secrets,
+            fifos,
             warnings,
         })
     }
@@ -924,6 +1014,105 @@ fn parse_ha(h: &RawHa, warnings: &mut Vec<String>) -> Result<HaCfg, ConfigError>
         require_user_id: h.ha_require_user_id,
         backoff_min_ms: h.backoff_min_ms,
         backoff_max_ms: h.backoff_max_ms,
+    })
+}
+
+/// Validate one `[[fifo]]` entry (spec section 20.1).
+fn parse_fifo(
+    f: &RawFifo,
+    secrets: &[SecretAcl],
+    done: &[FifoCfg],
+    daemon: &DaemonCfg,
+    gid: u32,
+    owner: Option<u32>,
+    warnings: &mut Vec<String>,
+) -> Result<FifoCfg, ConfigError> {
+    let label = f.path.display().to_string();
+    if !f.path.is_absolute() {
+        return err(format!("fifo path {label} must be absolute"));
+    }
+    if f.path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) || f.path.file_name().is_none()
+        || label.ends_with('/')
+    {
+        return err(format!(
+            "fifo path {label} must be a normalised file path (no `.`, `..` or trailing `/`)"
+        ));
+    }
+    if done.iter().any(|d| d.path == f.path) {
+        return err(format!("fifo path {label} is configured twice"));
+    }
+    for (n, p) in [
+        ("socket", &daemon.socket),
+        ("admin_socket", &daemon.admin_socket),
+        ("store", &daemon.store),
+        ("audit_log", &daemon.audit_log),
+    ] {
+        if *p == f.path {
+            return err(format!("fifo path {label} is the same as daemon.{n}"));
+        }
+    }
+    if !secrets.iter().any(|s| s.name == f.secret) {
+        return err(format!(
+            "fifo {label}: secret {:?} is not defined in [[secret]]",
+            f.secret
+        ));
+    }
+    let mode = f
+        .mode
+        .strip_prefix('0')
+        .filter(|m| !m.is_empty() && m.bytes().all(|b| (b'0'..=b'7').contains(&b)))
+        .and_then(|m| u32::from_str_radix(m, 8).ok())
+        .ok_or_else(|| {
+            ConfigError(format!(
+                "fifo {label}: mode {:?} must be an octal string such as \"0640\"",
+                f.mode
+            ))
+        })?;
+    if mode & !0o660 != 0 {
+        return err(format!(
+            "fifo {label}: mode {:04o} grants access beyond owner/group read-write (max 0660, \
+             no `other`, setuid, setgid or sticky bits)",
+            mode
+        ));
+    }
+    if mode & 0o440 == 0 {
+        return err(format!(
+            "fifo {label}: mode {mode:04o} lets nobody read the pipe"
+        ));
+    }
+    if mode & 0o220 != 0 {
+        warnings.push(format!(
+            "fifo {label}: mode {mode:04o} lets its owner/group write to the pipe as well as the \
+             daemon; any process they run may feed the reader data of its own"
+        ));
+    }
+    if f.attempts_per_min == 0 {
+        return err(format!("fifo {label}: attempts_per_min must be > 0"));
+    }
+    if f.write_deadline_secs == 0 {
+        return err(format!("fifo {label}: write_deadline_secs must be > 0"));
+    }
+    if !f.enforce_acl {
+        warnings.push(format!(
+            "fifo {label}: enforce_acl = false: the pipe's owner/group/mode is the only gate and \
+             no executable is pinned; the reader identity shown to the owner is best effort"
+        ));
+    }
+    Ok(FifoCfg {
+        path: f.path.clone(),
+        secret: f.secret.clone(),
+        owner,
+        gid,
+        mode,
+        enforce_acl: f.enforce_acl,
+        attempts_per_min: f.attempts_per_min,
+        cooldown_secs: f.cooldown_secs,
+        write_deadline_secs: f.write_deadline_secs,
     })
 }
 
@@ -1297,6 +1486,81 @@ owner_emails = ["Owner@Example.com"]
         .unwrap();
         assert!(c.homeassistant.is_none());
         assert!(c.warnings.iter().any(|w| w.contains("homeassistant")));
+    }
+
+    #[test]
+    fn fifo_rules() {
+        let fifo = |body: &str| {
+            Config::parse(
+                &format!(
+                    "{BASE}\n[[secret]]\nname='db'\nallow_uids=[1000]\nallow_exes=['/x']\n\
+                     [[fifo]]\npath = \"/run/secretd/pipes/db\"\nsecret = \"db\"\n\
+                     group = \"devs\"\n{body}\n"
+                ),
+                &R,
+            )
+        };
+        let c = fifo("").unwrap();
+        let f = &c.fifos[0];
+        assert_eq!((f.gid, f.owner, f.mode), (100, None, 0o640));
+        assert!(!f.enforce_acl);
+        assert_eq!(
+            (f.attempts_per_min, f.cooldown_secs, f.write_deadline_secs),
+            (10, 5, 5)
+        );
+        assert!(c.warnings.iter().any(|w| w.contains("enforce_acl = false")));
+        let c = fifo("owner = \"alice\"\nmode = \"0460\"\nenforce_acl = true").unwrap();
+        assert_eq!((c.fifos[0].owner, c.fifos[0].mode), (Some(1000), 0o460));
+        assert!(!c.warnings.iter().any(|w| w.contains("enforce_acl = false")));
+        // Modes: octal strings only, nothing for `other`, nobody unable to read.
+        for bad in [
+            "\"0644\"", "\"0666\"", "\"4640\"", "\"0200\"", "\"640\"", "\"0x40\"", "\"0480\"",
+            "440",
+        ] {
+            assert!(fifo(&format!("mode = {bad}")).is_err(), "{bad}");
+        }
+        assert!(fifo("mode = \"0440\"").is_ok());
+        assert!(fifo("mode = \"0660\"")
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|w| w.contains("write")));
+        // Secret must exist, names must resolve, paths must be sane and unique.
+        let raw = |path: &str, secret: &str, extra: &str| {
+            Config::parse(
+                &format!(
+                    "{BASE}\n[[secret]]\nname='db'\nallow_uids=[1000]\nallow_exes=['/x']\n\
+                     [[fifo]]\npath = \"{path}\"\nsecret = \"{secret}\"\ngroup = 100\n{extra}\n"
+                ),
+                &R,
+            )
+        };
+        assert!(raw("/p/a", "db", "").is_ok());
+        assert!(raw("/p/a", "missing", "")
+            .unwrap_err()
+            .0
+            .contains("not defined"));
+        assert!(raw("rel/p", "db", "").is_err());
+        assert!(raw("/p/../a", "db", "").is_err());
+        assert!(raw("/p/a/", "db", "").is_err());
+        assert!(raw("/p/a", "db", "owner = \"bob\"").is_err());
+        assert!(raw("/p/a", "db", "attempts_per_min = 0").is_err());
+        assert!(raw("/p/a", "db", "write_deadline_secs = 0").is_err());
+        assert!(raw("/p/a", "db", "cooldown_secs = 0").is_ok());
+        assert!(raw("/var/lib/secretd/store.age", "db", "").is_err());
+        // Two pipes may serve the same secret; the same path twice is an error.
+        let two = |p2: &str| {
+            Config::parse(
+                &format!(
+                    "{BASE}\n[[secret]]\nname='db'\nallow_uids=[1000]\nallow_exes=['/x']\n\
+                     [[fifo]]\npath = \"/p/a\"\nsecret = \"db\"\ngroup = 100\n\
+                     [[fifo]]\npath = \"{p2}\"\nsecret = \"db\"\ngroup = 100\n"
+                ),
+                &R,
+            )
+        };
+        assert_eq!(two("/p/b").unwrap().fifos.len(), 2);
+        assert!(two("/p/a").is_err());
     }
 
     #[test]

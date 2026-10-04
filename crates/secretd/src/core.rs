@@ -55,7 +55,7 @@ enum Outcome {
     Released {
         rel: Released,
         source: Source,
-        ack: oneshot::Sender<bool>,
+        ack: oneshot::Sender<Delivery>,
     },
     Denied,
     DecryptFailed,
@@ -73,7 +73,8 @@ pub enum Source {
 }
 
 impl Source {
-    fn ip(self) -> Option<IpAddr> {
+    /// Source address of an HTTP action; `None` for other channels.
+    pub fn ip(self) -> Option<IpAddr> {
         match self {
             Source::Http(ip) => Some(ip),
             Source::Admin | Source::HomeAssistant => None,
@@ -132,9 +133,63 @@ pub enum TokenCheck {
     Ok,
 }
 
+/// Where a request came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// A client on the Unix socket (`secret.get`).
+    Socket,
+    /// A reader that opened the named pipe at this path (section 20).
+    Fifo(String),
+}
+
+/// What [`Core::request_approval`] needs to know about a request.
+pub struct RequestSpec {
+    pub origin: Origin,
+    pub secret: String,
+    /// Already sanitised.
+    pub reason: Option<String>,
+    /// The client (socket) or the one identified reader (FIFO; `None` when no
+    /// reader process could be identified).
+    pub caller: Option<Caller>,
+    /// How long the owner has to answer.
+    pub wait: Duration,
+}
+
+/// What became of an approved value (reported back to the approver).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Fully delivered (and audited, for socket clients).
+    Released,
+    /// The requester could not be re-verified at release time; nothing was sent.
+    CallerChanged,
+    /// The requester went away or the write failed; nothing (complete) was sent.
+    Aborted,
+    /// Any other failure (for example the audit log).
+    Failed,
+}
+
+/// An approved request on its way to the requester. The approver is told
+/// "released" only after [`Grant::finish`] confirmed that the value really
+/// reached the requester (and was audited).
+pub struct Grant {
+    pub id: String,
+    pub rel: Released,
+    pub source: Source,
+    ack: oneshot::Sender<Delivery>,
+}
+
+impl Grant {
+    /// Report the delivery result to the approver and take the value.
+    pub fn finish(self, result: Delivery) -> Released {
+        let _ = self.ack.send(result);
+        self.rel
+    }
+}
+
 struct Pending {
     token: String,
-    caller: Caller,
+    caller: Option<Caller>,
+    origin: Origin,
     secret: String,
     description: Option<String>,
     reason: Option<String>,
@@ -292,6 +347,23 @@ impl Core {
         ev.pid = Some(caller.pid);
         ev.exe = caller.proc.as_ref().map(|p| p.exe.clone());
         self.audit(&ev)
+    }
+
+    /// Audit an event about a request: identity of the requester when known,
+    /// and the FIFO path for pipe requests.
+    pub fn audit_req(
+        &self,
+        mut ev: AuditEvent,
+        caller: Option<&Caller>,
+        origin: &Origin,
+    ) -> io::Result<()> {
+        if let Origin::Fifo(p) = origin {
+            ev.fifo = Some(p.clone());
+        }
+        match caller {
+            Some(c) => self.audit_for(ev, c),
+            None => self.audit(&ev),
+        }
     }
 
     fn rejection_event(
@@ -470,7 +542,8 @@ impl Core {
         c
     }
 
-    fn allowed(cfg: &Config, caller: &Caller, name: &str) -> bool {
+    /// Does `caller` pass the ACL of secret `name` (uid/gid and executable)?
+    pub fn allowed(cfg: &Config, caller: &Caller, name: &str) -> bool {
         let Some(proc) = &caller.proc else {
             return false;
         };
@@ -584,55 +657,151 @@ impl Core {
         // minute and uid get this far.
         self.audit_for(AuditEvent::new("request_received").secret(&name), caller)
             .map_err(|_| internal())?;
-        let secret_cfg = cfg.secret(&name).ok_or_else(internal)?;
-        let proc = caller.proc.as_ref().ok_or_else(internal)?;
+        if caller.proc.is_none() {
+            return Err(internal());
+        }
 
         let max_wait = cfg.daemon.request_timeout_secs;
         let wait = params
             .timeout_secs
             .map_or(max_wait, |t| t.clamp(1, max_wait));
+        let grant = self
+            .request_approval(
+                RequestSpec {
+                    origin: Origin::Socket,
+                    secret: name.clone(),
+                    reason,
+                    caller: Some(caller.clone()),
+                    wait: Duration::from_secs(wait),
+                },
+                disconnect,
+            )
+            .await?;
+        // The handler that waits for the client audits the release; the
+        // approver is told "released" only if that succeeded.
+        let audited = self
+            .audit_for(
+                AuditEvent::new("released")
+                    .request(&grant.id)
+                    .secret(&name)
+                    .source(grant.source.ip())
+                    .channel(grant.source.channel()),
+                caller,
+            )
+            .is_ok();
+        let rel = grant.finish(if audited {
+            Delivery::Released
+        } else {
+            Delivery::Failed
+        });
+        if audited {
+            Ok(rel)
+        } else {
+            Err(internal())
+        }
+    }
+
+    /// Create a pending request, announce it on every notification channel and
+    /// wait for the owner: the part of a release that is the same for socket
+    /// clients and named pipes. Returns the [`Grant`] once approved; the caller
+    /// delivers the value, audits `released` and calls [`Grant::finish`].
+    /// `disconnect` resolves when the requester went away.
+    pub async fn request_approval(
+        &self,
+        spec: RequestSpec,
+        disconnect: impl Future<Output = ()>,
+    ) -> Result<Grant, RpcError> {
+        let RequestSpec {
+            origin,
+            secret: name,
+            reason,
+            caller,
+            wait,
+        } = spec;
+        let cfg = self.config();
+        let secret_cfg = cfg.secret(&name).ok_or_else(internal)?;
+        let caller = caller.as_ref();
+        let proc = caller.and_then(|c| c.proc.as_ref());
+        if origin == Origin::Socket && proc.is_none() {
+            return Err(internal());
+        }
         let now = Instant::now();
-        let deadline = now + Duration::from_secs(wait);
+        let deadline = now + wait;
         let id = random_hex(16).ok_or_else(internal)?;
         let token = random_token().ok_or_else(internal)?;
         let (tx, mut rx) = oneshot::channel();
 
-        let expires_at = SystemTime::now() + Duration::from_secs(wait);
+        let expires_at = SystemTime::now() + wait;
         {
             let mut st = self.lock();
-            let dup = st.pending.values().any(|p| {
-                p.secret == name
-                    && p.caller.uid == caller.uid
-                    && p.caller.proc.as_ref().map(|x| &x.exe) == Some(&proc.exe)
-            });
-            let per_uid = st
-                .pending
-                .values()
-                .filter(|p| p.caller.uid == caller.uid)
-                .count();
-            let limited = if dup {
-                Some("duplicate")
-            } else if per_uid >= cfg.limits.max_pending_per_uid {
-                Some("pending_per_uid")
-            } else if st.pending.len() >= cfg.limits.max_pending_total {
-                Some("pending_total")
-            } else {
-                None
+            let limited = match &origin {
+                Origin::Socket => {
+                    let c = caller.ok_or_else(internal)?;
+                    let socket = |p: &&Pending| p.origin == Origin::Socket;
+                    let dup = st.pending.values().filter(socket).any(|p| {
+                        p.secret == name
+                            && p.caller.as_ref().map(|x| x.uid) == Some(c.uid)
+                            && p.caller
+                                .as_ref()
+                                .and_then(|x| x.proc.as_ref())
+                                .map(|x| &x.exe)
+                                == proc.map(|x| &x.exe)
+                    });
+                    let per_uid = st
+                        .pending
+                        .values()
+                        .filter(socket)
+                        .filter(|p| p.caller.as_ref().map(|x| x.uid) == Some(c.uid))
+                        .count();
+                    if dup {
+                        Some("duplicate")
+                    } else if per_uid >= cfg.limits.max_pending_per_uid {
+                        Some("pending_per_uid")
+                    } else if st.pending.len() >= cfg.limits.max_pending_total {
+                        Some("pending_total")
+                    } else {
+                        None
+                    }
+                }
+                // Per-request limits of a pipe are keyed on the pipe: one
+                // pending request at a time, plus the global cap.
+                Origin::Fifo(path) => {
+                    if st
+                        .pending
+                        .values()
+                        .any(|p| p.origin == Origin::Fifo(path.clone()))
+                    {
+                        Some("fifo_pending")
+                    } else if st.pending.len() >= cfg.limits.max_pending_total {
+                        Some("pending_total")
+                    } else {
+                        None
+                    }
+                }
             };
             if let Some(why) = limited {
                 drop(st);
-                self.audit_coalesced(
-                    self.rejection_event("rate_limited", &name, why, caller),
-                    &subject,
-                )
-                .map_err(|_| internal())?;
+                let (ev, subject) = match (&origin, caller) {
+                    (Origin::Socket, Some(c)) => (
+                        self.rejection_event("rate_limited", &name, why, c),
+                        c.uid.to_string(),
+                    ),
+                    (Origin::Fifo(path), _) => {
+                        let mut ev = AuditEvent::new("rate_limited").secret(&name).outcome(why);
+                        ev.fifo = Some(path.clone());
+                        (ev, path.clone())
+                    }
+                    _ => return Err(internal()),
+                };
+                self.audit_coalesced(ev, &subject).map_err(|_| internal())?;
                 return Err(RpcError::new(ErrorKind::RateLimited));
             }
             st.pending.insert(
                 id.clone(),
                 Pending {
                     token: token.clone(),
-                    caller: caller.clone(),
+                    caller: caller.cloned(),
+                    origin: origin.clone(),
                     secret: name.clone(),
                     description: secret_cfg.description.clone(),
                     reason: reason.clone(),
@@ -649,11 +818,11 @@ impl Core {
             request_id: id.clone(),
             secret_name: name.clone(),
             description: secret_cfg.description.clone(),
-            uid: caller.uid,
-            username: caller.username.clone(),
-            pid: caller.pid,
-            exe: sanitize::clean(&proc.exe, 512),
-            cmdline: proc.cmdline.clone(),
+            uid: caller.map_or(0, |c| c.uid),
+            username: caller.map_or_else(|| "unknown".into(), |c| c.username.clone()),
+            pid: caller.map_or(0, |c| c.pid),
+            exe: proc.map_or_else(|| "unknown".into(), |p| sanitize::clean(&p.exe, 512)),
+            cmdline: proc.map(|p| p.cmdline.clone()).unwrap_or_default(),
             reason,
             expires_at: rfc3339(expires_at),
             approval_url: cfg
@@ -662,7 +831,11 @@ impl Core {
                 .map(|a| format!("{}/approve/{id}?t={token}", a.external_url))
                 .unwrap_or_default(),
             approval_token: token.clone(),
-            via: None,
+            via: match &origin {
+                Origin::Socket => None,
+                Origin::Fifo(p) => Some(format!("via FIFO {}", sanitize::clean(p, 512))),
+            },
+            identified: caller.is_some(),
         });
 
         // Announce on every enabled notification channel at once.
@@ -711,7 +884,7 @@ impl Core {
                                 .request(&id)
                                 .secret(&name)
                                 .channel(kind);
-                            if self.audit_for(ev, caller).is_err() {
+                            if self.audit_req(ev, caller, &origin).is_err() {
                                 // Fail closed: an unlogged notification must not arm the request.
                                 break Done::NotifyFailed;
                             }
@@ -722,7 +895,7 @@ impl Core {
                                 .request(&id)
                                 .secret(&name)
                                 .channel(kind);
-                            let _ = self.audit_for(ev, caller);
+                            let _ = self.audit_req(ev, caller, &origin);
                             if announces.is_empty() && !notified {
                                 break Done::NotifyFailed;
                             }
@@ -746,24 +919,15 @@ impl Core {
 
         let (result, why) = match done {
             Done::Outcome(Some(outcome)) => match outcome {
-                Outcome::Released { rel, source, ack } => {
-                    let audited = self
-                        .audit_for(
-                            AuditEvent::new("released")
-                                .request(&id)
-                                .secret(&name)
-                                .source(source.ip())
-                                .channel(source.channel()),
-                            caller,
-                        )
-                        .is_ok();
-                    let _ = ack.send(audited);
-                    if audited {
-                        (Ok(rel), Closed::Released)
-                    } else {
-                        (Err(internal()), Closed::Failed)
-                    }
-                }
+                Outcome::Released { rel, source, ack } => (
+                    Ok(Grant {
+                        id: id.clone(),
+                        rel,
+                        source,
+                        ack,
+                    }),
+                    Closed::Released,
+                ),
                 Outcome::Denied => (Err(RpcError::new(ErrorKind::Denied)), Closed::Denied),
                 Outcome::DecryptFailed => {
                     (Err(RpcError::new(ErrorKind::DecryptFailed)), Closed::Failed)
@@ -785,9 +949,10 @@ impl Core {
             }
             Done::Timeout => {
                 self.remove(&id);
-                let audited = self.audit_for(
+                let audited = self.audit_req(
                     AuditEvent::new("timeout").request(&id).secret(&name),
                     caller,
+                    &origin,
                 );
                 let r = if audited.is_ok() {
                     Err(RpcError::new(ErrorKind::Timeout))
@@ -798,11 +963,17 @@ impl Core {
             }
             Done::Gone => {
                 self.remove(&id);
-                let _ = self.audit_for(
+                let outcome = match origin {
+                    Origin::Socket => "cancelled",
+                    Origin::Fifo(_) => "reader_gone",
+                };
+                let _ = self.audit_req(
                     AuditEvent::new("client_disconnected")
                         .request(&id)
-                        .secret(&name),
+                        .secret(&name)
+                        .outcome(outcome),
                     caller,
+                    &origin,
                 );
                 (Err(internal()), Closed::Cancelled)
             }
@@ -852,16 +1023,23 @@ impl Core {
     fn info(id: &str, p: &Pending) -> PendingInfo {
         let (exe, cmdline) = p
             .caller
-            .proc
             .as_ref()
+            .and_then(|c| c.proc.as_ref())
             .map(|x| (sanitize::clean(&x.exe, 512), x.cmdline.clone()))
-            .unwrap_or_default();
+            .unwrap_or_else(|| ("unknown".to_string(), String::new()));
         PendingInfo {
             request_id: id.to_string(),
             secret_name: p.secret.clone(),
-            uid: p.caller.uid,
-            username: p.caller.username.clone(),
-            pid: p.caller.pid,
+            uid: p.caller.as_ref().map_or(0, |c| c.uid),
+            username: p
+                .caller
+                .as_ref()
+                .map_or_else(|| "unknown".to_string(), |c| c.username.clone()),
+            pid: p.caller.as_ref().map_or(0, |c| c.pid),
+            via: match &p.origin {
+                Origin::Socket => None,
+                Origin::Fifo(path) => Some(format!("via FIFO {}", sanitize::clean(path, 512))),
+            },
             exe,
             cmdline,
             reason: p.reason.clone(),
@@ -929,13 +1107,14 @@ impl Core {
             st.pending.remove(id).expect("checked above")
         };
         let audited = self
-            .audit_for(
+            .audit_req(
                 AuditEvent::new("denied")
                     .request(id)
                     .secret(&p.secret)
                     .source(source.ip())
                     .channel(source.channel()),
-                &p.caller,
+                p.caller.as_ref(),
+                &p.origin,
             )
             .is_ok();
         if let Some(tx) = p.tx.take() {
@@ -990,7 +1169,7 @@ impl Core {
         source: Source,
     ) -> ApproveOutcome {
         // Claim the request.
-        let (caller, name, attempts, tx) = {
+        let (caller, origin, name, attempts, tx) = {
             let mut st = self.lock();
             match st.pending.get_mut(id) {
                 Some(p) if p.expires > Instant::now() => {
@@ -1001,7 +1180,13 @@ impl Core {
                         return ApproveOutcome::Gone;
                     };
                     p.busy = true;
-                    (p.caller.clone(), p.secret.clone(), p.attempts, tx)
+                    (
+                        p.caller.clone(),
+                        p.origin.clone(),
+                        p.secret.clone(),
+                        p.attempts,
+                        tx,
+                    )
                 }
                 _ => return ApproveOutcome::Gone,
             }
@@ -1011,13 +1196,14 @@ impl Core {
         // Record the attempt before doing anything with the passphrase. This
         // is *not* an approval: that is audited only after the store opened.
         if self
-            .audit_for(
+            .audit_req(
                 AuditEvent::new("approve_attempt")
                     .request(id)
                     .secret(&name)
                     .source(source.ip())
                     .channel(source.channel()),
-                &caller,
+                caller.as_ref(),
+                &origin,
             )
             .is_err()
         {
@@ -1026,28 +1212,36 @@ impl Core {
         }
 
         // Re-verify the caller (pid reuse / exec-after-connect) and the ACL.
-        if !self.verify_caller(&caller) {
+        // Pipe requests are re-verified by the reader-set check that the pipe
+        // handler runs just before it writes (section 20.3).
+        let socket_caller = match (&origin, caller.as_ref()) {
+            (Origin::Socket, Some(c)) => Some(c),
+            _ => None,
+        };
+        if socket_caller.is_some_and(|c| !self.verify_caller(c)) {
             // The request is aborted either way (fail-safe), so a dead audit
             // log is only logged (Core::audit reports the error).
-            let _ = self.audit_for(
+            let _ = self.audit_req(
                 AuditEvent::new("caller_changed")
                     .request(id)
                     .secret(&name)
                     .outcome("at_release")
                     .source(source.ip())
                     .channel(source.channel()),
-                &caller,
+                caller.as_ref(),
+                &origin,
             );
             self.conclude(id, tx, Outcome::CallerChanged);
             return ApproveOutcome::CallerChanged;
         }
-        if !Self::allowed(&cfg, &caller, &name) {
-            let _ = self.audit_for(
+        if socket_caller.is_some_and(|c| !Self::allowed(&cfg, c, &name)) {
+            let _ = self.audit_req(
                 AuditEvent::new("acl_denied")
                     .request(id)
                     .secret(&name)
                     .outcome("acl_changed"),
-                &caller,
+                caller.as_ref(),
+                &origin,
             );
             self.conclude(id, tx, Outcome::NotFound);
             return ApproveOutcome::Gone;
@@ -1078,13 +1272,14 @@ impl Core {
                 drop(entry);
                 // The passphrase opened the store: this is the approval.
                 if self
-                    .audit_for(
+                    .audit_req(
                         AuditEvent::new("approved")
                             .request(id)
                             .secret(&name)
                             .source(source.ip())
                             .channel(source.channel()),
-                        &caller,
+                        caller.as_ref(),
+                        &origin,
                     )
                     .is_err()
                 {
@@ -1101,35 +1296,39 @@ impl Core {
                     ack,
                 });
                 if sent.is_err() {
-                    let _ = self.audit_for(
+                    let _ = self.audit_req(
                         AuditEvent::new("aborted")
                             .request(id)
                             .secret(&name)
                             .outcome("client_gone")
                             .source(source.ip())
                             .channel(source.channel()),
-                        &caller,
+                        caller.as_ref(),
+                        &origin,
                     );
                     return ApproveOutcome::Aborted;
                 }
                 // The handler audits `released` and confirms; only then is
                 // the owner told that the secret was released.
                 match ack_rx.await {
-                    Ok(true) => ApproveOutcome::Released,
+                    Ok(Delivery::Released) => ApproveOutcome::Released,
+                    Ok(Delivery::CallerChanged) => ApproveOutcome::CallerChanged,
+                    Ok(Delivery::Aborted) => ApproveOutcome::Aborted,
                     _ => ApproveOutcome::Internal,
                 }
             }
             Ok(Err(StoreError::WrongPassphrase)) => {
                 let remaining = MAX_ATTEMPTS.saturating_sub(attempts + 1);
                 let audited = self
-                    .audit_for(
+                    .audit_req(
                         AuditEvent::new("decrypt_failed")
                             .request(id)
                             .secret(&name)
                             .outcome(if remaining == 0 { "final" } else { "retry" })
                             .source(source.ip())
                             .channel(source.channel()),
-                        &caller,
+                        caller.as_ref(),
+                        &origin,
                     )
                     .is_ok();
                 if !audited {
@@ -1156,28 +1355,30 @@ impl Core {
             }
             Ok(Err(StoreError::NoSuchSecret)) => {
                 tracing::warn!("secret {name:?} is configured but missing from the store");
-                let _ = self.audit_for(
+                let _ = self.audit_req(
                     AuditEvent::new("decrypt_failed")
                         .request(id)
                         .secret(&name)
                         .outcome("not_in_store")
                         .source(source.ip())
                         .channel(source.channel()),
-                    &caller,
+                    caller.as_ref(),
+                    &origin,
                 );
                 self.conclude(id, tx, Outcome::NotFound);
                 ApproveOutcome::NotInStore
             }
             Ok(Err(e)) => {
                 tracing::error!("store error: {e}");
-                let _ = self.audit_for(
+                let _ = self.audit_req(
                     AuditEvent::new("decrypt_failed")
                         .request(id)
                         .secret(&name)
                         .outcome("store_error")
                         .source(source.ip())
                         .channel(source.channel()),
-                    &caller,
+                    caller.as_ref(),
+                    &origin,
                 );
                 self.conclude(id, tx, Outcome::Internal);
                 ApproveOutcome::Internal

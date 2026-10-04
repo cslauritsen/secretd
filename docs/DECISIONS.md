@@ -389,3 +389,86 @@ Choices the specification left open, recorded as simply as possible.
   zeroized (see HARDENING known gaps). The same is true of the access token in the auth message.
 - Tests use `tests/common/ha.rs`, a mock HA WebSocket server (auth, subscription, `call_service`,
   `get_states`, event injection, connection drops, rejected connections, failing services).
+
+## Named-pipe (FIFO) secrets (milestone 9)
+
+- **The spec's own example cannot work, and these are the deviations.** `owner = "app"`, `group =
+  "app"`, `mode = "0440"` leaves the daemon (user `secretd`) with no write access to the pipe, yet it
+  must `open(O_WRONLY)` it for every request (a reader cannot be served otherwise); chown to
+  another user also needs `CAP_CHOWN`, which the unit does not grant. So: (a) the daemon must be able
+  to open the pipe for writing, verified at set-up with `faccessat(W_OK, AT_EACCESS)` (and by
+  `secretctl check-config` from the config alone): it is the owner with the owner write bit, or in
+  `group` with the group write bit; (b) `owner` is optional and defaults to the daemon user (another
+  owner is accepted only if the process may chown to it, i.e. it is root or has `CAP_CHOWN`); readers
+  get access through `group`, which an unprivileged daemon can only set to a group it belongs to;
+  (c) the default `mode` is `"0640"`, not `0440`; allowed modes are subsets of `0660` that someone can
+  read (no setuid/setgid/sticky, no execute, nothing for `other`); `mode` must be a quoted octal string
+  (a bare TOML integer is refused, `440` and `0o440` mean different things); a mode that lets the
+  owner/group write only warns (they could feed the reader data).
+- Creation: parent directory must be a real directory (not a symlink), owned by the daemon uid, not
+  group/other-writable (created with 0755 if missing; the packaged tmpfiles use `0711`). The path is
+  inspected with `lstat`: a symlink or non-FIFO refuses start-up; a FIFO owned by the daemon user or
+  by the configured owner (a leftover of a crash) is removed and recreated rather than reused, so
+  mode, owner and inode are always known. `mkfifo(0600)`, a path `chmod` (the directory is not
+  writable by others), then `open(O_RDWR|O_NONBLOCK|O_NOFOLLOW)` whose `fstat` must match the
+  `lstat`, then `fchown`/`fchmod` on the descriptor and a final verification of owner, group and mode;
+  a failure at any step removes the pipe and refuses to start. On shutdown only the inode we created
+  is removed.
+- Arming: `open(O_WRONLY|O_NONBLOCK|O_NOFOLLOW)` every 100 ms (no inotify: a poll is simplest,
+  cancellable and enough). The descriptor that succeeds is kept as the write end for the whole
+  request and its `fstat` must still be our inode. Cancellation (shutdown, SIGHUP re-arm) is checked
+  at every step; an in-flight request is cancelled the same way as a client disconnect; an approved
+  value that is already being written finishes within the write deadline. `SIGPIPE` is ignored.
+- **Re-arm race (found while testing):** a reader blocked in `read()` only gets EOF if the pipe has no
+  writer when it wakes. Re-opening the write end immediately after closing it (cool-down 0) made
+  readers hang through repeated requests. So the pause after every request is `max(cooldown_secs,
+  250 ms)`. Likewise our `open` can return before the reader's own `open` has installed its
+  descriptor, so an empty `/proc` scan right after detection is retried (8 x 25 ms) before the reader
+  counts as unknown.
+- Reader detection and identity: for every `/proc/<pid>/fd/<n>` whose link is an absolute path
+  (pipes, sockets and anonymous inodes are skipped without a `stat`), `stat` follows the link and
+  compares `(st_dev, st_ino)` with the pipe; `/proc/<pid>/fdinfo/<n>` flags (octal) must not be
+  `O_WRONLY`. One entry per process, own pid excluded. uid/gid are the effective ids from
+  `/proc/<pid>/status`, exe/cmdline/start time from the `ProcReader` as for sockets. Processes whose
+  `fd` directory cannot be read (other uid without `CAP_SYS_PTRACE`) are not seen; a reader whose
+  `/proc` entry cannot be read still counts for the ambiguity rule but is unidentified. The scan is a
+  blocking walk of `/proc` and runs on the blocking pool.
+- Rules: ambiguity (>1 process) at request time and at release -> `fifo_ambiguous` (`at_request` /
+  `at_release`); `enforce_acl` with nobody identified -> `fifo_reader_unknown`, identified but failing
+  uid/gid/exe -> `acl_denied` (outcome `fifo_acl`); release-time check compares pid, exe, cmdline and
+  start time with the request-time snapshot and also requires that somebody still has the read end
+  open (`POLLERR` on our write end); when nobody could be identified either time only that last
+  condition is checked. A difference -> `caller_changed` (`at_release`), nothing written, the approver
+  is told `CallerChanged`. These rejections go through the audit coalescer (per pipe) because anyone
+  who may open the pipe can trigger them.
+- Requests reuse `Core::request_approval` (shared with `secret.get`): a pending entry of origin
+  `Fifo(path)`, the channel list of section 19.1, `reason = "read of <path>"`, the daemon's
+  `request_timeout_secs`. Per-request limits are keyed on the pipe: one pending request per pipe
+  (inherent: one reader flow per pipe, also enforced in the registry), `attempts_per_min` (sliding 60 s
+  window, `rate_limited` / `fifo_attempt_rate`) and the global `max_pending_total`; the per-uid caps
+  and duplicate suppression do not apply (the reader is not necessarily known). A pipe request is not
+  counted against the per-uid attempt limiter of `secret.get`. `request_received` is audited one by
+  one (outcome `fifo_open`) and fails closed like for sockets. Audit events carry a `fifo` field; the
+  reader that went away is `client_disconnected` with outcome `reader_gone`.
+- Delivery: `Grant` carries the value to the pipe handler instead of the socket handler; the approver
+  is told the real result through `Delivery` (`Released`, `CallerChanged`, `Aborted`, `Failed`; the
+  old boolean ack became this enum). Write: the held descriptor is registered with `AsyncFd`, written
+  in a loop with a deadline (`write_deadline_secs`), then dropped (EOF). `EPIPE` -> `aborted` /
+  `reader_gone`; deadline -> `aborted` / `write_timeout`; both with `detail: "wrote N of M bytes"`
+  (never data). `released` is audited only after the whole value was written; if that audit write then
+  fails the value is already out, so it is logged and the approver is still told "released". A
+  partially written value is not retried on a later open.
+- The notification says `Requested via FIFO <path> (caller identity is best effort)`; an unidentified
+  reader is shown as `unknown (no reader process could be identified)` (`Notification.identified`,
+  `PendingInfo.via`; `secretctl pending` and the approval page show the same).
+- Config `[[fifo]]` fields: `path`, `secret`, `owner`, `group`, `mode`, `enforce_acl`, plus the
+  tunables `attempts_per_min` (10), `cooldown_secs` (5; 0 allowed, the 250 ms floor applies) and
+  `write_deadline_secs` (5). The path must be absolute and normalised, unique, and must not be one of
+  the daemon's own files; the secret must exist.
+- Packaging: unit `ReadWritePaths=... -/run/secretd/pipes` (the `-` tolerates a missing directory when
+  no pipe is configured), tmpfiles `d /run/secretd/pipes 0711 secretd secretd -` (traverse-only for
+  others, not listable, not writable). `SystemCallFilter=@system-service` is kept (it includes
+  `mknod`); this could not be verified under real systemd here.
+- Not implemented: inotify (`IN_OPEN`) based detection; pipes created by anything but the daemon at
+  runtime; a per-pipe policy beyond `enforce_acl`; readers that use `O_NONBLOCK` and poll are served
+  like any other reader (their first read may return EAGAIN until the value is written).

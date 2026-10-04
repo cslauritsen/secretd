@@ -183,6 +183,20 @@ async fn run() -> Result<()> {
         tokio::spawn(server::serve_admin(core.clone(), admin_l, peer));
     }
 
+    // Named pipes (section 20): created now, as the daemon user.
+    let daemon_uid = nix::unistd::geteuid().as_raw();
+    let scanner: Arc<dyn secretd::fifo::ReaderScanner> =
+        Arc::new(secretd::fifo::ProcScanner::new(Arc::new(RealProcReader)));
+    let mut fifo_cfgs = core.config().fifos.clone();
+    let mut fifos = if fifo_cfgs.is_empty() {
+        None
+    } else {
+        Some(
+            secretd::fifo::start(core.clone(), scanner.clone(), &fifo_cfgs, daemon_uid)
+                .context("setting up the named pipes")?,
+        )
+    };
+
     let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -191,7 +205,32 @@ async fn run() -> Result<()> {
         tokio::select! {
             _ = hup.recv() => {
                 match load_config(&args.config) {
-                    Ok(c) => { core.set_config(c); tracing::info!("configuration reloaded"); }
+                    Ok(c) => {
+                        let new_fifos = c.fifos.clone();
+                        core.set_config(c);
+                        tracing::info!("configuration reloaded");
+                        // Pipes are re-armed only if their configuration changed
+                        // (every wait is cancelled first).
+                        if new_fifos != fifo_cfgs {
+                            if let Some(f) = fifos.take() {
+                                f.shutdown().await;
+                            }
+                            fifo_cfgs = new_fifos;
+                            if !fifo_cfgs.is_empty() {
+                                match secretd::fifo::start(
+                                    core.clone(),
+                                    scanner.clone(),
+                                    &fifo_cfgs,
+                                    daemon_uid,
+                                ) {
+                                    Ok(f) => fifos = Some(f),
+                                    Err(e) => tracing::error!(
+                                        "named pipes not re-armed after reload: {e}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
                     Err(e) => tracing::error!("reload failed, keeping old config: {e}"),
                 }
                 // Log rotation: reopen the audit file on the same signal.
@@ -204,6 +243,9 @@ async fn run() -> Result<()> {
             _ = term.recv() => break,
             _ = int.recv() => break,
         }
+    }
+    if let Some(f) = fifos.take() {
+        f.shutdown().await; // cancels the waits and removes the pipes
     }
     core.flush_audit_summaries(true);
     tracing::info!("shutting down");

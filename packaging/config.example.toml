@@ -112,3 +112,22 @@ allow_exes = ["/usr/bin/psql", "/opt/app/bin/app"]
 # name = "deploy-token"
 # allow_uids = ["deploy"]
 # allow_any_exe = true
+
+# Named-pipe secrets: a legacy program reads a secret by opening a pipe. Opening it triggers
+# the normal notification/approval flow; on approval the raw value is written to the pipe and
+# the pipe is closed (EOF). The reader blocks meanwhile (up to request_timeout_secs).
+#
+# The daemon must be able to open the pipe for WRITING: be the owner (default) with the owner
+# write bit, or a member of `group` with the group write bit. The readers get access through
+# the group, so the daemon user must also belong to that group (an unprivileged daemon can only
+# chgrp to its own groups and chown to itself). Needs the pipe directory: see tmpfiles.d.
+# [[fifo]]
+# path = "/run/secretd/pipes/db-password"
+# secret = "db-password"          # must exist in [[secret]]; several pipes may share one secret
+# group = "app"                   # readers' group (secretd must be a member)
+# # owner = "secretd"             # default: the daemon user
+# mode = "0640"                   # octal string; at most 0660 (default 0640)
+# enforce_acl = false             # true: the single identified reader must pass the secret's ACL
+# attempts_per_min = 10           # reader detections per minute before they are refused
+# cooldown_secs = 5               # pause after a request before the pipe is armed again
+# write_deadline_secs = 5         # time allowed to push the value into the pipe
