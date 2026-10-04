@@ -472,3 +472,55 @@ Choices the specification left open, recorded as simply as possible.
 - Not implemented: inotify (`IN_OPEN`) based detection; pipes created by anything but the daemon at
   runtime; a per-pipe policy beyond `enforce_acl`; readers that use `O_NONBLOCK` and poll are served
   like any other reader (their first read may return EAGAIN until the value is written).
+
+## Platform support: Linux and macOS (milestone 10)
+
+* **Seams, not forks.** Existing seams were kept (`PeerCredProvider`, `ProcInfoReader`,
+  `ReaderScanner`); OS code is in `cfg(target_os)` blocks and one macOS-only module
+  (`secretd::macos`, the libproc/sysctl/launchd wrappers). `ProcReader` was renamed
+  `ProcInfoReader` (mechanical; `RealProcReader` and `StaticProcReader` kept their names, and
+  `RealProcReader` is the OS's real implementation on both). Pure parsers (`KERN_PROCARGS2`,
+  `/proc/<pid>/stat`, cmdline joining) are not gated, so they are unit-tested on Linux.
+* **Peer pid on macOS is `LOCAL_PEERPID`, read by us.** tokio's `peer_cred` returns
+  `LOCAL_PEEREPID` there (the effective pid, different for delegated sockets); uid/gid from it are
+  the `LOCAL_PEERCRED`/`getpeereid` values and are used as is.
+* **No pidfd on macOS.** `peer_pidfd` returns `None`, `pidfd_alive` fails closed. Pid reuse is caught
+  by the start time (microseconds since the epoch from `pbi_start_tvsec/usec`; value type
+  documented as OS-specific because it is only compared for equality).
+* **Start time falls back to `sysctl(KERN_PROC_PID)`** when `proc_pidinfo(PROC_PIDTBSDINFO)` is
+  refused, reading only the leading `struct timeval` of `kinfo_proc` (libc has no such struct). A
+  macOS unit test asserts both sources agree for the test process; if that ever fails the fallback
+  is wrong and must not be trusted.
+* **Unresolvable means denied, and the daemon says so at start-up.** No reduced-identity mode was
+  added: `Core::allowed` still needs `proc` for every ACL. Instead `platform::check_process_inspection`
+  probes pid 1 on macOS and refuses to start with an exe-pinned ACL for another uid/any gid that the
+  daemon cannot inspect (warning for `allow_any_exe`). Linux keeps its per-request fail-closed
+  behaviour without a start-up refusal (the unit grants `CAP_SYS_PTRACE`).
+* **macOS runs as root, then drops to `_secretd`.** A LaunchDaemon with `UserName=_secretd` cannot
+  recreate `/var/run/secretd` after a reboot, so the plist has no `UserName`: the daemon binds as
+  root and drops (the pre-existing root path). `daemon.user = "root"` is the supported way to keep
+  full inspection. Deviation from "run as `_secretd`": the process does run as `_secretd` after start-up.
+* **Hardening.** macOS: `ptrace(PT_DENY_ATTACH)` best effort; `disable_core_dumps` still returns
+  whether every applicable step worked and `main` only warns.
+* **`initgroups` / `getgrouplist` via libc.** `nix` 0.29 does not provide them on macOS;
+  `secret_proto::sys` wraps the libc calls for both OSes (one code path, tested on Linux).
+* **FIFO.** Reader scan via libproc (`proc_listpids`, `PROC_PIDLISTFDS`, `PROC_PIDFDVNODEPATHINFO`);
+  the `proc_fileinfo`/`vnode_fdinfowithpath` structs are not in libc, so they are declared locally
+  with compile-time size assertions (24/136/152/1200 bytes). `st_dev` is compared on its low 32 bits
+  (libproc's `vst_dev` is 32-bit while `MetadataExt::dev` sign-extends). `FREAD` (kernel flag, not
+  `O_*`) marks readers. `mode_t` is 16 bits on macOS, so the `fchmod` argument is cast.
+* **Socket activation.** Linux: `LISTEN_FDS` as before. macOS: plain bind by default; launchd
+  `launch_activate_socket` for `Sockets` entries named `secretd`/`admin` is implemented (small, and
+  ESRCH/ENOENT/EALREADY mean "not activated") but untested; the plist ships it commented out.
+* **Per-OS defaults** for sockets (`/var/run/secretd`) and store (`/var/db/secretd/store.age`) live
+  in `secret_proto` constants shared by the config default and the `secret` CLI; explicit config is
+  unaffected. The audit log default (`/var/log/secretd`) is the same on both.
+* **Tests.** Gated for Linux: the `setpriv` multi-uid test, the pidfd tests (moved into a `pidfd`
+  module in `tests/identity.rs`), `SO_PEERPIDFD`. `/proc/<pid>/exe` reads in tests became
+  `RealProcReader`. The systemd packaging text tests read static files and run everywhere; launchd
+  text tests were added next to them. macOS-only unit tests cover the libproc wrappers,
+  `LOCAL_PEERPID`, and the sysctl start time.
+* **Verification limits.** The macOS code was cross-compiled (`cargo check --all-targets` for both Apple
+  triples, `clippy -D warnings` for aarch64) with a stub C compiler for `ring`'s build script, which is enough for
+  type-checking but produces no binary. Nothing was executed on macOS here; the macOS CI job is the first
+  real run.

@@ -34,7 +34,7 @@ pub struct Caller {
     pub gid: u32,
     pub pid: u32,
     pub username: String,
-    /// `None` when `/proc` resolution failed: every request is then denied.
+    /// `None` when process resolution (`/proc`, libproc) failed: every request is then denied.
     pub proc: Option<ProcInfo>,
     /// `SO_PEERPIDFD` handle, when the kernel provides one: lets a recycled
     /// pid be told apart from the process that connected.

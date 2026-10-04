@@ -18,7 +18,7 @@ Secrets at rest are always encrypted. The decryption key is never stored on disk
 | `secret-client` | lib | Reusable Rust client for the JSON-RPC protocol |
 | `secret-proto` | lib | Shared types: JSON-RPC messages, error codes, framing |
 
-Language: Rust (stable, edition 2021 or later). Target: Linux only (`SO_PEERCRED`, `/proc`).
+Language: Rust (stable, edition 2021 or later). Targets: Linux (`SO_PEERCRED`, `/proc`) and macOS (`LOCAL_PEERCRED`/`LOCAL_PEERPID`, libproc); see §22.
 
 ## 2. Threat model
 
@@ -292,7 +292,7 @@ allow_exes = ["/usr/bin/psql"]
 
 ## 17. Non-goals (v1)
 
-Network-reachable secret access (Unix socket only), non-Linux platforms, grant caching or TTL leases, secret versioning/history, multi-owner or quorum approval, HSM/TPM integration, `secret run`. (Home Assistant and FIFO support are v1.1 extensions in §19-§20.)
+Network-reachable secret access (Unix socket only), platforms other than Linux and macOS (§22), grant caching or TTL leases, secret versioning/history, multi-owner or quorum approval, HSM/TPM integration, `secret run`. (Home Assistant and FIFO support are v1.1 extensions in §19-§20.)
 
 ## 18. Decisions and open questions
 
@@ -423,3 +423,58 @@ enforce_acl = false           # see 20.3
 8. Home Assistant channel (§19) with the mock HA server and docs on recorder exclusion.
 9. FIFO secrets (§20) with `[[fifo]]` config, `secretctl check-config` support, packaging (`ReadWritePaths`, tmpfiles) and docs.
 10. Security review of both extensions.
+
+## 22. Platform support (Linux and macOS)
+
+`secretd` builds, tests and runs on Linux and on macOS (Apple silicon and Intel). The OS-specific parts sit behind small traits or `cfg(target_os)` modules; behaviour on Linux is the reference and is unchanged by the macOS port. Other Unixes are not supported.
+
+### 22.1 Mechanisms per OS
+
+| Concern | Linux | macOS |
+|---|---|---|
+| Peer uid/gid | `SO_PEERCRED` (tokio `peer_cred`) | `LOCAL_PEERCRED` credentials via `getpeereid` (tokio `peer_cred`) |
+| Peer pid | `SO_PEERCRED` | `LOCAL_PEERPID` (`getsockopt(SOL_LOCAL)`), read by `secretd` itself: tokio would report `LOCAL_PEEREPID`, the effective pid, which differs for delegated sockets |
+| Pid-reuse handle | `SO_PEERPIDFD` pidfd where the kernel has it (liveness re-checked at release) | none; start time only |
+| Process identity (`ProcInfoReader`) | `/proc/<pid>/exe`, `cmdline` (256 bytes, sanitised), `stat` field 22 | `proc_pidpath` (exe), `sysctl(KERN_PROCARGS2)` argv only, environment never kept (best effort, same sanitising and 256-byte limit), `proc_pidinfo(PROC_PIDTBSDINFO)` `pbi_start_tvsec/tvusec` for the start time, `sysctl(KERN_PROC_PID)` `p_starttime` when `proc_pidinfo` is refused |
+| Process gone | `/proc/<pid>` missing | libproc/sysctl report `ESRCH` (mapped to `NotFound`) |
+| Deleted executable | ` (deleted)` suffix is always denied | no such concept: a binary whose vnode path cannot be resolved makes `proc_pidpath` fail, which is "unresolvable" and denied |
+| Core dumps / inspection | `RLIMIT_CORE=0`, `prctl(PR_SET_DUMPABLE, 0)` | `RLIMIT_CORE=0`, `ptrace(PT_DENY_ATTACH)` (best effort; a failure is only a warning) |
+| `mlock` | as before | as before (best effort) |
+| FIFO reader scan (§20.2) | `/proc/*/fd` and `fdinfo` flags | `proc_listpids`, `proc_pidinfo(PROC_PIDLISTFDS)`, `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`: match the file's device and inode, `FREAD` in the open flags means "reader" |
+| Socket activation | systemd `LISTEN_FDS`/`LISTEN_PID`/`LISTEN_FDNAMES` | none by default (plain bind); opt-in launchd activation of `Sockets` entries named `secretd` and `admin` through `launch_activate_socket` |
+| Default socket paths | `/run/secretd/secretd.sock`, `/run/secretd/admin.sock` | `/var/run/secretd/secretd.sock`, `/var/run/secretd/admin.sock` |
+| Default store | `/var/lib/secretd/store.age` | `/var/db/secretd/store.age` |
+| Service manager | `packaging/secretd.service`, `.socket`, `sysusers.d`, `tmpfiles.d` | `packaging/launchd/` (LaunchDaemon plist, example `[daemon]` section, `dscl` steps) |
+
+Explicit configuration works the same on both; only the defaults differ (`secret_proto::DEFAULT_RUN_DIR`, `DEFAULT_SOCKET`, `DEFAULT_ADMIN_SOCKET`, `DEFAULT_STORE`, also the default of the `secret` CLI).
+
+`start_time` in `ProcInfo` is OS-specific (clock ticks since boot on Linux, microseconds since the epoch on macOS) and is only ever compared for equality between two reads. The re-verification semantics of §3.2 are identical: a changed executable or start time gives `CALLER_CHANGED`; an unresolvable process is denied.
+
+### 22.2 Inspecting other users' processes
+
+A caller that cannot be resolved is denied (`proc_unavailable`, audited): that is the only failure mode, ACLs are never weakened. What the daemon may inspect decides which callers can work:
+
+* Linux: other uids need `CAP_SYS_PTRACE` (granted by the unit, see `docs/HARDENING.md`).
+* macOS: the same uid is always inspectable. For other uids the daemon needs root for descriptor tables (`PROC_PIDLISTFDS`, hence FIFO reader detection) and `KERN_PROCARGS2` (hence the command line, which is only context). `proc_pidpath` and the start time are expected to be available without root (`proc_pidpath` and `sysctl(KERN_PROC_PID)` are not restricted to the same user in XNU), but this is an observation about XNU, not an Apple-documented guarantee, so `secretd` checks it empirically at start-up.
+
+Start-up check (macOS only, after privileges were dropped): `secretd` reads the identity of pid 1 (`launchd`, owned by root). If that fails, then a secret whose ACL pins an executable (`allow_exes`) for anyone other than the daemon's own uid (any `allow_gids` entry counts) is a configuration error and the daemon **refuses to start**, naming the secret; `allow_any_exe` secrets for other users only produce a warning (their requests will be denied with `proc_unavailable`). The remedy is `daemon.user = "root"` (no privilege drop) or restricting the ACL to the daemon's own uid. FIFO readers of other users are unidentified when the daemon is not root: with `enforce_acl = true` they are refused (`fifo_reader_unknown`), without it the request shows an unidentified reader.
+
+### 22.3 Privileges and users
+
+Neither sysusers nor tmpfiles is assumed. On macOS the job is started by launchd as root, binds its sockets (creating `/var/run/secretd`, which macOS clears at boot), gives the client socket to the daemon user and group, drops to `daemon.user` (`_secretd`) and verifies root cannot be regained; this is the existing root-start path of §13, not a new one. The service account and groups are created with `dscl` (README in `packaging/launchd/`). FIFOs on macOS use a directory owned by the daemon user (`/var/db/secretd-pipes`), because `/var/run/secretd` is owned by root.
+
+### 22.4 FIFO semantics on macOS
+
+`open(O_WRONLY|O_NONBLOCK)` on a FIFO without a reader fails with `ENXIO` on both systems, and a reader still blocked in its own `open(O_RDONLY)` counts as a reader on both. The polling reader detection of §20.2 and the re-arm pause are unchanged. A vanished reader is detected through `poll(POLLOUT)` on the write end (`POLLERR` on Linux, `POLLHUP` expected on macOS; both are accepted) and, independently, as `EPIPE` on write. tokio waits with kqueue instead of epoll.
+
+### 22.5 Not supported or different
+
+* No `SO_PEERPIDFD`/pidfd on macOS: pid reuse is caught by the start time only.
+* No systemd-style sandbox on macOS (`ProtectSystem`, syscall filter, capability bounding, `MemoryDenyWriteExecute`): `PT_DENY_ATTACH`, `RLIMIT_CORE=0` and the dedicated account are the available hardening. Hardened-runtime/notarization entitlements are not used.
+* launchd socket activation is opt-in and not covered by automated tests.
+* Unix socket paths are limited to 104 bytes on macOS (108 on Linux).
+* Exe pinning is by path on both systems (not inode).
+
+### 22.6 Tests and CI
+
+Linux-only tests are gated with `#[cfg(target_os = "linux")]` (the `setpriv` multi-uid test, pidfd tests, the `/proc/<pid>/fdinfo` helpers). Pure parsers (`KERN_PROCARGS2`, `/proc/<pid>/stat`) are tested on every OS; macOS-only unit tests for the libproc/sysctl wrappers and `LOCAL_PEERPID` run on macOS. CI runs `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` on `ubuntu-latest` and `macos-latest`.

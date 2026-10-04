@@ -2,7 +2,8 @@
 
 use crate::config::SecretAcl;
 
-/// Identity of a caller as established from `SO_PEERCRED` and `/proc`.
+/// Identity of a caller as established from the peer credentials
+/// (`SO_PEERCRED` / `LOCAL_PEERCRED`) and the process table (`/proc` / libproc).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallerIds<'a> {
     pub uid: u32,

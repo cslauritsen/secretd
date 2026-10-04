@@ -1,6 +1,6 @@
 # secretd
 
-`secretd` is a local secrets-release daemon for Linux. It keeps an
+`secretd` is a local secrets-release daemon for Linux and macOS. It keeps an
 [age](https://age-encryption.org)-encrypted store of named secrets and releases one only
 after **you** approve that exact request, from your phone, with a passphrase you type each
 time.
@@ -16,8 +16,8 @@ time.
 ```
 
 * Always sealed: the passphrase is never stored; every release needs a fresh approval.
-* The caller is identified by the kernel (`SO_PEERCRED`, plus `SO_PEERPIDFD` where available)
-  and `/proc/<pid>/exe`, snapshotted at accept, re-checked when each request arrives and again at
+* The caller is identified by the kernel (`SO_PEERCRED`, plus `SO_PEERPIDFD` where available; on
+  macOS `LOCAL_PEERCRED`/`LOCAL_PEERPID`) and `/proc/<pid>/exe` (macOS: `proc_pidpath`), snapshotted at accept, re-checked when each request arrives and again at
   release time (pid reuse / exec-after-connect gives `CALLER_CHANGED`). **Executable pinning is
   defence in depth, not a boundary:** a process running as an allowed uid can run an allowed binary
   (or win a connect/fork/exec race) and pass the ACL. The owner's per-request approval and passphrase
@@ -43,7 +43,7 @@ See [`docs/DECISIONS.md`](docs/DECISIONS.md) for choices the spec left open and
 ## Build and install
 
 ```sh
-cargo build --release          # stable Rust (developed on 1.97), Linux only
+cargo build --release          # stable Rust (developed on 1.97); Linux and macOS
 sudo install -m0755 target/release/{secretd,secretctl,secret} /usr/bin/
 sudo install -m0644 packaging/secretd.service packaging/secretd.socket \
      packaging/secretd-admin.socket /etc/systemd/system/
@@ -53,6 +53,28 @@ sudo systemd-sysusers && sudo systemd-tmpfiles --create
 # Who may ask for secrets: members of the dedicated socket group (NOT the `secretd` group).
 sudo usermod -aG secretd-clients alice
 ```
+
+### macOS
+
+The same workspace builds on macOS (Apple silicon and Intel) with `cargo build --release`. Install
+the binaries, create the `_secretd` account and the `_secretd-clients` group with `dscl`, create the
+directories and load the LaunchDaemon as described in
+[`packaging/launchd/README.md`](packaging/launchd/README.md) (plist, example `[daemon]` section,
+`launchctl` commands). Differences you will notice:
+
+* default paths are `/var/run/secretd/secretd.sock` (client socket; the `secret` CLI default too),
+  `/var/run/secretd/admin.sock`, `/var/db/secretd/store.age`; explicit config works as on Linux;
+* the job starts as root, binds the sockets, then drops to `_secretd` (`daemon.user`); there is no
+  `LISTEN_FDS` socket activation (plain bind; launchd activation is opt-in and untested);
+* identifying a caller of **another user** needs root for some information. `secretd` checks this
+  at start-up and **refuses to start** if an ACL pins an executable for such callers and they cannot
+  be inspected; use `daemon.user = "root"` or restrict the ACL to the daemon's uid. Requests whose
+  caller cannot be identified are denied and audited, never allowed with a weaker ACL. FIFO reader
+  detection of other users' processes also needs root;
+* no pidfd (pid reuse is caught by the start time), no systemd-style sandbox; `PT_DENY_ATTACH` and
+  `RLIMIT_CORE=0` replace `PR_SET_DUMPABLE`.
+
+See [`docs/HARDENING.md`](docs/HARDENING.md#macos) and spec section 22.
 
 The client socket belongs to `secretd-clients`, a group created by `sysusers.d` that is separate
 from the `secretd` group which can read `/etc/secretd`: being allowed to connect never implies read
@@ -359,17 +381,23 @@ denial, client disconnect: HTTP 410).
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-SECRETD_TEST_MULTIUID=1 cargo test --workspace                    # needs root + setpriv
+SECRETD_TEST_MULTIUID=1 cargo test --workspace                    # Linux only: needs root + setpriv
 ```
 
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and the test suite on Linux and on macOS. The macOS
+job is the only place the libproc, `LOCAL_PEERPID` and `PT_DENY_ATTACH` code runs; on Linux you can
+type-check it with `rustup target add aarch64-apple-darwin` and
+`cargo check --workspace --all-targets --target aarch64-apple-darwin` (the `ring` C build script
+needs a macOS C toolchain, or a stub compiler via `CC_aarch64_apple_darwin`, for that to succeed).
+
 The integration tests run the daemon in-process with an injectable peer-credential provider,
-`/proc` reader and notifier, a mock ntfy server and a mock OIDC provider (test JWKS under
+process-table reader (`/proc` or libproc) and notifier, a mock ntfy server and a mock OIDC provider (test JWKS under
 `crates/secretd/tests/common/keys/`; these keys protect nothing). `crates/secretd/tests/binary.rs`
 also drives the real `secretd` binary end to end.
 
 ## Status and limits
 
-Linux only. Network-reachable secret access, grant caching/leases, secret history, multi-owner
+Linux and macOS (see the macOS notes above for what differs). Network-reachable secret access, grant caching/leases, secret history, multi-owner
 approval, HSM/TPM support and `secret run` are non-goals for v1. Known gaps are listed in
 [`docs/HARDENING.md`](docs/HARDENING.md#known-gaps).
 

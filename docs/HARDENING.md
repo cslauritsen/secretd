@@ -153,6 +153,74 @@ Residual risks (also in the README):
 * The unit's `SystemCallFilter`/`ReadWritePaths` for pipes were reviewed but not run under real
   systemd (same as the rest of the unit).
 
+## macOS
+
+Linux is the reference platform (everything above). On macOS (spec section 22) the same checks run
+through different primitives, and some protections do not exist. None of this has been run on a Mac
+by the author of the port: it was cross-compiled and linted for `aarch64-apple-darwin` and
+`x86_64-apple-darwin`, and the macOS CI job runs the tests; read the notes below as design intent
+plus the failure modes the daemon enforces.
+
+**Identification.** uid/gid come from the kernel (`getpeereid`, the `LOCAL_PEERCRED` credentials)
+and the pid from `LOCAL_PEERPID`. The executable is `proc_pidpath`, the start time
+`proc_pidinfo(PROC_PIDTBSDINFO)` (or `sysctl(KERN_PROC_PID)` when that is refused), the command
+line `sysctl(KERN_PROCARGS2)` (argv only; the environment block is never kept and its buffer is
+zeroized). There is no pidfd: a recycled pid is caught by the start time only, so the window between
+`connect` and the identity snapshot is the same as on a pre-6.5 Linux kernel. There is no
+`(deleted)` marker; a process whose executable vnode can no longer be resolved fails `proc_pidpath`
+and is denied as unresolvable.
+
+**What needs root.** Inspecting a process of another user is the macOS counterpart of
+`CAP_SYS_PTRACE`:
+
+| Information | Same uid | Other uid, unprivileged | Other uid, root |
+|---|---|---|---|
+| exe (`proc_pidpath`) | yes | expected yes (probed at start-up) | yes |
+| start time (`proc_pidinfo`, else `sysctl(KERN_PROC_PID)`) | yes | expected yes (probed at start-up) | yes |
+| command line (`KERN_PROCARGS2`) | yes | no (best effort: shown empty) | yes |
+| open descriptors (`PROC_PIDLISTFDS`; FIFO reader scan) | yes | no | yes |
+
+(The "expected" cells follow XNU's `proc_info` behaviour, which Apple does not document; the daemon
+therefore measures instead of assuming.) A request whose caller cannot be resolved is **denied
+and audited** (`acl_denied`, outcome `proc_unavailable`); the ACL is never relaxed. Because a
+configuration that pins an executable for another user's processes would then silently serve
+nobody, `secretd` checks at start-up (after dropping privileges) that it can read the identity of
+pid 1. If it cannot, it **refuses to start** when any secret pins an executable (`allow_exes`) for
+a uid other than its own or for any gid, and says which secret and why. `allow_any_exe` secrets only
+log a warning. Remedies, in order of preference: restrict the ACL to the daemon's own uid; run with
+`daemon.user = "root"` (no privilege drop; every process is inspectable). FIFO readers belonging to
+other users are invisible to a non-root daemon: with `enforce_acl = true` they are refused
+(`fifo_reader_unknown`), otherwise the owner sees an unidentified reader and the other rules
+(single reader, re-check before the write) still hold.
+
+**Running as root costs more than on Linux.** The systemd unit confines a `CAP_SYS_PTRACE`-only
+process with a syscall filter that forbids `ptrace`, `process_vm_readv` and `pidfd_getfd`. macOS has
+no equivalent per-service filter in a plain LaunchDaemon, so a root `secretd` that is compromised can
+do much more than read `exe` links. Prefer the `_secretd` account whenever the ACLs allow it; use
+root only when exe pinning across users is the point.
+
+**Hardening that exists:** `RLIMIT_CORE=0`; `ptrace(PT_DENY_ATTACH)` (stops debuggers and `dtrace`
+attaching; a hint to the kernel, not a boundary against root, and it may fail, for example under a
+debugger, which only logs a warning); `mlock` (best effort); a dedicated hidden account; mode `0600`
+store and audit files; plist `Umask` 0077; core dumps limited to 0 in the plist. **Hardening that does
+not exist on macOS:** `NoNewPrivileges`, `ProtectSystem`/`ProtectHome`, `PrivateTmp`, address-family
+and syscall filters, `MemoryDenyWriteExecute`, `MemorySwapMax=0` (enable FileVault and encrypted swap,
+which macOS has by default on Apple silicon), cgroup `TasksMax`/`MemoryMax`. System Integrity
+Protection and the TCC prompts apply to what other processes can do, not to what `secretd` may do.
+
+**Paths.** Sockets in `/var/run/secretd` (cleared at boot; the daemon recreates the directory while
+root, which is why the job starts as root and drops), store in `/var/db/secretd`, logs in
+`/var/log/secretd`. Pipes must live in a directory owned by the daemon user
+(`/var/db/secretd-pipes`), not under `/var/run/secretd`. Unix socket paths are limited to 104 bytes.
+
+**FIFO semantics.** Same as Linux for the rules that matter (non-blocking write-open gives `ENXIO`
+without a reader; EOF to a reader when the daemon closes its write end; `SIGPIPE` ignored so a
+reader that vanished mid-write gives `EPIPE`). Reader detection by libproc matches the file's
+device and inode, which libproc reports as a 32-bit `dev_t` (compared on the low 32 bits of `st_dev`)
+and requires the `FREAD` open flag. The scan is as racy as the `/proc` one, plus it is slower per
+descriptor; it runs only when a reader was detected and again before the write, never on the 100 ms
+poll.
+
 ## Known gaps
 
 * **Transient copies (not fixed).** The passphrase passes through the HTTP stack (request body, form
@@ -161,7 +229,8 @@ Residual risks (also in the README):
   and admin parsing are accepted. The same applies to the
   `secret-client` request path for names (not secret) and to the `age` crate's internal key
   schedule. Out of scope per the threat model (physical memory attacks, root).
-* **`mlock` is best effort** and subject to `RLIMIT_MEMLOCK` (the unit sets `LimitMEMLOCK=32M`);
+* **`mlock` is best effort** and subject to `RLIMIT_MEMLOCK` (the unit sets `LimitMEMLOCK=32M`; on
+  macOS the limit comes from launchd and the user's resource limits);
   failures are silent. The unit also sets `MemorySwapMax=0`; encrypted swap is still advisable for the
   rest of the host.
 * **Approve vs deny/timeout/disconnect window.** The window is the *whole unseal* (an scrypt
