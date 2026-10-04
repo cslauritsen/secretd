@@ -1,4 +1,4 @@
-//! The real `secretd` binary serving a named pipe: real `/proc` scan, real
+//! The real `secretd` binary serving a named pipe: real process-table scan (`/proc` or libproc), real
 //! reader process (`cat`), approval through the mock Home Assistant, clean-up
 //! on SIGTERM.
 
@@ -6,6 +6,7 @@ mod common;
 use common::ha::*;
 use common::*;
 use secret_proto::store::{self, Entry};
+use secretd::procinfo::{ProcInfoReader, RealProcReader};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::process::{Command, Stdio};
 
@@ -22,7 +23,7 @@ async fn real_daemon_serves_a_pipe_to_a_real_reader() {
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    let cat_exe = std::fs::read_link(format!("/proc/{}/exe", probe.id())).unwrap();
+    let cat_exe = RealProcReader.read(probe.id()).unwrap().exe;
     let _ = probe.kill();
     let _ = probe.wait();
     let pipe = dir.path().join("pipes/mine");
@@ -58,7 +59,7 @@ enforce_acl = true
 cooldown_secs = 1
 "#,
         url = ha.url(),
-        exe = cat_exe.display(),
+        exe = cat_exe,
         pipe = pipe.display()
     );
     std::fs::write(dir.path().join("config.toml"), cfg).unwrap();
@@ -110,7 +111,7 @@ cooldown_secs = 1
     assert!(text.contains("via FIFO"), "{text}");
     assert!(text.contains(&pipe.display().to_string()), "{text}");
     assert!(text.contains(&format!("pid {rpid}")), "{text}");
-    assert!(text.contains(&cat_exe.display().to_string()), "{text}");
+    assert!(text.contains(&cat_exe.to_string()), "{text}");
     assert!(text.contains("best effort"), "{text}");
     let (approve, _) = actions_of(&n);
     ha.set_state(ENTITY, PASS);

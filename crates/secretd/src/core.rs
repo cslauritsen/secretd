@@ -5,7 +5,7 @@ use crate::audit::{Audit, AuditEvent};
 use crate::channel::{AdminChannel, Channel, Closed, WebChannel};
 use crate::notify::{Notification, Notifier};
 use crate::peer::PeerCred;
-use crate::procinfo::{ProcInfo, ProcReader};
+use crate::procinfo::{ProcInfo, ProcInfoReader};
 use secret_proto::acl::{self, CallerIds};
 use secret_proto::config::{ChannelKind, Config};
 use secret_proto::rpc::{ErrorKind, GetParams, PendingInfo, RpcError};
@@ -228,7 +228,7 @@ pub struct Core {
     coalesce_window: Mutex<Duration>,
     audit: Audit,
     channels: Vec<Arc<dyn Channel>>,
-    procs: Arc<dyn ProcReader>,
+    procs: Arc<dyn ProcInfoReader>,
     /// Serialises unsealing: one scrypt derivation can need hundreds of MiB.
     unseal_gate: tokio::sync::Semaphore,
     /// Test hook: artificial delay inside the blocking unseal task, to widen
@@ -285,7 +285,7 @@ impl Core {
         cfg: Config,
         audit: Audit,
         notifier: Arc<dyn Notifier>,
-        procs: Arc<dyn ProcReader>,
+        procs: Arc<dyn ProcInfoReader>,
     ) -> Arc<Core> {
         Self::with_channels(
             cfg,
@@ -300,7 +300,7 @@ impl Core {
         cfg: Config,
         audit: Audit,
         channels: Vec<Arc<dyn Channel>>,
-        procs: Arc<dyn ProcReader>,
+        procs: Arc<dyn ProcInfoReader>,
     ) -> Arc<Core> {
         Arc::new(Core {
             cfg: RwLock::new(Arc::new(cfg)),

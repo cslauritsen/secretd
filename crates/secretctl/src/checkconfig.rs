@@ -249,11 +249,9 @@ fn check_fifos(cfg: &Config, warnings: &mut Vec<String>, errors: &mut Vec<String
                  the group) or create the pipe with systemd-tmpfiles"
             ));
         }
-        let name = std::ffi::CString::new(cfg.daemon.user.clone()).ok();
         let in_group = f.gid == u.gid.as_raw()
-            || name
-                .and_then(|n| nix::unistd::getgrouplist(&n, u.gid).ok())
-                .is_some_and(|g| g.iter().any(|x| x.as_raw() == f.gid));
+            || secret_proto::sys::group_ids(&cfg.daemon.user, u.gid.as_raw())
+                .is_some_and(|g| g.contains(&f.gid));
         let can_write = (owner == uid && f.mode & 0o200 != 0) || (in_group && f.mode & 0o020 != 0);
         if !can_write {
             errors.push(format!(

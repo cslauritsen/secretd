@@ -15,7 +15,7 @@ use secretd::channel::Channel;
 use secretd::core::Core;
 use secretd::notify::{Notification, Notifier, NotifyError};
 use secretd::peer::{PeerCred, PeerCredProvider, StaticPeerCred};
-use secretd::procinfo::{ProcInfo, ProcReader, StaticProcReader};
+use secretd::procinfo::{ProcInfo, ProcInfoReader, StaticProcReader};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -96,7 +96,7 @@ pub struct Opts {
     pub notifier_from_cfg: Option<Box<dyn FnOnce(&Config) -> Arc<dyn Notifier>>>,
     pub audit_writer: Option<Box<dyn std::io::Write + Send>>,
     pub peer: Option<Arc<dyn PeerCredProvider>>,
-    pub procs: Option<Arc<dyn ProcReader>>,
+    pub procs: Option<Arc<dyn ProcInfoReader>>,
     pub notify_url: String,
     pub oidc_issuer: String,
     pub listen: String,
@@ -271,7 +271,7 @@ impl Harness {
             (None, Some(f)) => f(&cfg),
             (None, None) => notifier.clone(),
         };
-        let p: Arc<dyn ProcReader> = o.procs.unwrap_or_else(|| procs.clone());
+        let p: Arc<dyn ProcInfoReader> = o.procs.unwrap_or_else(|| procs.clone());
         let core = match o.channels {
             Some(ch) => Core::with_channels(cfg.clone(), audit, ch, p),
             None if o.extra_channels.is_empty() => Core::new(cfg.clone(), audit, n, p),

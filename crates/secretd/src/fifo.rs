@@ -4,7 +4,8 @@
 //! each configured pipe armed by trying `open(O_WRONLY | O_NONBLOCK)` every
 //! 100 ms (it fails with `ENXIO` until a reader exists), turns a detected
 //! reader into the same pending request as `secret.get` (identifying the
-//! reader best-effort from `/proc/*/fd`), and, once the owner approved,
+//! reader best-effort from `/proc/*/fd` on Linux, libproc on macOS), and, once
+//! the owner approved,
 //! writes the raw value into the pipe and closes it so the reader sees EOF.
 //!
 //! Safety rules implemented here: the pipe is created and verified without
@@ -17,7 +18,7 @@
 
 use crate::audit::AuditEvent;
 use crate::core::{Caller, Core, Delivery, Grant, Origin, RequestSpec};
-use crate::procinfo::{ProcInfo, ProcReader};
+use crate::procinfo::{ProcInfo, ProcInfoReader};
 use secret_proto::config::FifoCfg;
 use secret_proto::sanitize;
 use secret_proto::Encoding;
@@ -71,16 +72,17 @@ pub trait ReaderScanner: Send + Sync {
 /// Scans `/proc/*/fd` (best effort: processes the daemon may not look into are
 /// skipped, and the scan is inherently racy).
 pub struct ProcScanner {
-    procs: Arc<dyn ProcReader>,
+    procs: Arc<dyn ProcInfoReader>,
 }
 
 impl ProcScanner {
-    pub fn new(procs: Arc<dyn ProcReader>) -> Self {
+    pub fn new(procs: Arc<dyn ProcInfoReader>) -> Self {
         ProcScanner { procs }
     }
 }
 
 /// Effective uid and gid of `pid` from `/proc/<pid>/status`.
+#[cfg(target_os = "linux")]
 fn proc_ids(pid: u32) -> Option<(u32, u32)> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let field = |key: &str| -> Option<u32> {
@@ -96,6 +98,7 @@ fn proc_ids(pid: u32) -> Option<(u32, u32)> {
 }
 
 /// Parses the `flags:` line of `/proc/<pid>/fdinfo/<fd>` (octal).
+#[cfg(target_os = "linux")]
 fn fdinfo_flags(text: &str) -> Option<u32> {
     let v = text.lines().find_map(|l| l.strip_prefix("flags:"))?.trim();
     u32::from_str_radix(v, 8).ok()
@@ -103,6 +106,61 @@ fn fdinfo_flags(text: &str) -> Option<u32> {
 
 impl ReaderScanner for ProcScanner {
     fn readers(&self, dev: u64, ino: u64) -> io::Result<Vec<ReaderIdent>> {
+        self.scan(dev, ino)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ProcScanner {
+    /// macOS: `proc_listpids`, then per process `PROC_PIDLISTFDS` and, for the
+    /// vnode descriptors, `PROC_PIDFDVNODEPATHINFO`, which reports the file's
+    /// device and inode and the open flags (`FREAD`). Other users' processes
+    /// are visible only to root (`EPERM` => skipped, like on Linux without
+    /// `CAP_SYS_PTRACE`).
+    fn scan(&self, dev: u64, ino: u64) -> io::Result<Vec<ReaderIdent>> {
+        use crate::macos;
+        let me = std::process::id();
+        let want_dev = macos::dev32(dev);
+        let mut found: BTreeMap<u32, ReaderIdent> = BTreeMap::new();
+        for pid in macos::list_pids()? {
+            if pid == me || found.contains_key(&pid) {
+                continue;
+            }
+            let Ok(fds) = macos::list_fds(pid) else {
+                continue;
+            };
+            for (fd, ty) in fds {
+                if ty != libc::PROX_FDTYPE_VNODE as u32 {
+                    continue;
+                }
+                let Ok(v) = macos::vnode_fd(pid, fd) else {
+                    continue;
+                };
+                // Only a descriptor opened for reading is a reader.
+                if v.dev != want_dev || v.ino != ino || !v.readable {
+                    continue;
+                }
+                let ids = macos::bsd_info(pid).ok().map(|b| (b.pbi_uid, b.pbi_gid));
+                let proc = self.procs.read(pid).ok();
+                found.insert(
+                    pid,
+                    ReaderIdent {
+                        pid,
+                        uid: ids.map_or(0, |i| i.0),
+                        gid: ids.map_or(0, |i| i.1),
+                        proc: proc.filter(|_| ids.is_some()),
+                    },
+                );
+                break;
+            }
+        }
+        Ok(found.into_values().collect())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ProcScanner {
+    fn scan(&self, dev: u64, ino: u64) -> io::Result<Vec<ReaderIdent>> {
         let me = std::process::id();
         let mut found: BTreeMap<u32, ReaderIdent> = BTreeMap::new();
         for entry in std::fs::read_dir("/proc")? {
@@ -312,7 +370,9 @@ pub fn setup(cfg: &FifoCfg, daemon_uid: u32) -> io::Result<FifoId> {
         );
     }
     // SAFETY: as above.
-    if unsafe { libc::fchmod(file.as_raw_fd(), cfg.mode) } != 0 {
+    #[allow(clippy::unnecessary_cast)] // mode_t is u16 on macOS
+    let mode = cfg.mode as libc::mode_t;
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
         let e = io::Error::last_os_error();
         let _ = std::fs::remove_file(path);
         return Err(e);
@@ -370,6 +430,15 @@ pub fn remove(path: &Path, id: FifoId) {
 
 /// `open(O_WRONLY | O_NONBLOCK)`: `Ok(None)` while no reader has the pipe open
 /// (`ENXIO`), the write end as soon as one does. Never blocks.
+///
+/// POSIX specifies `ENXIO` for this case and both Linux and macOS (XNU's
+/// `fifo_open`) implement it, including counting a reader that is still
+/// blocked in its own `open(O_RDONLY)`. Differences to keep in mind on macOS:
+/// a write end whose readers left is expected to show up as `POLLHUP`
+/// (Linux: `POLLERR`); [`reader_gone_now`] accepts either, and the write path
+/// does not depend on it (a vanished reader gives `EPIPE`, `SIGPIPE` being
+/// ignored). tokio's `AsyncFd` waits with `kqueue` instead of epoll. These
+/// macOS behaviours are exercised by `tests/fifo.rs` in the macOS CI job.
 fn try_open_writer(path: &Path, id: FifoId) -> io::Result<Option<OwnedFd>> {
     let c = cstr(path)?;
     // SAFETY: valid NUL-terminated path, constant flags.
@@ -899,6 +968,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn fdinfo_flags_are_octal() {
         assert_eq!(

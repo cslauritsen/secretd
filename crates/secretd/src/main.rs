@@ -8,8 +8,8 @@ use secretd::homeassistant::HaChannel;
 use secretd::notify_http::HttpNotifier;
 use secretd::oidc::OidcClient;
 use secretd::peer::RealPeerCred;
-use secretd::procinfo::RealProcReader;
-use secretd::{runtime, server};
+use secretd::procinfo::{ProcInfoReader, RealProcReader};
+use secretd::{platform, runtime, server};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -67,8 +67,8 @@ fn warn_if_nofile_low(cfg: &Config) {
         if cur < need {
             tracing::warn!(
                 "RLIMIT_NOFILE is {} but the configured limits can need {need} descriptors; \
-                 raise LimitNOFILE= in the unit or lower limits.max_conns_total / \
-                 approval.max_connections",
+                 raise LimitNOFILE= in the unit (SoftResourceLimits/NumberOfFiles in the \
+                 launchd plist) or lower limits.max_conns_total / approval.max_connections",
                 rl.rlim_cur
             );
         }
@@ -99,7 +99,7 @@ async fn run() -> Result<()> {
     }
 
     // Bind (or inherit) sockets while still privileged, then drop root.
-    let activated = runtime::systemd_sockets().context("socket activation")?;
+    let activated = runtime::activated_sockets().context("socket activation")?;
     let client_l = match activated.client {
         Some(l) => l,
         None => {
@@ -122,6 +122,24 @@ async fn run() -> Result<()> {
         (None, false) => None,
     };
     runtime::drop_privileges(&cfg.daemon.user).context("dropping privileges")?;
+
+    // macOS: identifying callers of other users needs root (spec section 22).
+    // Refuse a configuration that pins executables for such callers instead of
+    // starting a daemon that would deny all of them. Linux keeps its documented
+    // per-request fail-closed behaviour (CAP_SYS_PTRACE is granted by the unit).
+    if cfg!(target_os = "macos") {
+        let probe = RealProcReader.read(1).map(|_| ());
+        let rep = platform::check_process_inspection(&cfg, nix::unistd::geteuid().as_raw(), &probe);
+        for w in &rep.warnings {
+            tracing::warn!("process inspection: {w}");
+        }
+        if !rep.errors.is_empty() {
+            return Err(anyhow!(
+                "cannot identify callers of other users: {}",
+                rep.errors.join("; ")
+            ));
+        }
+    }
 
     let audit = Audit::open(&cfg.daemon.audit_log)
         .with_context(|| format!("opening audit log {}", cfg.daemon.audit_log.display()))?;

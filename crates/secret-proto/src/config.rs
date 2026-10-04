@@ -251,8 +251,8 @@ impl Default for DaemonCfg {
     fn default() -> Self {
         DaemonCfg {
             user: "secretd".into(),
-            socket: "/run/secretd/secretd.sock".into(),
-            admin_socket: "/run/secretd/admin.sock".into(),
+            socket: crate::DEFAULT_SOCKET.into(),
+            admin_socket: crate::DEFAULT_ADMIN_SOCKET.into(),
             store: "/var/lib/secretd/store.age".into(),
             audit_log: "/var/log/secretd/audit.jsonl".into(),
             request_timeout_secs: 300,

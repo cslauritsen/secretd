@@ -6,7 +6,7 @@ use secret_proto::config::FifoCfg;
 use secret_proto::store::{self, Entry};
 use secretd::core::{ApproveOutcome, DenyOutcome, Source};
 use secretd::fifo::{self, FifoHandle, ProcScanner, ReaderIdent, ReaderScanner};
-use secretd::procinfo::{ProcInfo, RealProcReader};
+use secretd::procinfo::{ProcInfo, ProcInfoReader, RealProcReader};
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::PathBuf;
@@ -270,8 +270,7 @@ async fn identity_of_a_real_reader_is_captured() {
     let n = &n[0];
     assert_eq!(n.pid, pid, "the cat process, not the daemon");
     assert_eq!(n.uid, euid());
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
-    assert_eq!(n.exe, exe.to_string_lossy());
+    assert_eq!(n.exe, exe_of(pid));
     assert!(
         n.cmdline.contains(&path.display().to_string()),
         "{}",
@@ -289,17 +288,23 @@ async fn identity_of_a_real_reader_is_captured() {
     assert_no_secret_in_audit(&h);
 }
 
-/// Path of the executable `cat` really is (as `/proc/<pid>/exe` reports it).
+/// The executable of a live process as the OS reports it (`/proc/<pid>/exe` on
+/// Linux, `proc_pidpath` on macOS).
+fn exe_of(pid: u32) -> String {
+    RealProcReader.read(pid).unwrap().exe
+}
+
+/// Path of the executable `cat` really is (as the OS reports it).
 fn cat_exe() -> String {
     let mut c = std::process::Command::new("cat")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let exe = std::fs::read_link(format!("/proc/{}/exe", c.id())).unwrap();
+    let exe = exe_of(c.id());
     let _ = c.kill();
     let _ = c.wait();
-    exe.to_string_lossy().into_owned()
+    exe
 }
 
 #[tokio::test]
