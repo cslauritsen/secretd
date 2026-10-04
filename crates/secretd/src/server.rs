@@ -323,6 +323,7 @@ async fn admin_dispatch(core: &Arc<Core>, req: &Request) -> Result<Value, RpcErr
         .audit(
             &crate::audit::AuditEvent::new("admin_action")
                 .outcome(&req.method)
+                .channel(secret_proto::config::ChannelKind::Admin)
                 .detail("admin socket"),
         )
         .is_ok();

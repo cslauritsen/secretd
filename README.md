@@ -165,6 +165,28 @@ secretd.example.com {
 (default loopback); keep the proxy on the same host, or list its address and set
 `allow_non_loopback = true` if `secretd` must listen elsewhere.
 
+## Channels
+
+The owner can be reached, and can approve, through any enabled *channel*:
+
+```toml
+[channels]
+enabled = ["web", "admin"]      # default; "homeassistant" is the third (see below)
+```
+
+* `web`: push notification (ntfy/webhook) plus the Google-OIDC approval page. Needs `[notify]`,
+  `[approval]` and `[approval.oidc]`.
+* `admin`: the root-only admin socket (`secretctl pending|approve|deny`). Pull based, announces nothing.
+* `homeassistant`: see the Home Assistant section.
+
+At least one must be enabled (`secretctl check-config` and the daemon refuse to start otherwise).
+A request may be resolved through any enabled channel; the first valid resolution wins and the
+others are told the request is closed (web URL: 410, Home Assistant notification cleared). A
+request fails with `INTERNAL` only if **every** enabled notification channel (`web`,
+`homeassistant`) failed to announce it; a single failing channel is audited (`notify_failed`
+with its `channel`) but not fatal. Every approval-related audit event carries a `channel` field.
+Which channels are enabled needs a restart to change (SIGHUP does not re-wire channels).
+
 ## Audit log and limits
 
 `/var/log/secretd/audit.jsonl` (mode `0640`, JSON lines, every event has an `outcome`) is reopened

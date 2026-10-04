@@ -17,15 +17,20 @@ pub fn run(cli: &Cli) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
 
     // Files referenced by the configuration.
-    let mut secret_files = vec![(
-        "approval.oidc.client_secret_file",
-        &cfg.approval.oidc.client_secret_file,
-    )];
-    if let Some(p) = &cfg.notify.auth_token_file {
-        secret_files.push(("notify.auth_token_file", p));
+    let mut secret_files = Vec::new();
+    if let Some(a) = &cfg.approval {
+        secret_files.push((
+            "approval.oidc.client_secret_file",
+            &a.oidc.client_secret_file,
+        ));
     }
-    if let Some(p) = &cfg.notify.hmac_secret_file {
-        secret_files.push(("notify.hmac_secret_file", p));
+    if let Some(n) = &cfg.notify {
+        if let Some(p) = &n.auth_token_file {
+            secret_files.push(("notify.auth_token_file", p));
+        }
+        if let Some(p) = &n.hmac_secret_file {
+            secret_files.push(("notify.hmac_secret_file", p));
+        }
     }
     let socket_gid = cfg.daemon.socket_group.as_deref().and_then(|g| {
         secret_proto::config::NameResolver::gid(&secret_proto::config::SystemResolver, g)
@@ -90,11 +95,13 @@ pub fn run(cli: &Cli) -> Result<()> {
     }
 
     // OIDC / approval summary.
-    if cfg.approval.oidc.issuer != "https://accounts.google.com" {
-        warnings.push(format!(
-            "approval.oidc.issuer is {:?}, not Google",
-            cfg.approval.oidc.issuer
-        ));
+    if let Some(a) = &cfg.approval {
+        if a.oidc.issuer != "https://accounts.google.com" {
+            warnings.push(format!(
+                "approval.oidc.issuer is {:?}, not Google",
+                a.oidc.issuer
+            ));
+        }
     }
     if cfg.secrets.is_empty() {
         warnings.push("no [[secret]] entries configured".into());
@@ -107,13 +114,20 @@ pub fn run(cli: &Cli) -> Result<()> {
         println!("ERROR: {e}");
     }
     if errors.is_empty() {
+        let channels: Vec<&str> = cfg.channels.enabled.iter().map(|c| c.as_str()).collect();
         println!(
-            "OK: {} secret(s), approval on {} (external {}), {} owner email(s)",
+            "OK: {} secret(s), channels: {}",
             cfg.secrets.len(),
-            cfg.approval.listen,
-            cfg.approval.external_url,
-            cfg.approval.oidc.owner_emails.len()
+            channels.join(", ")
         );
+        if let Some(a) = &cfg.approval {
+            println!(
+                "OK: web approval on {} (external {}), {} owner email(s)",
+                a.listen,
+                a.external_url,
+                a.oidc.owner_emails.len()
+            );
+        }
         Ok(())
     } else {
         bail!("{} error(s) found", errors.len())

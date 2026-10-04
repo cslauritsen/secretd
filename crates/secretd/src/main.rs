@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use secret_proto::config::{Config, SystemResolver};
+use secret_proto::config::{ChannelKind, Config, SystemResolver};
 use secretd::audit::Audit;
+use secretd::channel::{AdminChannel, Channel, WebChannel};
 use secretd::core::Core;
 use secretd::notify_http::HttpNotifier;
 use secretd::oidc::OidcClient;
@@ -45,7 +46,11 @@ fn main() -> Result<()> {
 /// and a pidfd per client connection, the approval connections, plus headroom
 /// for listeners, the audit log, the store and outbound notification calls.
 fn nofile_needed(cfg: &Config) -> u64 {
-    2 * cfg.limits.max_conns_total as u64 + cfg.approval.max_connections as u64 + 64
+    let web = cfg
+        .approval
+        .as_ref()
+        .map_or(0, |a| a.max_connections as u64);
+    2 * cfg.limits.max_conns_total as u64 + web + 64
 }
 
 fn warn_if_nofile_low(cfg: &Config) {
@@ -108,37 +113,58 @@ async fn run() -> Result<()> {
             l
         }
     };
-    let admin_l = match activated.admin {
-        Some(l) => l,
-        None => runtime::bind_unix(&cfg.daemon.admin_socket, 0o600)?,
+    let want_admin = cfg.channels.has(ChannelKind::Admin);
+    let admin_l = match (activated.admin, want_admin) {
+        (Some(l), true) => Some(l),
+        (Some(_), false) => None, // channel disabled: drop the inherited socket
+        (None, true) => Some(runtime::bind_unix(&cfg.daemon.admin_socket, 0o600)?),
+        (None, false) => None,
     };
     runtime::drop_privileges(&cfg.daemon.user).context("dropping privileges")?;
 
     let audit = Audit::open(&cfg.daemon.audit_log)
         .with_context(|| format!("opening audit log {}", cfg.daemon.audit_log.display()))?;
-    let notifier = HttpNotifier::new(&cfg.notify).context("setting up notifier")?;
-    let client_secret =
-        secret_proto::config::read_secret_file(&cfg.approval.oidc.client_secret_file)
-            .map_err(|e| anyhow!("{e}"))?;
-    let oidc = Arc::new(OidcClient::new(cfg.approval.oidc.clone(), client_secret)?);
-    let approval_cfg = cfg.approval.clone();
-    let core = Core::new(cfg, audit, Arc::new(notifier), Arc::new(RealProcReader));
-    let http_listener = tokio::net::TcpListener::bind(approval_cfg.listen)
-        .await
-        .with_context(|| format!("binding approval endpoint {}", approval_cfg.listen))?;
-    tracing::info!(
-        "approval endpoint on {} (plain HTTP; terminate TLS in a reverse proxy)",
-        approval_cfg.listen
-    );
-    let serve_opts = secretd::approval::ServeOpts::from_cfg(&approval_cfg);
-    tokio::spawn(secretd::approval::serve_with(
-        http_listener,
-        secretd::approval::router(core.clone(), approval_cfg, oidc),
-        serve_opts,
-    ));
+
+    let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
+    let mut web_parts = None;
+    if let (true, Some(notify_cfg), Some(approval_cfg)) = (
+        cfg.channels.has(ChannelKind::Web),
+        &cfg.notify,
+        &cfg.approval,
+    ) {
+        let notifier = HttpNotifier::new(notify_cfg).context("setting up notifier")?;
+        let client_secret =
+            secret_proto::config::read_secret_file(&approval_cfg.oidc.client_secret_file)
+                .map_err(|e| anyhow!("{e}"))?;
+        let oidc = Arc::new(OidcClient::new(approval_cfg.oidc.clone(), client_secret)?);
+        channels.push(Arc::new(WebChannel::new(Arc::new(notifier))));
+        web_parts = Some((approval_cfg.clone(), oidc));
+    }
+    if want_admin {
+        channels.push(Arc::new(AdminChannel));
+    }
+    let core = Core::with_channels(cfg, audit, channels, Arc::new(RealProcReader));
+
+    if let Some((approval_cfg, oidc)) = web_parts {
+        let http_listener = tokio::net::TcpListener::bind(approval_cfg.listen)
+            .await
+            .with_context(|| format!("binding approval endpoint {}", approval_cfg.listen))?;
+        tracing::info!(
+            "approval endpoint on {} (plain HTTP; terminate TLS in a reverse proxy)",
+            approval_cfg.listen
+        );
+        let serve_opts = secretd::approval::ServeOpts::from_cfg(&approval_cfg);
+        tokio::spawn(secretd::approval::serve_with(
+            http_listener,
+            secretd::approval::router(core.clone(), approval_cfg, oidc),
+            serve_opts,
+        ));
+    }
     let peer: Arc<dyn secretd::peer::PeerCredProvider> = Arc::new(RealPeerCred);
     tokio::spawn(server::serve_clients(core.clone(), client_l, peer.clone()));
-    tokio::spawn(server::serve_admin(core.clone(), admin_l, peer));
+    if let Some(admin_l) = admin_l {
+        tokio::spawn(server::serve_admin(core.clone(), admin_l, peer));
+    }
 
     let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

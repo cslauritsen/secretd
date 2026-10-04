@@ -27,6 +27,9 @@ pub struct AuditEvent {
     pub outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_ip: Option<String>,
+    /// Approval channel involved (`web`, `admin`, `homeassistant`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
     /// Extra non-sensitive detail (for example the OIDC `amr` claim).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -77,6 +80,10 @@ impl AuditEvent {
     }
     pub fn source(mut self, ip: Option<std::net::IpAddr>) -> Self {
         self.source_ip = ip.map(|i| i.to_string());
+        self
+    }
+    pub fn channel(mut self, c: secret_proto::config::ChannelKind) -> Self {
+        self.channel = Some(c.as_str().to_string());
         self
     }
     pub fn detail(mut self, d: &str) -> Self {

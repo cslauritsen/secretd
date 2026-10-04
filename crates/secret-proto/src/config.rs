@@ -22,10 +22,54 @@ struct RawConfig {
     daemon: DaemonCfg,
     #[serde(default)]
     limits: LimitsCfg,
-    notify: NotifyCfg,
-    approval: RawApproval,
+    #[serde(default)]
+    channels: Option<RawChannels>,
+    notify: Option<NotifyCfg>,
+    approval: Option<RawApproval>,
     #[serde(default, rename = "secret")]
     secrets: Vec<RawSecret>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawChannels {
+    enabled: Vec<ChannelKind>,
+}
+
+/// An approval channel (spec section 19.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelKind {
+    /// Push notification plus the OIDC-protected approval page.
+    Web,
+    /// The root-only admin socket (`secretctl approve|deny`).
+    Admin,
+    /// Home Assistant (notification actions and a passphrase entity).
+    HomeAssistant,
+}
+
+impl ChannelKind {
+    /// The name used in the configuration and in the audit log `channel` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChannelKind::Web => "web",
+            ChannelKind::Admin => "admin",
+            ChannelKind::HomeAssistant => "homeassistant",
+        }
+    }
+}
+
+/// Which channels are enabled. Without a `[channels]` table: `web` and `admin`
+/// (the behaviour before channels existed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelsCfg {
+    pub enabled: Vec<ChannelKind>,
+}
+
+impl ChannelsCfg {
+    pub fn has(&self, k: ChannelKind) -> bool {
+        self.enabled.contains(&k)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,8 +373,11 @@ pub struct SecretAcl {
 pub struct Config {
     pub daemon: DaemonCfg,
     pub limits: LimitsCfg,
-    pub notify: NotifyCfg,
-    pub approval: ApprovalCfg,
+    pub channels: ChannelsCfg,
+    /// Push notification settings; present exactly when `web` is enabled.
+    pub notify: Option<NotifyCfg>,
+    /// Approval endpoint and OIDC settings; present exactly when `web` is enabled.
+    pub approval: Option<ApprovalCfg>,
     pub secrets: Vec<SecretAcl>,
     /// Non-fatal findings from validation.
     pub warnings: Vec<String>,
@@ -410,111 +457,38 @@ impl Config {
             return err("limits must be non-zero");
         }
 
-        // notify
-        let n = &raw.notify;
-        if !(n.url.starts_with("https://") || n.url.starts_with("http://")) {
-            return err("notify.url must be an http(s) URL");
-        }
-        if n.url.starts_with("http://") {
-            warnings.push("notify.url uses plain http".into());
-        }
-        if n.attempts == 0 {
-            return err("notify.attempts must be >= 1");
-        }
-        if n.kind == NotifyKind::Ntfy && n.hmac_secret_file.is_some() {
-            warnings.push("notify.hmac_secret_file is ignored for kind = \"ntfy\"".into());
-        }
-        if n.kind == NotifyKind::Webhook && n.auth_token_file.is_some() {
-            warnings.push("notify.auth_token_file is ignored for kind = \"webhook\"".into());
-        }
-
-        // approval
-        let a = &raw.approval;
-        let listen: SocketAddr = a
-            .listen
-            .parse()
-            .map_err(|_| ConfigError(format!("approval.listen {:?} is not host:port", a.listen)))?;
-        if !listen.ip().is_loopback() {
-            if !a.allow_non_loopback {
-                return err(format!(
-                    "approval.listen {listen} is not a loopback address; \
-                     set approval.allow_non_loopback = true to allow it"
-                ));
-            }
-            warnings.push(format!(
-                "approval.listen {listen} is not loopback: ensure only the TLS reverse proxy can reach it"
-            ));
-        }
-        let ext = url::Url::parse(&a.external_url)
-            .map_err(|_| ConfigError("approval.external_url is not a valid URL".into()))?;
-        if ext.scheme() != "https" {
-            return err("approval.external_url must be an https:// URL");
-        }
-        let host = ext
-            .host_str()
-            .ok_or_else(|| ConfigError("approval.external_url has no host".into()))?;
-        if ext.path() != "/" && !ext.path().is_empty() || ext.query().is_some() {
-            return err("approval.external_url must not contain a path or query");
-        }
-        let external_host = match ext.port() {
-            Some(p) => format!("{host}:{p}"),
-            None => host.to_string(),
+        // channels
+        let enabled = match &raw.channels {
+            Some(c) => c.enabled.clone(),
+            None => vec![ChannelKind::Web, ChannelKind::Admin],
         };
-        let external_url = format!("https://{external_host}");
-        let trusted_proxies = a
-            .trusted_proxies
-            .iter()
-            .map(|s| Cidr::parse(s))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        if a.max_connections == 0
-            || a.header_read_timeout_secs == 0
-            || a.request_timeout_secs == 0
-            || a.max_login_starts_per_min == 0
-        {
-            return err("approval connection limits and timeouts must be non-zero");
+        if enabled.is_empty() {
+            return err("channels.enabled is empty: at least one approval channel must be enabled");
         }
-
-        let o = &a.oidc;
-        let issuer = url::Url::parse(&o.issuer)
-            .map_err(|_| ConfigError("approval.oidc.issuer is not a valid URL".into()))?;
-        match issuer.scheme() {
-            "https" => {}
-            // Plain http is tolerated only towards this machine (local mock
-            // providers); a network issuer over http would let anyone on the
-            // path forge the discovery document and the signing keys.
-            "http" if issuer_is_loopback(&issuer) => warnings.push(
-                "approval.oidc.issuer uses plain http (loopback only; for local testing)".into(),
-            ),
-            _ => return err("approval.oidc.issuer must be an https:// URL"),
-        }
-        if o.client_id.trim().is_empty() {
-            return err("approval.oidc.client_id is empty");
-        }
-        if o.owner_emails.is_empty() || o.owner_emails.iter().any(|e| !e.contains('@')) {
-            return err("approval.oidc.owner_emails must list at least one email address");
-        }
-        if o.session_ttl_secs == 0 {
-            return err("approval.oidc.session_ttl_secs must be > 0");
-        }
-        let redirect_url = match &o.redirect_url {
-            Some(r) => {
-                let u = url::Url::parse(r)
-                    .map_err(|_| ConfigError("approval.oidc.redirect_url is invalid".into()))?;
-                if u.scheme() != "https" {
-                    return err("approval.oidc.redirect_url must be https");
-                }
-                r.clone()
+        for (i, k) in enabled.iter().enumerate() {
+            if enabled[..i].contains(k) {
+                return err(format!("channels.enabled lists {:?} twice", k.as_str()));
             }
-            None => format!("{external_url}/auth/callback"),
-        };
-        let oidc = OidcCfg {
-            issuer: o.issuer.clone(),
-            client_id: o.client_id.clone(),
-            client_secret_file: o.client_secret_file.clone(),
-            redirect_url,
-            owner_emails: o.owner_emails.iter().map(|e| e.to_lowercase()).collect(),
-            session_ttl_secs: o.session_ttl_secs,
+        }
+        let channels = ChannelsCfg { enabled };
+        let web = channels.has(ChannelKind::Web);
+        if web && (raw.notify.is_none() || raw.approval.is_none()) {
+            return err(
+                "channel \"web\" is enabled but [notify], [approval] and [approval.oidc] are \
+                 not all configured",
+            );
+        }
+        if !web && (raw.notify.is_some() || raw.approval.is_some()) {
+            warnings.push(
+                "[notify]/[approval] are configured but the \"web\" channel is not enabled; \
+                 they are ignored"
+                    .into(),
+            );
+        }
+
+        let (notify, approval) = match (web, &raw.notify, &raw.approval) {
+            (true, Some(n), Some(a)) => (Some(n.clone()), Some(parse_web(n, a, &mut warnings)?)),
+            _ => (None, None),
         };
 
         // secrets
@@ -602,20 +576,9 @@ impl Config {
         Ok(Config {
             daemon: raw.daemon,
             limits: raw.limits,
-            notify: raw.notify,
-            approval: ApprovalCfg {
-                listen,
-                external_url,
-                external_host,
-                trusted_proxies,
-                allow_non_loopback: a.allow_non_loopback,
-                max_failed_attempts_per_min: a.max_failed_attempts_per_min,
-                max_login_starts_per_min: a.max_login_starts_per_min,
-                max_connections: a.max_connections,
-                header_read_timeout_secs: a.header_read_timeout_secs,
-                request_timeout_secs: a.request_timeout_secs,
-                oidc,
-            },
+            channels,
+            notify,
+            approval,
             secrets,
             warnings,
         })
@@ -657,6 +620,130 @@ impl Config {
     pub fn secret(&self, name: &str) -> Option<&SecretAcl> {
         self.secrets.iter().find(|s| s.name == name)
     }
+}
+
+/// Validate the `[notify]` and `[approval]` tables (the `web` channel).
+fn parse_web(
+    n: &NotifyCfg,
+    a: &RawApproval,
+    warnings: &mut Vec<String>,
+) -> Result<ApprovalCfg, ConfigError> {
+    if !(n.url.starts_with("https://") || n.url.starts_with("http://")) {
+        return err("notify.url must be an http(s) URL");
+    }
+    if n.url.starts_with("http://") {
+        warnings.push("notify.url uses plain http".into());
+    }
+    if n.attempts == 0 {
+        return err("notify.attempts must be >= 1");
+    }
+    if n.kind == NotifyKind::Ntfy && n.hmac_secret_file.is_some() {
+        warnings.push("notify.hmac_secret_file is ignored for kind = \"ntfy\"".into());
+    }
+    if n.kind == NotifyKind::Webhook && n.auth_token_file.is_some() {
+        warnings.push("notify.auth_token_file is ignored for kind = \"webhook\"".into());
+    }
+
+    // approval
+    let listen: SocketAddr = a
+        .listen
+        .parse()
+        .map_err(|_| ConfigError(format!("approval.listen {:?} is not host:port", a.listen)))?;
+    if !listen.ip().is_loopback() {
+        if !a.allow_non_loopback {
+            return err(format!(
+                "approval.listen {listen} is not a loopback address; \
+                     set approval.allow_non_loopback = true to allow it"
+            ));
+        }
+        warnings.push(format!(
+                "approval.listen {listen} is not loopback: ensure only the TLS reverse proxy can reach it"
+            ));
+    }
+    let ext = url::Url::parse(&a.external_url)
+        .map_err(|_| ConfigError("approval.external_url is not a valid URL".into()))?;
+    if ext.scheme() != "https" {
+        return err("approval.external_url must be an https:// URL");
+    }
+    let host = ext
+        .host_str()
+        .ok_or_else(|| ConfigError("approval.external_url has no host".into()))?;
+    if ext.path() != "/" && !ext.path().is_empty() || ext.query().is_some() {
+        return err("approval.external_url must not contain a path or query");
+    }
+    let external_host = match ext.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    };
+    let external_url = format!("https://{external_host}");
+    let trusted_proxies = a
+        .trusted_proxies
+        .iter()
+        .map(|s| Cidr::parse(s))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if a.max_connections == 0
+        || a.header_read_timeout_secs == 0
+        || a.request_timeout_secs == 0
+        || a.max_login_starts_per_min == 0
+    {
+        return err("approval connection limits and timeouts must be non-zero");
+    }
+
+    let o = &a.oidc;
+    let issuer = url::Url::parse(&o.issuer)
+        .map_err(|_| ConfigError("approval.oidc.issuer is not a valid URL".into()))?;
+    match issuer.scheme() {
+        "https" => {}
+        // Plain http is tolerated only towards this machine (local mock
+        // providers); a network issuer over http would let anyone on the
+        // path forge the discovery document and the signing keys.
+        "http" if issuer_is_loopback(&issuer) => warnings
+            .push("approval.oidc.issuer uses plain http (loopback only; for local testing)".into()),
+        _ => return err("approval.oidc.issuer must be an https:// URL"),
+    }
+    if o.client_id.trim().is_empty() {
+        return err("approval.oidc.client_id is empty");
+    }
+    if o.owner_emails.is_empty() || o.owner_emails.iter().any(|e| !e.contains('@')) {
+        return err("approval.oidc.owner_emails must list at least one email address");
+    }
+    if o.session_ttl_secs == 0 {
+        return err("approval.oidc.session_ttl_secs must be > 0");
+    }
+    let redirect_url = match &o.redirect_url {
+        Some(r) => {
+            let u = url::Url::parse(r)
+                .map_err(|_| ConfigError("approval.oidc.redirect_url is invalid".into()))?;
+            if u.scheme() != "https" {
+                return err("approval.oidc.redirect_url must be https");
+            }
+            r.clone()
+        }
+        None => format!("{external_url}/auth/callback"),
+    };
+    let oidc = OidcCfg {
+        issuer: o.issuer.clone(),
+        client_id: o.client_id.clone(),
+        client_secret_file: o.client_secret_file.clone(),
+        redirect_url,
+        owner_emails: o.owner_emails.iter().map(|e| e.to_lowercase()).collect(),
+        session_ttl_secs: o.session_ttl_secs,
+    };
+
+    Ok(ApprovalCfg {
+        listen,
+        external_url,
+        external_host,
+        trusted_proxies,
+        allow_non_loopback: a.allow_non_loopback,
+        max_failed_attempts_per_min: a.max_failed_attempts_per_min,
+        max_login_starts_per_min: a.max_login_starts_per_min,
+        max_connections: a.max_connections,
+        header_read_timeout_secs: a.header_read_timeout_secs,
+        request_timeout_secs: a.request_timeout_secs,
+        oidc,
+    })
 }
 
 fn issuer_is_loopback(u: &url::Url) -> bool {
@@ -742,16 +829,25 @@ owner_emails = ["Owner@Example.com"]
     #[test]
     fn defaults() {
         let c = parse("").unwrap();
-        assert_eq!(c.approval.listen.to_string(), "127.0.0.1:8443");
-        assert_eq!(c.approval.external_host, "secretd.example.com");
         assert_eq!(
-            c.approval.oidc.redirect_url,
+            c.approval.as_ref().unwrap().listen.to_string(),
+            "127.0.0.1:8443"
+        );
+        assert_eq!(
+            c.approval.as_ref().unwrap().external_host,
+            "secretd.example.com"
+        );
+        assert_eq!(
+            c.approval.as_ref().unwrap().oidc.redirect_url,
             "https://secretd.example.com/auth/callback"
         );
-        assert_eq!(c.approval.oidc.owner_emails, vec!["owner@example.com"]);
+        assert_eq!(
+            c.approval.as_ref().unwrap().oidc.owner_emails,
+            vec!["owner@example.com"]
+        );
         assert_eq!(c.limits.max_pending_per_uid, 3);
         assert_eq!(c.daemon.request_timeout_secs, 300);
-        assert_eq!(c.approval.trusted_proxies.len(), 2);
+        assert_eq!(c.approval.as_ref().unwrap().trusted_proxies.len(), 2);
     }
 
     #[test]
@@ -821,7 +917,10 @@ owner_emails = ["Owner@Example.com"]
         assert!(Config::parse(&b, &R).is_err());
         let b = BASE.replace("https://secretd.example.com", "https://x.example.com:8444/");
         let c = Config::parse(&b, &R).unwrap();
-        assert_eq!(c.approval.external_host, "x.example.com:8444");
+        assert_eq!(
+            c.approval.as_ref().unwrap().external_host,
+            "x.example.com:8444"
+        );
         let b = BASE.replace("https://secretd.example.com", "https://x.example.com/sub");
         assert!(Config::parse(&b, &R).is_err());
     }
@@ -897,13 +996,42 @@ owner_emails = ["Owner@Example.com"]
     }
 
     #[test]
+    fn channels_default_and_rules() {
+        let c = parse("").unwrap();
+        assert_eq!(
+            c.channels.enabled,
+            vec![ChannelKind::Web, ChannelKind::Admin]
+        );
+        let with = |ch: &str| Config::parse(&format!("{BASE}\n[channels]\nenabled = {ch}\n"), &R);
+        // Explicit subset, web off: [notify]/[approval] are ignored with a warning.
+        let c = with("[\"admin\"]").unwrap();
+        assert!(c.notify.is_none() && c.approval.is_none());
+        assert!(c.warnings.iter().any(|w| w.contains("ignored")));
+        // At least one approval channel.
+        assert!(with("[]").unwrap_err().0.contains("at least one"));
+        assert!(with("[\"web\", \"web\"]").unwrap_err().0.contains("twice"));
+        assert!(with("[\"carrier-pigeon\"]").is_err());
+        // Web needs its tables.
+        let no_web = "[channels]\nenabled = [\"web\"]\n";
+        let e = Config::parse(no_web, &R).unwrap_err();
+        assert!(e.0.contains("web"), "{e}");
+        // Admin only, no [notify]/[approval] at all: valid.
+        let c = Config::parse("[channels]\nenabled = [\"admin\"]\n", &R).unwrap();
+        assert_eq!(c.channels.enabled, vec![ChannelKind::Admin]);
+        assert_eq!(ChannelKind::HomeAssistant.as_str(), "homeassistant");
+    }
+
+    #[test]
     fn packaged_example_config_parses() {
         let text = include_str!("../../../packaging/config.example.toml");
         let c = Config::parse(text, &R).unwrap();
         assert_eq!(c.secrets[0].name, "db-password");
         assert_eq!(c.daemon.socket_mode, 0o660);
-        assert_eq!(c.approval.external_host, "secretd.example.com");
-        assert_eq!(c.notify.attempts, 3);
+        assert_eq!(
+            c.approval.as_ref().unwrap().external_host,
+            "secretd.example.com"
+        );
+        assert_eq!(c.notify.as_ref().unwrap().attempts, 3);
     }
 
     #[test]

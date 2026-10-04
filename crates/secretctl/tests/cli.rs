@@ -240,6 +240,26 @@ fn check_config() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("writable"));
 }
 
+#[test]
+fn check_config_validates_channels() {
+    let e = Env::new();
+    let base = std::fs::read_to_string(e.path("config.toml")).unwrap();
+    let with = |extra: &str| {
+        std::fs::write(e.path("config.toml"), format!("{base}\n{extra}\n")).unwrap();
+        e.run(&["check-config"], None)
+    };
+    // No approval channel at all: refused.
+    let o = with("[channels]\nenabled = []");
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("at least one approval channel"));
+    // Unknown channel: refused.
+    assert!(!with("[channels]\nenabled = [\"sms\"]").status.success());
+    // Subset: accepted, and the summary names the channels.
+    let o = with("[channels]\nenabled = [\"web\", \"admin\"]");
+    ok(&o);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("channels: web, admin"));
+}
+
 // ------------------------------------------------------------ admin socket
 
 mod admin {

@@ -2,11 +2,12 @@
 //! the approve/deny/release logic shared by the HTTP and admin endpoints.
 
 use crate::audit::{Audit, AuditEvent};
+use crate::channel::{AdminChannel, Channel, Closed, WebChannel};
 use crate::notify::{Notification, Notifier};
 use crate::peer::PeerCred;
 use crate::procinfo::{ProcInfo, ProcReader};
 use secret_proto::acl::{self, CallerIds};
-use secret_proto::config::Config;
+use secret_proto::config::{ChannelKind, Config};
 use secret_proto::rpc::{ErrorKind, GetParams, PendingInfo, RpcError};
 use secret_proto::sanitize;
 use secret_proto::store::{self, Passphrase, StoreError};
@@ -53,7 +54,7 @@ enum Outcome {
     /// only told "released" when that is true).
     Released {
         rel: Released,
-        source_ip: Option<IpAddr>,
+        source: Source,
         ack: oneshot::Sender<bool>,
     },
     Denied,
@@ -68,13 +69,23 @@ enum Outcome {
 pub enum Source {
     Http(IpAddr),
     Admin,
+    HomeAssistant,
 }
 
 impl Source {
     fn ip(self) -> Option<IpAddr> {
         match self {
             Source::Http(ip) => Some(ip),
-            Source::Admin => None,
+            Source::Admin | Source::HomeAssistant => None,
+        }
+    }
+
+    /// The approval channel the action arrived through.
+    pub fn channel(self) -> ChannelKind {
+        match self {
+            Source::Http(_) => ChannelKind::Web,
+            Source::Admin => ChannelKind::Admin,
+            Source::HomeAssistant => ChannelKind::HomeAssistant,
         }
     }
 }
@@ -161,7 +172,7 @@ pub struct Core {
     coalesce: Mutex<HashMap<CoalesceKey, Slot>>,
     coalesce_window: Mutex<Duration>,
     audit: Audit,
-    notifier: Arc<dyn Notifier>,
+    channels: Vec<Arc<dyn Channel>>,
     procs: Arc<dyn ProcReader>,
     /// Serialises unsealing: one scrypt derivation can need hundreds of MiB.
     unseal_gate: tokio::sync::Semaphore,
@@ -213,10 +224,27 @@ fn internal() -> RpcError {
 }
 
 impl Core {
+    /// A core with the classic channel pair: `web` (announcing through
+    /// `notifier`) and `admin`.
     pub fn new(
         cfg: Config,
         audit: Audit,
         notifier: Arc<dyn Notifier>,
+        procs: Arc<dyn ProcReader>,
+    ) -> Arc<Core> {
+        Self::with_channels(
+            cfg,
+            audit,
+            vec![Arc::new(WebChannel::new(notifier)), Arc::new(AdminChannel)],
+            procs,
+        )
+    }
+
+    /// A core with an explicit set of enabled channels.
+    pub fn with_channels(
+        cfg: Config,
+        audit: Audit,
+        channels: Vec<Arc<dyn Channel>>,
         procs: Arc<dyn ProcReader>,
     ) -> Arc<Core> {
         Arc::new(Core {
@@ -225,7 +253,7 @@ impl Core {
             coalesce: Mutex::new(HashMap::new()),
             coalesce_window: Mutex::new(COALESCE_WINDOW),
             audit,
-            notifier,
+            channels,
             procs,
             unseal_gate: tokio::sync::Semaphore::new(1),
             unseal_delay: Mutex::new(Duration::ZERO),
@@ -617,7 +645,7 @@ impl Core {
             );
         }
 
-        let notification = Notification {
+        let notification = Arc::new(Notification {
             request_id: id.clone(),
             secret_name: name.clone(),
             description: secret_cfg.description.clone(),
@@ -628,21 +656,32 @@ impl Core {
             cmdline: proc.cmdline.clone(),
             reason,
             expires_at: rfc3339(expires_at),
-            approval_url: format!("{}/approve/{id}?t={token}", cfg.approval.external_url),
-        };
+            approval_url: cfg
+                .approval
+                .as_ref()
+                .map(|a| format!("{}/approve/{id}?t={token}", a.external_url))
+                .unwrap_or_default(),
+            approval_token: token.clone(),
+        });
 
-        let notify_fut = async {
-            if let Err(e) = self.notifier.notify(&notification).await {
-                tracing::error!("{e}");
-                return Err(());
-            }
-            self.audit_for(
-                AuditEvent::new("notified").request(&id).secret(&name),
-                caller,
-            )
-            .map_err(|_| ())
-        };
-        tokio::pin!(notify_fut);
+        // Announce on every enabled notification channel at once.
+        let mut announces: tokio::task::JoinSet<(ChannelKind, Result<(), ()>)> =
+            tokio::task::JoinSet::new();
+        for ch in self.channels.iter().filter(|c| c.announces()) {
+            let (ch, n) = (ch.clone(), notification.clone());
+            announces.spawn(async move {
+                let kind = ch.kind();
+                match ch.announce(&n).await {
+                    Ok(()) => (kind, Ok(())),
+                    Err(e) => {
+                        tracing::error!("{} channel: {e}", kind.as_str());
+                        (kind, Err(()))
+                    }
+                }
+            });
+        }
+        // With no announcing channel (admin only) the request is armed at once.
+        let mut notified = announces.is_empty();
         tokio::pin!(disconnect);
 
         enum Done {
@@ -651,15 +690,44 @@ impl Core {
             Timeout,
             Gone,
         }
-        // The owner cannot act before `notified` is audited, so the outcome
-        // channel is only polled afterwards (keeps the audit order stable).
-        let mut notified = false;
+        // The owner cannot act before the first `notified` is audited, so the
+        // outcome channel is only polled afterwards (keeps the audit order
+        // stable). A channel that fails is audited (`notify_failed`) but only
+        // ends the request when every announcing channel failed.
         let mut done = loop {
             tokio::select! {
-                r = &mut notify_fut, if !notified => match r {
-                    Ok(()) => notified = true,
-                    Err(()) => break Done::NotifyFailed,
-                },
+                Some(joined) = announces.join_next(), if !announces.is_empty() => {
+                    let Ok((kind, res)) = joined else {
+                        // The announce task itself panicked: count it as a failure.
+                        if announces.is_empty() && !notified {
+                            break Done::NotifyFailed;
+                        }
+                        continue;
+                    };
+                    match res {
+                        Ok(()) => {
+                            let ev = AuditEvent::new("notified")
+                                .request(&id)
+                                .secret(&name)
+                                .channel(kind);
+                            if self.audit_for(ev, caller).is_err() {
+                                // Fail closed: an unlogged notification must not arm the request.
+                                break Done::NotifyFailed;
+                            }
+                            notified = true;
+                        }
+                        Err(()) => {
+                            let ev = AuditEvent::new("notify_failed")
+                                .request(&id)
+                                .secret(&name)
+                                .channel(kind);
+                            let _ = self.audit_for(ev, caller);
+                            if announces.is_empty() && !notified {
+                                break Done::NotifyFailed;
+                            }
+                        }
+                    }
+                }
                 o = &mut rx, if notified => break Done::Outcome(o.ok()),
                 _ = tokio::time::sleep_until(deadline) => break Done::Timeout,
                 _ = &mut disconnect => break Done::Gone,
@@ -675,55 +743,57 @@ impl Core {
             }
         }
 
-        match done {
+        let (result, why) = match done {
             Done::Outcome(Some(outcome)) => match outcome {
-                Outcome::Released {
-                    rel,
-                    source_ip,
-                    ack,
-                } => {
+                Outcome::Released { rel, source, ack } => {
                     let audited = self
                         .audit_for(
                             AuditEvent::new("released")
                                 .request(&id)
                                 .secret(&name)
-                                .source(source_ip),
+                                .source(source.ip())
+                                .channel(source.channel()),
                             caller,
                         )
                         .is_ok();
                     let _ = ack.send(audited);
                     if audited {
-                        Ok(rel)
+                        (Ok(rel), Closed::Released)
                     } else {
-                        Err(internal())
+                        (Err(internal()), Closed::Failed)
                     }
                 }
-                Outcome::Denied => Err(RpcError::new(ErrorKind::Denied)),
-                Outcome::DecryptFailed => Err(RpcError::new(ErrorKind::DecryptFailed)),
-                Outcome::CallerChanged => Err(RpcError::new(ErrorKind::CallerChanged)),
-                Outcome::NotFound => Err(RpcError::new(ErrorKind::NotFound)),
-                Outcome::Internal => Err(internal()),
+                Outcome::Denied => (Err(RpcError::new(ErrorKind::Denied)), Closed::Denied),
+                Outcome::DecryptFailed => {
+                    (Err(RpcError::new(ErrorKind::DecryptFailed)), Closed::Failed)
+                }
+                Outcome::CallerChanged => {
+                    (Err(RpcError::new(ErrorKind::CallerChanged)), Closed::Failed)
+                }
+                Outcome::NotFound => (Err(RpcError::new(ErrorKind::NotFound)), Closed::Failed),
+                Outcome::Internal => (Err(internal()), Closed::Failed),
             },
             Done::Outcome(None) => {
                 self.remove(&id);
-                Err(internal())
+                (Err(internal()), Closed::Failed)
             }
             Done::NotifyFailed => {
+                // Each failing channel was audited above.
                 self.remove(&id);
-                let _ = self.audit_for(
-                    AuditEvent::new("notify_failed").request(&id).secret(&name),
-                    caller,
-                );
-                Err(internal())
+                (Err(internal()), Closed::Failed)
             }
             Done::Timeout => {
                 self.remove(&id);
-                self.audit_for(
+                let audited = self.audit_for(
                     AuditEvent::new("timeout").request(&id).secret(&name),
                     caller,
-                )
-                .map_err(|_| internal())?;
-                Err(RpcError::new(ErrorKind::Timeout))
+                );
+                let r = if audited.is_ok() {
+                    Err(RpcError::new(ErrorKind::Timeout))
+                } else {
+                    Err(internal())
+                };
+                (r, Closed::Timeout)
             }
             Done::Gone => {
                 self.remove(&id);
@@ -733,8 +803,20 @@ impl Core {
                         .secret(&name),
                     caller,
                 );
-                Err(internal())
+                (Err(internal()), Closed::Cancelled)
             }
+        };
+        // Tell every channel that the request is closed (first resolution
+        // wins: a Home Assistant notification is cleared, the web URL already
+        // answers 410). Detached so a slow channel never delays the client.
+        self.close_channels(&id, why);
+        result
+    }
+
+    fn close_channels(&self, id: &str, why: Closed) {
+        for ch in &self.channels {
+            let (ch, id) = (ch.clone(), id.to_string());
+            tokio::spawn(async move { ch.closed(&id, why).await });
         }
     }
 
@@ -850,7 +932,8 @@ impl Core {
                 AuditEvent::new("denied")
                     .request(id)
                     .secret(&p.secret)
-                    .source(source.ip()),
+                    .source(source.ip())
+                    .channel(source.channel()),
                 &p.caller,
             )
             .is_ok();
@@ -931,7 +1014,8 @@ impl Core {
                 AuditEvent::new("approve_attempt")
                     .request(id)
                     .secret(&name)
-                    .source(source.ip()),
+                    .source(source.ip())
+                    .channel(source.channel()),
                 &caller,
             )
             .is_err()
@@ -949,7 +1033,8 @@ impl Core {
                     .request(id)
                     .secret(&name)
                     .outcome("at_release")
-                    .source(source.ip()),
+                    .source(source.ip())
+                    .channel(source.channel()),
                 &caller,
             );
             self.conclude(id, tx, Outcome::CallerChanged);
@@ -996,7 +1081,8 @@ impl Core {
                         AuditEvent::new("approved")
                             .request(id)
                             .secret(&name)
-                            .source(source.ip()),
+                            .source(source.ip())
+                            .channel(source.channel()),
                         &caller,
                     )
                     .is_err()
@@ -1010,7 +1096,7 @@ impl Core {
                 let (ack, ack_rx) = oneshot::channel();
                 let sent = tx.send(Outcome::Released {
                     rel: released,
-                    source_ip: source.ip(),
+                    source,
                     ack,
                 });
                 if sent.is_err() {
@@ -1019,7 +1105,8 @@ impl Core {
                             .request(id)
                             .secret(&name)
                             .outcome("client_gone")
-                            .source(source.ip()),
+                            .source(source.ip())
+                            .channel(source.channel()),
                         &caller,
                     );
                     return ApproveOutcome::Aborted;
@@ -1039,7 +1126,8 @@ impl Core {
                             .request(id)
                             .secret(&name)
                             .outcome(if remaining == 0 { "final" } else { "retry" })
-                            .source(source.ip()),
+                            .source(source.ip())
+                            .channel(source.channel()),
                         &caller,
                     )
                     .is_ok();
@@ -1072,7 +1160,8 @@ impl Core {
                         .request(id)
                         .secret(&name)
                         .outcome("not_in_store")
-                        .source(source.ip()),
+                        .source(source.ip())
+                        .channel(source.channel()),
                     &caller,
                 );
                 self.conclude(id, tx, Outcome::NotFound);
@@ -1085,7 +1174,8 @@ impl Core {
                         .request(id)
                         .secret(&name)
                         .outcome("store_error")
-                        .source(source.ip()),
+                        .source(source.ip())
+                        .channel(source.channel()),
                     &caller,
                 );
                 self.conclude(id, tx, Outcome::Internal);

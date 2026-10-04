@@ -291,3 +291,36 @@ Choices the specification left open, recorded as simply as possible.
   `/etc/secretd`, so nothing but the daemon user should be able to read secrets there. systemd
   `LoadCredential=` is an alternative. `secretctl check-config` warns when a credential file is
   readable by the client socket group.
+
+## Channels (milestone 7)
+
+- `[channels] enabled` defaults to `["web", "admin"]` when the table is absent, so existing configs
+  behave as before. `web` needs `[notify]`, `[approval]` and `[approval.oidc]` (both are now optional
+  in the config model: `Config.notify` / `Config.approval` are `Option`, `Some` exactly when `web` is
+  enabled). Tables present while `web` is off are ignored with a warning. Duplicates, unknown names
+  and an empty list are config errors, which `secretctl check-config` reports (it loads the config
+  with the same validator as the daemon).
+- `Channel` trait (`secretd::channel`): `announce` (push to the owner), `announces()` (false for the
+  pull-based admin channel) and `closed` (the request left the pending state). The *decision* half of
+  a channel is a call to `Core::approve` / `Core::deny` with a `Source` (`Http(ip)`, `Admin`,
+  `HomeAssistant`), so first-resolution-wins stays a single mechanism: the pending registry and the
+  reply-channel handoff that already decided approve vs deny vs timeout.
+- `Core::new(cfg, audit, notifier, procs)` is kept (web + admin around one `Notifier`) so the in-process
+  test harness and the CLI tests are unchanged; `Core::with_channels` takes an explicit set.
+- Announcing: every announcing channel is called concurrently. The request becomes answerable as soon
+  as the first one succeeded *and its `notified` event was written* (audit order stays
+  `request_received`, `notified`, ...); slower channels keep going and are audited when they finish.
+  If all announcing channels failed, the request fails `INTERNAL`. If there is none (admin only), the
+  request is answerable immediately and no `notified` event exists. A failing audit write on
+  `notified` still fails closed.
+- `closed` is called once per request on every channel, detached (a slow channel never delays the
+  client's reply), with `Released | Denied | Timeout | Cancelled | Failed`. The web channel needs
+  nothing (unknown request ids already answer 410).
+- Audit `channel` is set on events that have a channel: `notified` / `notify_failed` (the announcing
+  channel), `approve_attempt`, `approved`, `denied`, `decrypt_failed`, `released`, `aborted` (the
+  resolving channel), the web endpoint's `admin_action` / `rate_limited` lines (`web`) and the admin
+  socket's `admin_action` (`admin`). Events that belong to no channel (`request_received`, `timeout`,
+  `client_disconnected`, `acl_denied`, `rate_limited` for socket clients) have none.
+- `Notification` gained `approval_token` (channels other than web build their action ids from it) and
+  its `approval_url` is empty without the web channel. Its `Debug` output redacts both, so a stray
+  `{:?}` cannot log a token.

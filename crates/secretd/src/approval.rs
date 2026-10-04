@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
 use hmac::{Hmac, Mac};
-use secret_proto::config::ApprovalCfg;
+use secret_proto::config::{ApprovalCfg, ChannelKind};
 use secret_proto::rpc::PendingInfo;
 use secret_proto::sanitize;
 use sha2::Sha256;
@@ -487,7 +487,7 @@ impl AppState {
     }
 
     fn audit(&self, ev: AuditEvent) {
-        let _ = self.core.audit(&ev);
+        let _ = self.core.audit(&ev.channel(ChannelKind::Web));
     }
 
     fn rate_limited_response(&self, ip: IpAddr) -> Response {
@@ -499,6 +499,7 @@ impl AppState {
         let _ = self.core.audit_coalesced(
             AuditEvent::new("rate_limited")
                 .outcome(why)
+                .channel(ChannelKind::Web)
                 .source(Some(ip)),
             &ip.to_string(),
         );

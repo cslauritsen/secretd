@@ -14,7 +14,7 @@ async fn custom_server(
     opts: ServeOpts,
     edit: impl FnOnce(&mut secret_proto::config::ApprovalCfg),
 ) -> SocketAddr {
-    let mut cfg = w.h.cfg.approval.clone();
+    let mut cfg = w.h.cfg.approval.clone().unwrap();
     edit(&mut cfg);
     let app = approval::router(w.h.core.clone(), cfg, w.oidc_client.clone());
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

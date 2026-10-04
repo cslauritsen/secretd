@@ -10,6 +10,7 @@ use secret_proto::config::{Config, NameResolver};
 use secret_proto::store::{self, Entry};
 use secret_proto::{Request, Response};
 use secretd::audit::Audit;
+use secretd::channel::Channel;
 use secretd::core::Core;
 use secretd::notify::{Notification, Notifier, NotifyError};
 use secretd::peer::{PeerCred, PeerCredProvider, StaticPeerCred};
@@ -86,6 +87,8 @@ pub struct Opts {
     pub limits: String,
     pub timeout_secs: u64,
     pub notifier: Option<Arc<dyn Notifier>>,
+    /// Explicit channel set (replaces the default web+admin pair).
+    pub channels: Option<Vec<Arc<dyn Channel>>>,
     #[allow(clippy::type_complexity)]
     pub notifier_from_cfg: Option<Box<dyn FnOnce(&Config) -> Arc<dyn Notifier>>>,
     pub audit_writer: Option<Box<dyn std::io::Write + Send>>,
@@ -108,6 +111,7 @@ impl Default for Opts {
             limits: String::new(),
             timeout_secs: 30,
             notifier: None,
+            channels: None,
             notifier_from_cfg: None,
             audit_writer: None,
             peer: None,
@@ -264,7 +268,10 @@ impl Harness {
             (None, None) => notifier.clone(),
         };
         let p: Arc<dyn ProcReader> = o.procs.unwrap_or_else(|| procs.clone());
-        let core = Core::new(cfg.clone(), audit, n, p);
+        let core = match o.channels {
+            Some(ch) => Core::with_channels(cfg.clone(), audit, ch, p),
+            None => Core::new(cfg.clone(), audit, n, p),
+        };
 
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).unwrap();
