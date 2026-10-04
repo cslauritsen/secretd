@@ -2,6 +2,7 @@
 //! Shared integration-test harness: an in-process daemon core on a temp
 //! socket with injectable peer credentials, `/proc` reader and notifier.
 
+pub mod ha;
 pub mod mock;
 pub mod web;
 
@@ -89,6 +90,8 @@ pub struct Opts {
     pub notifier: Option<Arc<dyn Notifier>>,
     /// Explicit channel set (replaces the default web+admin pair).
     pub channels: Option<Vec<Arc<dyn Channel>>>,
+    /// Channels added to the default web+admin pair.
+    pub extra_channels: Vec<Arc<dyn Channel>>,
     #[allow(clippy::type_complexity)]
     pub notifier_from_cfg: Option<Box<dyn FnOnce(&Config) -> Arc<dyn Notifier>>>,
     pub audit_writer: Option<Box<dyn std::io::Write + Send>>,
@@ -112,6 +115,7 @@ impl Default for Opts {
             timeout_secs: 30,
             notifier: None,
             channels: None,
+            extra_channels: Vec::new(),
             notifier_from_cfg: None,
             audit_writer: None,
             peer: None,
@@ -270,7 +274,15 @@ impl Harness {
         let p: Arc<dyn ProcReader> = o.procs.unwrap_or_else(|| procs.clone());
         let core = match o.channels {
             Some(ch) => Core::with_channels(cfg.clone(), audit, ch, p),
-            None => Core::new(cfg.clone(), audit, n, p),
+            None if o.extra_channels.is_empty() => Core::new(cfg.clone(), audit, n, p),
+            None => {
+                let mut ch: Vec<Arc<dyn Channel>> = vec![
+                    Arc::new(secretd::channel::WebChannel::new(n)),
+                    Arc::new(secretd::channel::AdminChannel),
+                ];
+                ch.extend(o.extra_channels);
+                Core::with_channels(cfg.clone(), audit, ch, p)
+            }
         };
 
         let sock = dir.path().join("s.sock");

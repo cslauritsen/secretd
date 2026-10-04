@@ -177,7 +177,8 @@ enabled = ["web", "admin"]      # default; "homeassistant" is the third (see bel
 * `web`: push notification (ntfy/webhook) plus the Google-OIDC approval page. Needs `[notify]`,
   `[approval]` and `[approval.oidc]`.
 * `admin`: the root-only admin socket (`secretctl pending|approve|deny`). Pull based, announces nothing.
-* `homeassistant`: see the Home Assistant section.
+* `homeassistant`: see the Home Assistant section. With `web` off, no HTTP listener, `[notify]`,
+  `[approval]` or OIDC settings are needed.
 
 At least one must be enabled (`secretctl check-config` and the daemon refuse to start otherwise).
 A request may be resolved through any enabled channel; the first valid resolution wins and the
@@ -185,7 +186,97 @@ others are told the request is closed (web URL: 410, Home Assistant notification
 request fails with `INTERNAL` only if **every** enabled notification channel (`web`,
 `homeassistant`) failed to announce it; a single failing channel is audited (`notify_failed`
 with its `channel`) but not fatal. Every approval-related audit event carries a `channel` field.
-Which channels are enabled needs a restart to change (SIGHUP does not re-wire channels).
+Which channels are enabled (and their settings) needs a restart to change (SIGHUP does not re-wire channels).
+
+## Home Assistant channel
+
+Instead of (or besides) the web page, the owner can approve from a **Home Assistant** (HA)
+actionable notification: `secretd` sends it through your `notify.mobile_app_*` service, you type the
+store passphrase into an `input_text` helper in HA, and tap **Approve** (or **Deny**).
+
+```toml
+[channels]
+enabled = ["homeassistant", "admin"]          # no [notify]/[approval]/OIDC needed without "web"
+
+[homeassistant]
+url = "https://homeassistant.example.com:8123"
+token_file = "/etc/secretd/ha.token"          # long-lived access token, secretd:secretd 0400
+notify_service = "notify.mobile_app_owner_phone"
+passphrase_entity = "input_text.secretd_passphrase"
+owner_user_ids = ["0123456789abcdef0123456789abcdef"]   # HA user id(s) allowed to approve
+# allow_insecure_http = false                 # http:// to a non-loopback host needs this (warns)
+# ca_file = "/etc/secretd/ha-ca.pem"          # pin the CA/certificate for https
+# ha_require_user_id = true                   # see "Who may approve" below
+```
+
+`secretd` keeps one WebSocket connection to `/api/websocket` (token authenticated, reconnecting with
+exponential backoff from 1 s up to 60 s). While it is down the channel counts as failed for new
+requests (audited as `notify_failed`; the request fails only if no other channel announced it).
+The URL must be `https://` unless the host is loopback or `allow_insecure_http = true` (a LAN-only
+HA is common; this logs a warning: the token and the passphrase then cross the LAN unencrypted).
+
+**Flow.** The notification carries the same details as the other channels (secret, request id,
+caller uid/user, pid, exe, command line, the labelled client reason, expiry) and two actions,
+`SECRETD_APPROVE_<request id>_<token>` and `SECRETD_DENY_<request id>_<token>`; the 256-bit
+per-request token is only inside the action ids, never in the text. You type the passphrase into
+`passphrase_entity`, then tap Approve. `secretd` reads the entity **only** in response to a valid
+Approve for a pending request and clears it *immediately*, whatever happens next (wrong
+passphrase, store error, deny, timeout, client disconnect). An Approve with an empty entity
+re-prompts ("enter the passphrase first") and does not count as an attempt; a wrong passphrase
+re-sends the notification with the attempts left. Only one approval is processed at a time (the
+entity is shared); a second Approve meanwhile gets a "busy, try again" notification. At start-up
+(and on reconnect while nothing is pending) a non-empty entity is treated as stale and cleared
+(audited `ha_entity_cleared`). Passphrases longer than 255 characters cannot be entered this way
+(`input_text` maximum); `secretctl check-config` reminds you.
+
+**HA setup (required).** Create the helper and keep it out of the recorder, history and logbook:
+
+```yaml
+# configuration.yaml
+input_text:
+  secretd_passphrase:
+    name: secretd passphrase
+    mode: password        # masks the field in the UI
+    min: 0
+    max: 255
+    initial: ""           # do not restore an old value after a restart
+
+recorder:
+  exclude:
+    entities:
+      - input_text.secretd_passphrase    # keeps it out of the database and therefore history
+
+logbook:
+  exclude:
+    entities:
+      - input_text.secretd_passphrase
+
+# history: has no filter of its own in current Home Assistant (it reads the recorder
+# database); on older versions with `history: exclude:` add the entity there as well.
+```
+
+Also: put HA behind its own strong authentication/MFA, use HTTPS to HA, and give `secretd` a
+**dedicated, non-administrator HA user** for its long-lived token.
+
+> **Risk: the passphrase transits Home Assistant.** While you are typing it, it is the state of an
+> entity, and when you tap Approve it sits in the HA state machine, travels over the HA event bus
+> and WebSocket to `secretd`, and (unless excluded as above) can be written by the recorder, history
+> and logbook. Anyone with administrator access to HA (or to a process that can read its state
+> machine or WebSocket) can read it while it is set, and a compromised HA host can capture it. This
+> weakens the "your phone is the only place the passphrase exists" property of the web channel. Use
+> the web channel (or `secretctl approve` over SSH) if HA is not at least as trusted as the secrets.
+> `secretd` itself never logs, audits or stores the passphrase, the token or the HA access token.
+
+**Who may approve.** Home Assistant puts the id of the user who registered the phone in
+`context.user_id` of the `mobile_app_notification_action` event (verified in HA's source: the
+`mobile_app` webhook fires the event with `registration_context`, see `docs/DECISIONS.md`).
+`secretd` accepts an action only if that user id is in `owner_user_ids` **and** the action carries the
+right per-request token; everything else is ignored and audited as `ha_event_rejected` (with the user
+id if present, never the action id). To find your user id: Developer tools > Events > listen to
+`mobile_app_notification_action`, tap any notification action on the phone and read
+`context.user_id`. `ha_require_user_id = false` is an explicit opt-out for setups whose events carry
+no user id (then only the token protects against other HA users, and `secretd` warns at start-up).
+The app event name is `mobile_app_notification_action` for the Android and current iOS Companion apps.
 
 ## Audit log and limits
 

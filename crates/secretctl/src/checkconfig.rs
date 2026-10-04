@@ -32,6 +32,17 @@ pub fn run(cli: &Cli) -> Result<()> {
             secret_files.push(("notify.hmac_secret_file", p));
         }
     }
+    if let Some(h) = &cfg.homeassistant {
+        secret_files.push(("homeassistant.token_file", &h.token_file));
+        if let Some(ca) = &h.ca_file {
+            if !ca.is_file() {
+                errors.push(format!(
+                    "homeassistant.ca_file {} is not a file",
+                    ca.display()
+                ));
+            }
+        }
+    }
     let socket_gid = cfg.daemon.socket_group.as_deref().and_then(|g| {
         secret_proto::config::NameResolver::gid(&secret_proto::config::SystemResolver, g)
     });
@@ -103,6 +114,20 @@ pub fn run(cli: &Cli) -> Result<()> {
             ));
         }
     }
+    if let Some(h) = &cfg.homeassistant {
+        // Documented limit of the channel: the passphrase is typed into an
+        // `input_text` helper, whose maximum length is 255.
+        println!(
+            "NOTE: homeassistant: {} must be an input_text helper (mode: password, max: 255) \
+             excluded from recorder/history/logbook; store passphrases longer than 255 \
+             characters cannot be entered through Home Assistant",
+            h.passphrase_entity
+        );
+        println!(
+            "NOTE: homeassistant: the passphrase transits Home Assistant (entity state, event bus, \
+             WebSocket); anyone with HA admin access can read it while it is set. See the README"
+        );
+    }
     if cfg.secrets.is_empty() {
         warnings.push("no [[secret]] entries configured".into());
     }
@@ -120,6 +145,15 @@ pub fn run(cli: &Cli) -> Result<()> {
             cfg.secrets.len(),
             channels.join(", ")
         );
+        if let Some(h) = &cfg.homeassistant {
+            println!(
+                "OK: Home Assistant at {} (notify {}, entity {}, {} owner user id(s))",
+                h.url,
+                h.notify_service,
+                h.passphrase_entity,
+                h.owner_user_ids.len()
+            );
+        }
         if let Some(a) = &cfg.approval {
             println!(
                 "OK: web approval on {} (external {}), {} owner email(s)",

@@ -324,3 +324,68 @@ Choices the specification left open, recorded as simply as possible.
 - `Notification` gained `approval_token` (channels other than web build their action ids from it) and
   its `approval_url` is empty without the web channel. Its `Debug` output redacts both, so a stray
   `{:?}` cannot log a token.
+
+## Home Assistant channel (milestone 8)
+
+- **Does the Companion app event carry `context.user_id`?** Checked in Home Assistant core
+  (`homeassistant/components/mobile_app/webhook.py`, `dev` branch, October 2026): the app delivers
+  notification actions through the `fire_event` webhook command, which does
+  `hass.bus.async_fire(event_type, data, EventOrigin.remote, context=registration_context(config_entry.data))`,
+  and `registration_context()` in `helpers.py` is `Context(user_id=registration[CONF_USER_ID])`.
+  So `mobile_app_notification_action` events carry the id of the HA user who registered the device
+  (not the user currently logged in to the HA frontend, and not necessarily the person holding the
+  phone). It was verified by reading the source; it was **not** tested against a live Companion app
+  (none is available here). Caveats: a registration without a user id yields `user_id: null`; events
+  fired from automations/scripts inherit the context of whatever triggered them; and anyone who can
+  fire events as the owner's user (their long-lived token) is indistinguishable from the owner.
+  Hence the allowlist (`owner_user_ids`) is mandatory by default and `ha_require_user_id = false`
+  exists as the opt-out the spec asks for: with it, events *without* a user id are accepted
+  (events with a user id must still be in `owner_user_ids` when that list is non-empty), and the
+  daemon warns at start-up. Even then the per-request token (only inside the notification) must match.
+- Event name: only `mobile_app_notification_action` is subscribed (Android and current iOS
+  Companion). Legacy iOS builds that fire `ios.notification_action_fired` are not supported.
+- Library: `tokio-tungstenite` 0.30 with rustls (`ring`), no new async runtime. TLS roots: the
+  system store, or only `ca_file` when set (a pin: nothing else is trusted). `wss://` handshakes
+  use the `ring` provider explicitly, so the process-wide default provider is never needed.
+- Protocol: one connection; command ids are assigned by the connection task; every call has a
+  10 s timeout; an application-level `ping` every 30 s and a dead-connection cut-off after 75 s without
+  traffic. Reconnect delay doubles from `backoff_min_ms` (1000) to `backoff_max_ms` (60000) and
+  resets after a connection that authenticated; both are configurable only so the tests can use
+  small values. An `auth_invalid` reply is treated like any other connection failure (same backoff).
+- Reading the entity uses the WebSocket `get_states` command and picks the one entity out of the
+  answer (HA has no per-entity read command on the WebSocket API; REST would need a second
+  connection and client). It transfers all states of the HA instance for each Approve; the state
+  list is dropped immediately and only the entity value is kept in a zeroizing buffer. A
+  `render_template` subscription would be leaner but is event based and stays subscribed.
+  `unknown` and `unavailable` count as empty.
+- Clearing: `input_text.set_value` with `value: ""` right after the read (before the unseal, so
+  also on every failure path), 3 attempts 200 ms apart; if all fail, `ha_clear_failed` is audited and
+  the approval still proceeds ("the clear has been attempted"). The clear is skipped when the entity
+  was empty. When a request ends for any reason other than a release, its `closed` hook clears the
+  notification and the entity again (so a passphrase typed and never submitted does not linger).
+  Consequence: a timeout of request A can clear a passphrase the owner is typing for request B;
+  B's Approve then re-prompts. At connect (and on reconnect while no request announced on HA is
+  pending) the entity is read once and cleared if non-empty, audited as `ha_entity_cleared`
+  (outcome `stale`); this is an extra event beside the four in the spec.
+- Authorization order of an action event: prefix check (other apps' actions are ignored silently),
+  user id (`user_missing` / `user_not_allowed`), id/token syntax (`malformed_action`), request still
+  pending (`unknown_request`), constant-time token compare (`bad_token`). Each rejection is audited
+  as `ha_event_rejected` through the coalescer (one line per outcome and user per minute plus a
+  summary) with the user id in `detail` and the request id when it parsed, **never** the action id
+  or token. At most 16 action events are handled concurrently; extra ones are dropped (warning).
+- Busy: a channel-wide flag taken by the first Approve; a concurrent Approve is answered with a
+  "Busy, try again" notification and does not read the entity. A Deny of a request that is being
+  unsealed answers "approval in progress" (core refuses it as busy).
+- The notification is sent with `data.tag = <request id>`, `ttl: 0`, `priority: high`; re-prompts
+  (empty entity, wrong passphrase with attempts left, busy) reuse the tag and carry the two actions
+  again, because a notification replaced by a plain message would leave no Approve button. The token
+  is kept in memory in the channel to rebuild them.
+- Config: `homeassistant.url` must be http(s); plain http to a non-loopback host is an error without
+  `allow_insecure_http = true` (warning with). `notify_service` must look like `notify.<name>`,
+  `passphrase_entity` like `input_text.<name>`. `owner_user_ids` may be empty only with
+  `ha_require_user_id = false`.
+- The passphrase read from HA passes through the WebSocket message buffer and `serde_json::Value`
+  before it reaches the zeroizing buffer; like the HTTP form path, those transient copies are not
+  zeroized (see HARDENING known gaps). The same is true of the access token in the auth message.
+- Tests use `tests/common/ha.rs`, a mock HA WebSocket server (auth, subscription, `call_service`,
+  `get_states`, event injection, connection drops, rejected connections, failing services).

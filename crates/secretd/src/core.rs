@@ -662,6 +662,7 @@ impl Core {
                 .map(|a| format!("{}/approve/{id}?t={token}", a.external_url))
                 .unwrap_or_default(),
             approval_token: token.clone(),
+            via: None,
         });
 
         // Announce on every enabled notification channel at once.

@@ -22,6 +22,9 @@ pub struct Notification {
     /// The per-request approval token. Channels other than web use it to build
     /// their action ids. Never shown in message text.
     pub approval_token: String,
+    /// Set for requests that do not come from a socket client, e.g.
+    /// `via FIFO /run/secretd/pipes/db`. The caller identity is then best effort.
+    pub via: Option<String>,
 }
 
 impl std::fmt::Debug for Notification {

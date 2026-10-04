@@ -64,6 +64,7 @@ impl Web {
             timeout_secs: o.timeout_secs,
             notifier: o.notifier.take(),
             channels: o.channels.take(),
+            extra_channels: std::mem::take(&mut o.extra_channels),
             notifier_from_cfg: Some(Box::new(|cfg: &Config| {
                 Arc::new(HttpNotifier::new(cfg.notify.as_ref().unwrap()).unwrap())
                     as Arc<dyn Notifier>
@@ -280,6 +281,7 @@ pub fn notification_from_click(click: &str) -> secretd::notify::Notification {
         expires_at: String::new(),
         approval_url: click.to_string(),
         approval_token: String::new(),
+        via: None,
     }
 }
 

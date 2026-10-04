@@ -260,6 +260,60 @@ fn check_config_validates_channels() {
     assert!(String::from_utf8_lossy(&o.stdout).contains("channels: web, admin"));
 }
 
+#[test]
+fn check_config_home_assistant() {
+    let e = Env::new();
+    let base = std::fs::read_to_string(e.path("config.toml")).unwrap();
+    let ha = |token_file: &str, extra: &str| {
+        format!(
+            "{base}\n[channels]\nenabled = [\"web\", \"homeassistant\"]\n[homeassistant]\n\
+             url = \"https://ha.example.com\"\ntoken_file = \"{token_file}\"\n\
+             notify_service = \"notify.mobile_app_phone\"\n\
+             passphrase_entity = \"input_text.secretd_passphrase\"\n\
+             owner_user_ids = [\"abc\"]\n{extra}\n"
+        )
+    };
+    // Missing token file: an error.
+    let missing = e.path("ha.token").display().to_string();
+    std::fs::write(e.path("config.toml"), ha(&missing, "")).unwrap();
+    let o = e.run(&["check-config"], None);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("homeassistant.token_file"));
+    // With the token file: OK, plus the documented limits.
+    std::fs::write(e.path("ha.token"), "tok\n").unwrap();
+    std::fs::set_permissions(e.path("ha.token"), std::fs::Permissions::from_mode(0o400)).unwrap();
+    let o = e.run(&["check-config"], None);
+    ok(&o);
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(out.contains("channels: web, homeassistant"), "{out}");
+    assert!(
+        out.contains("255"),
+        "passphrase length limit is documented: {out}"
+    );
+    assert!(out.contains("transits Home Assistant"), "{out}");
+    // Plain http to a LAN host is refused by the validator.
+    let cfg = ha(&e.path("ha.token").display().to_string(), "")
+        .replace("https://ha.example.com", "http://homeassistant.local:8123");
+    std::fs::write(e.path("config.toml"), cfg).unwrap();
+    let o = e.run(&["check-config"], None);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("allow_insecure_http"));
+    // Web off: no [notify]/[approval] needed at all.
+    let only = format!(
+        "[daemon]\nstore = \"{d}/store.age\"\nsocket = \"{d}/s.sock\"\n\
+         admin_socket = \"{d}/a.sock\"\naudit_log = \"{d}/audit.jsonl\"\n\
+         [channels]\nenabled = [\"homeassistant\"]\n[homeassistant]\n\
+         url = \"https://ha.example.com\"\ntoken_file = \"{d}/ha.token\"\n\
+         notify_service = \"notify.mobile_app_phone\"\n\
+         passphrase_entity = \"input_text.secretd_passphrase\"\nowner_user_ids = [\"abc\"]\n",
+        d = e.dir.path().display()
+    );
+    std::fs::write(e.path("config.toml"), only).unwrap();
+    let o = e.run(&["check-config"], None);
+    ok(&o);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("Home Assistant at https://ha.example.com"));
+}
+
 // ------------------------------------------------------------ admin socket
 
 mod admin {

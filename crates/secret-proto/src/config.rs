@@ -26,6 +26,7 @@ struct RawConfig {
     channels: Option<RawChannels>,
     notify: Option<NotifyCfg>,
     approval: Option<RawApproval>,
+    homeassistant: Option<RawHa>,
     #[serde(default, rename = "secret")]
     secrets: Vec<RawSecret>,
 }
@@ -128,6 +129,36 @@ struct RawOidc {
     owner_emails: Vec<String>,
     #[serde(default = "default_session_ttl")]
     session_ttl_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHa {
+    url: String,
+    token_file: PathBuf,
+    notify_service: String,
+    passphrase_entity: String,
+    #[serde(default)]
+    owner_user_ids: Vec<String>,
+    #[serde(default)]
+    allow_insecure_http: bool,
+    ca_file: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    ha_require_user_id: bool,
+    #[serde(default = "default_ha_backoff_min")]
+    backoff_min_ms: u64,
+    #[serde(default = "default_ha_backoff_max")]
+    backoff_max_ms: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_ha_backoff_min() -> u64 {
+    1000
+}
+fn default_ha_backoff_max() -> u64 {
+    60_000
 }
 
 fn default_listen() -> String {
@@ -358,6 +389,32 @@ pub struct ApprovalCfg {
     pub oidc: OidcCfg,
 }
 
+/// Home Assistant channel settings (spec section 19.2).
+#[derive(Debug, Clone)]
+pub struct HaCfg {
+    /// Base URL as configured, without a trailing slash.
+    pub url: String,
+    /// `ws://` or `wss://` URL of the WebSocket API (`<url>/api/websocket`).
+    pub ws_url: String,
+    /// File with the long-lived access token (never inline).
+    pub token_file: PathBuf,
+    /// `notify.<service>` that reaches the owner's phone.
+    pub notify_service: String,
+    /// `input_text.<name>`: where the owner types the store passphrase.
+    pub passphrase_entity: String,
+    /// HA user ids whose notification actions are accepted.
+    pub owner_user_ids: Vec<String>,
+    pub allow_insecure_http: bool,
+    /// Optional CA certificate (PEM) that pins the trust anchor for `https`.
+    pub ca_file: Option<PathBuf>,
+    /// Require `context.user_id` on action events (default). `false` is the
+    /// documented opt-out (`ha_require_user_id = false`).
+    pub require_user_id: bool,
+    /// Reconnect backoff bounds in milliseconds (default 1 s up to 60 s).
+    pub backoff_min_ms: u64,
+    pub backoff_max_ms: u64,
+}
+
 /// A secret's name, description and resolved ACL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretAcl {
@@ -378,6 +435,8 @@ pub struct Config {
     pub notify: Option<NotifyCfg>,
     /// Approval endpoint and OIDC settings; present exactly when `web` is enabled.
     pub approval: Option<ApprovalCfg>,
+    /// Home Assistant settings; present exactly when `homeassistant` is enabled.
+    pub homeassistant: Option<HaCfg>,
     pub secrets: Vec<SecretAcl>,
     /// Non-fatal findings from validation.
     pub warnings: Vec<String>,
@@ -486,6 +545,23 @@ impl Config {
             );
         }
 
+        let ha_on = channels.has(ChannelKind::HomeAssistant);
+        if ha_on && raw.homeassistant.is_none() {
+            return err(
+                "channel \"homeassistant\" is enabled but [homeassistant] is not configured",
+            );
+        }
+        if !ha_on && raw.homeassistant.is_some() {
+            warnings.push(
+                "[homeassistant] is configured but the \"homeassistant\" channel is not enabled; \
+                 it is ignored"
+                    .into(),
+            );
+        }
+        let homeassistant = match (ha_on, &raw.homeassistant) {
+            (true, Some(h)) => Some(parse_ha(h, &mut warnings)?),
+            _ => None,
+        };
         let (notify, approval) = match (web, &raw.notify, &raw.approval) {
             (true, Some(n), Some(a)) => (Some(n.clone()), Some(parse_web(n, a, &mut warnings)?)),
             _ => (None, None),
@@ -577,6 +653,7 @@ impl Config {
             daemon: raw.daemon,
             limits: raw.limits,
             channels,
+            homeassistant,
             notify,
             approval,
             secrets,
@@ -743,6 +820,110 @@ fn parse_web(
         header_read_timeout_secs: a.header_read_timeout_secs,
         request_timeout_secs: a.request_timeout_secs,
         oidc,
+    })
+}
+
+/// Validate `[homeassistant]` (spec section 19.2, 19.4).
+fn parse_ha(h: &RawHa, warnings: &mut Vec<String>) -> Result<HaCfg, ConfigError> {
+    let u = url::Url::parse(&h.url)
+        .map_err(|_| ConfigError("homeassistant.url is not a valid URL".into()))?;
+    let secure = match u.scheme() {
+        "https" => true,
+        "http" => false,
+        _ => return err("homeassistant.url must be an http:// or https:// URL"),
+    };
+    if u.host_str().is_none() {
+        return err("homeassistant.url has no host");
+    }
+    if u.query().is_some() || u.fragment().is_some() {
+        return err("homeassistant.url must not contain a query or fragment");
+    }
+    if !secure {
+        // The long-lived token (and the passphrase) travel over this connection.
+        let loopback = match u.host() {
+            Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        };
+        if !loopback {
+            if !h.allow_insecure_http {
+                return err(
+                    "homeassistant.url is plain http to a non-loopback host: the access token \
+                     and the passphrase would cross the network unencrypted. Use https:// or set \
+                     homeassistant.allow_insecure_http = true",
+                );
+            }
+            warnings.push(
+                "homeassistant.url uses plain http (allow_insecure_http = true): the access token \
+                 and the store passphrase travel unencrypted; acceptable only on a trusted LAN"
+                    .into(),
+            );
+        }
+        if h.ca_file.is_some() {
+            warnings.push("homeassistant.ca_file is ignored for an http:// url".into());
+        }
+    }
+    let service_ok = |s: &str, domain: &str| {
+        s.strip_prefix(domain)
+            .and_then(|r| r.strip_prefix('.'))
+            .is_some_and(|n| {
+                !n.is_empty()
+                    && n.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+    };
+    if !service_ok(&h.notify_service, "notify") {
+        return err("homeassistant.notify_service must look like notify.mobile_app_<device>");
+    }
+    if !service_ok(&h.passphrase_entity, "input_text") {
+        return err("homeassistant.passphrase_entity must look like input_text.<name>");
+    }
+    if h.owner_user_ids
+        .iter()
+        .any(|i| i.trim().is_empty() || i.chars().any(char::is_whitespace))
+    {
+        return err("homeassistant.owner_user_ids entries must be non-empty ids without spaces");
+    }
+    if h.owner_user_ids.is_empty() && h.ha_require_user_id {
+        return err(
+            "homeassistant.owner_user_ids is empty: list the HA user id(s) allowed to approve",
+        );
+    }
+    if !h.ha_require_user_id {
+        warnings.push(
+            "homeassistant.ha_require_user_id = false: action events without a user id are \
+             accepted; only the per-request token protects approvals from other HA users"
+                .into(),
+        );
+        if h.owner_user_ids.is_empty() {
+            warnings.push(
+                "homeassistant.owner_user_ids is empty: any event carrying the token is accepted"
+                    .into(),
+            );
+        }
+    }
+    if h.backoff_min_ms == 0 || h.backoff_max_ms < h.backoff_min_ms {
+        return err("homeassistant.backoff_min_ms must be > 0 and <= backoff_max_ms");
+    }
+    let base = h.url.trim_end_matches('/').to_string();
+    let ws_url = format!(
+        "{}{}/api/websocket",
+        if secure { "wss" } else { "ws" },
+        &base[base.find("://").unwrap_or(0)..]
+    );
+    Ok(HaCfg {
+        url: base,
+        ws_url,
+        token_file: h.token_file.clone(),
+        notify_service: h.notify_service.clone(),
+        passphrase_entity: h.passphrase_entity.clone(),
+        owner_user_ids: h.owner_user_ids.clone(),
+        allow_insecure_http: h.allow_insecure_http,
+        ca_file: h.ca_file.clone(),
+        require_user_id: h.ha_require_user_id,
+        backoff_min_ms: h.backoff_min_ms,
+        backoff_max_ms: h.backoff_max_ms,
     })
 }
 
@@ -1019,6 +1200,103 @@ owner_emails = ["Owner@Example.com"]
         let c = Config::parse("[channels]\nenabled = [\"admin\"]\n", &R).unwrap();
         assert_eq!(c.channels.enabled, vec![ChannelKind::Admin]);
         assert_eq!(ChannelKind::HomeAssistant.as_str(), "homeassistant");
+    }
+
+    #[test]
+    fn homeassistant_rules() {
+        let ha = |extra: &str| {
+            Config::parse(
+                &format!(
+                    "{BASE}\n[channels]\nenabled = [\"homeassistant\"]\n[homeassistant]\n\
+                     token_file = \"/etc/secretd/ha.token\"\n\
+                     notify_service = \"notify.mobile_app_owner_phone\"\n\
+                     passphrase_entity = \"input_text.secretd_passphrase\"\n\
+                     owner_user_ids = [\"abc123\"]\n{extra}\n"
+                ),
+                &R,
+            )
+        };
+        let url = |u: &str, extra: &str| ha(&format!("url = \"{u}\"\n{extra}"));
+        // https is fine; the WebSocket URL is derived.
+        let c = url("https://ha.example.com:8123/", "").unwrap();
+        let h = c.homeassistant.unwrap();
+        assert_eq!(h.ws_url, "wss://ha.example.com:8123/api/websocket");
+        assert!(
+            c.approval.is_none() && c.notify.is_none(),
+            "HA-only needs no web"
+        );
+        // Plain http: refused off-loopback unless opted in (then a warning).
+        let e = url("http://homeassistant.local:8123", "").unwrap_err();
+        assert!(e.0.contains("allow_insecure_http"), "{e}");
+        let c = url(
+            "http://homeassistant.local:8123",
+            "allow_insecure_http = true",
+        )
+        .unwrap();
+        assert!(c.warnings.iter().any(|w| w.contains("unencrypted")));
+        assert_eq!(
+            c.homeassistant.unwrap().ws_url,
+            "ws://homeassistant.local:8123/api/websocket"
+        );
+        // Loopback http needs no opt-in and no warning.
+        for l in [
+            "http://127.0.0.1:8123",
+            "http://localhost:8123",
+            "http://[::1]:8123",
+        ] {
+            let c = url(l, "").unwrap();
+            assert!(!c.warnings.iter().any(|w| w.contains("unencrypted")), "{l}");
+        }
+        assert!(url("http://127.0.0.1.evil.example", "").is_err());
+        assert!(url("ftp://ha", "").is_err());
+        // Shape of the service and entity names.
+        let bad = |k: &str, v: &str| {
+            Config::parse(
+                &format!(
+                    "{BASE}\n[channels]\nenabled = [\"homeassistant\"]\n[homeassistant]\n\
+                     url = \"https://ha\"\ntoken_file = \"/t\"\nowner_user_ids = [\"a\"]\n\
+                     notify_service = \"{}\"\npassphrase_entity = \"{}\"\n",
+                    if k == "svc" { v } else { "notify.mobile_app_x" },
+                    if k == "ent" { v } else { "input_text.p" }
+                ),
+                &R,
+            )
+        };
+        assert!(bad("svc", "light.turn_on").is_err());
+        assert!(bad("ent", "sensor.x").is_err());
+        assert!(bad("ent", "input_text.p").is_ok());
+        // owner_user_ids is mandatory unless the user-id requirement is opted out.
+        let no_ids = |extra: &str| {
+            Config::parse(
+                &format!(
+                    "{BASE}\n[channels]\nenabled = [\"homeassistant\"]\n[homeassistant]\n\
+                     url = \"https://ha\"\ntoken_file = \"/t\"\n\
+                     notify_service = \"notify.mobile_app_x\"\n\
+                     passphrase_entity = \"input_text.p\"\n{extra}\n"
+                ),
+                &R,
+            )
+        };
+        assert!(no_ids("").is_err());
+        let c = no_ids("ha_require_user_id = false").unwrap();
+        assert!(c.warnings.iter().any(|w| w.contains("ha_require_user_id")));
+        assert!(!c.homeassistant.unwrap().require_user_id);
+        // Enabled without the table, and the table without the channel.
+        assert!(Config::parse(
+            &format!("{BASE}\n[channels]\nenabled = [\"homeassistant\"]\n"),
+            &R
+        )
+        .is_err());
+        let c = Config::parse(
+            &format!(
+                "{BASE}\n[homeassistant]\nurl = \"https://ha\"\ntoken_file = \"/t\"\n\
+                 notify_service = \"notify.x\"\npassphrase_entity = \"input_text.p\"\n"
+            ),
+            &R,
+        )
+        .unwrap();
+        assert!(c.homeassistant.is_none());
+        assert!(c.warnings.iter().any(|w| w.contains("homeassistant")));
     }
 
     #[test]

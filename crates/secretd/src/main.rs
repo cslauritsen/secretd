@@ -4,6 +4,7 @@ use secret_proto::config::{ChannelKind, Config, SystemResolver};
 use secretd::audit::Audit;
 use secretd::channel::{AdminChannel, Channel, WebChannel};
 use secretd::core::Core;
+use secretd::homeassistant::HaChannel;
 use secretd::notify_http::HttpNotifier;
 use secretd::oidc::OidcClient;
 use secretd::peer::RealPeerCred;
@@ -140,10 +141,26 @@ async fn run() -> Result<()> {
         channels.push(Arc::new(WebChannel::new(Arc::new(notifier))));
         web_parts = Some((approval_cfg.clone(), oidc));
     }
+    let mut ha_channel = None;
+    if let (true, Some(ha_cfg)) = (
+        cfg.channels.has(ChannelKind::HomeAssistant),
+        &cfg.homeassistant,
+    ) {
+        let token = secret_proto::config::read_secret_file(&ha_cfg.token_file)
+            .map_err(|e| anyhow!("{e}"))?;
+        let ha = HaChannel::new(ha_cfg, token).context("setting up the Home Assistant channel")?;
+        channels.push(ha.clone());
+        ha_channel = Some(ha);
+    }
     if want_admin {
         channels.push(Arc::new(AdminChannel));
     }
     let core = Core::with_channels(cfg, audit, channels, Arc::new(RealProcReader));
+    if let Some(ha) = ha_channel {
+        // Connects (and reconnects with backoff); until it is up, the channel
+        // counts as failed for new requests.
+        tokio::spawn(ha.run(core.clone()));
+    }
 
     if let Some((approval_cfg, oidc)) = web_parts {
         let http_listener = tokio::net::TcpListener::bind(approval_cfg.listen)

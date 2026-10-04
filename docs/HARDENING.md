@@ -100,6 +100,25 @@ passphrase and plaintext buffers, `zeroize` on every secret-bearing buffer, decr
 blocking thread, root dropped after binding sockets (or never held under socket activation),
 systemd sandboxing as shipped.
 
+## Home Assistant channel
+
+| Threat | Control |
+|---|---|
+| Passphrase lingers in HA | entity read only on a valid Approve (and once at connect), cleared immediately after the read on every path, cleared again when a request ends without a release, stale value cleared at start-up; `ha_clear_failed` audited after 3 failed attempts |
+| Forged action events on the HA bus | `context.user_id` must be in `owner_user_ids`, request must be pending, per-request token compared in constant time; rejections audited (`ha_event_rejected`, coalesced) without the action id |
+| Token or passphrase in notification text/logs/audit | text carries neither (token only inside action ids); `Notification` redacts url/token in `Debug`; tests assert audit and daemon log never contain the passphrase, the HA token or the action token |
+| HA token on the wire | `https://` required (loopback or `allow_insecure_http = true` excepted, with a warning); optional `ca_file` pin |
+| Flood of events | at most 16 action events handled at once, rejections coalesced in the audit log, one approval at a time |
+
+Residual risks, also in the README: the passphrase **does transit Home Assistant** (entity state,
+event bus, WebSocket, possibly recorder/history/logbook if not excluded) and is readable by HA
+administrators while it is set; a compromised HA host or long-lived token holder acting as the owner
+user can approve (still needing the per-request token, which only the notification contains).
+`get_states` is used to read the entity, so each Approve pulls the full state list of HA into
+`secretd`'s memory (dropped at once). Passphrases over 255 characters are not supported on this channel.
+Transient copies of the passphrase and of the access token in WebSocket/JSON buffers are not
+zeroized (same class as the HTTP form path).
+
 ## Known gaps
 
 * **Transient copies (not fixed).** The passphrase passes through the HTTP stack (request body, form

@@ -54,6 +54,11 @@ pub fn default_outcome(event: &str) -> &'static str {
         "caller_changed" => "denied",
         "aborted" => "aborted",
         "admin_action" => "ok",
+        "ha_connected" => "connected",
+        "ha_disconnected" => "disconnected",
+        "ha_event_rejected" => "rejected",
+        "ha_clear_failed" => "failed",
+        "ha_entity_cleared" => "cleared",
         _ => "ok",
     }
 }
@@ -182,6 +187,11 @@ mod tests {
             "caller_changed",
             "aborted",
             "admin_action",
+            "ha_connected",
+            "ha_disconnected",
+            "ha_event_rejected",
+            "ha_clear_failed",
+            "ha_entity_cleared",
         ] {
             let e = AuditEvent::new(ev);
             assert!(
