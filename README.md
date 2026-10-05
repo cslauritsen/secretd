@@ -280,8 +280,25 @@ logbook:
 # database); on older versions with `history: exclude:` add the entity there as well.
 ```
 
-Also: put HA behind its own strong authentication/MFA, use HTTPS to HA, and give `secretd` a
-**dedicated, non-administrator HA user** for its long-lived token.
+Also: put HA behind its own strong authentication/MFA and use HTTPS to HA.
+
+**The HA user must be an administrator.** Home Assistant only lets non-administrators subscribe to
+a short allowlist of event types (`SUBSCRIBE_ALLOWLIST` in `homeassistant/auth/permissions/events.py`,
+enforced in `websocket_api/commands.py`); `mobile_app_notification_action` is not on it, so a
+non-admin token is refused (`secretd` logs "event subscription refused" and never connects). Earlier
+versions of this README advised a non-administrator user; that was wrong (checked against the HA core
+source, `dev` branch, October 2026; not tested against a running instance). Use a **dedicated** admin
+user for `secretd` anyway, so the token can be revoked on its own, and treat the token as
+administrator-grade: keep `ha.token` mode 0400 and readable by the daemon only.
+
+> **Residual risk: the per-request approval token is visible to HA administrators.** The Approve and
+> Deny action ids carry the per-request token, and the `notify` service call that sends them is an
+> ordinary `call_service` event on the HA bus (and may appear in the logbook or debug logs). Anyone
+> with HA administrator access can therefore see the token of a pending request, and together with an
+> allowed `context.user_id` (which an administrator can forge by firing events with the owner's
+> token) could tap Approve on the owner's behalf; they still need the passphrase, which they can also
+> read from the entity while it is set (see above). HA administrator access is thus equivalent to
+> being the owner for this channel.
 
 > **Risk: the passphrase transits Home Assistant.** While you are typing it, it is the state of an
 > entity, and when you tap Approve it sits in the HA state machine, travels over the HA event bus
@@ -291,6 +308,27 @@ Also: put HA behind its own strong authentication/MFA, use HTTPS to HA, and give
 > weakens the "your phone is the only place the passphrase exists" property of the web channel. Use
 > the web channel (or `secretctl approve` over SSH) if HA is not at least as trusted as the secrets.
 > `secretd` itself never logs, audits or stores the passphrase, the token or the HA access token.
+
+**What is guaranteed about the passphrase entity.** `secretd` clears the entity right after reading
+it (also after a failed read, since the passphrase may still be there), and when the last request
+announced to HA closes for any reason (deny, timeout, client gone, or a release through the web page
+or the admin socket). While another request is still pending the entity is left alone, because you may
+be typing for that one (the Approve of the other request then asks for the passphrase again if it was
+wiped by an earlier one; this cannot be triggered by another local client any more). A clear that fails
+is retried, audited (`ha_clear_failed`) and *owed*: it is attempted again at the next request, and at
+the next (re)connect, even if requests are pending. The guarantee is therefore "cleared as soon as HA
+is reachable and answers", not "never present": a passphrase typed and not submitted stays in the
+entity while HA is down or refuses the call, and for as long as a request is pending. Outcomes that use
+up a typed passphrase without releasing anything (busy, request gone, client aborted, caller changed,
+too many wrong passphrases) are explained to you in a separate notification.
+
+**Reload and token errors.** `SIGHUP` applies a changed `owner_user_ids` / `ha_require_user_id` at once
+(revoking a user id does not wait for a restart); any other change to `[homeassistant]`, `[notify]`,
+`[approval]`, the channel list or the socket paths is **not** applied and is named in a warning in the
+log, so restart `secretd` for those. If HA rejects the access token (`auth_invalid`), `secretd` retries
+only every 5 minutes (doubling to 30) and audits `ha_auth_invalid` once, so a wrong token cannot get
+your address banned by HA's `ip_ban`; fix `token_file` and restart. `ha_connected`/`ha_disconnected`
+lines are coalesced when the link flaps.
 
 **Who may approve.** Home Assistant puts the id of the user who registered the phone in
 `context.user_id` of the `mobile_app_notification_action` event (verified in HA's source: the
@@ -331,19 +369,23 @@ cannot work.) The pipe is created at start-up in a directory owned by the daemon
 else can write to (`/run/secretd/pipes`, created by the packaged `tmpfiles.d`; the unit has
 `ReadWritePaths` for it), with owner/group/mode set explicitly (the umask plays no role), and removed
 on clean shutdown. An existing path must be a FIFO owned by the daemon user (a leftover is replaced);
-a symlink or any other file makes `secretd` refuse to start. Reload (`SIGHUP`) re-arms the pipes if
-their configuration changed.
+a symlink or any other file makes `secretd` refuse to start. A missing pipe directory (and parents)
+is created with mode 0755 whatever the umask (the unit's `UMask=0077` does not make it 0700). Reload (`SIGHUP`) re-arms the pipes if
+their configuration changed (a reader blocked in `open` while the pipe is being removed is released
+with EOF, not left hanging).
 
 What the owner sees: the notification and approval page say `via FIFO <path>` and show the reader's
 pid, uid, executable and command line, found by scanning `/proc/*/fd` for processes that hold the pipe
-open for reading, marked **best effort** (a process can be missed by a race or because the daemon may
+open for reading (descriptors that are write-only or `O_PATH` do not count; on macOS only descriptors
+opened with read access), marked **best effort** (a process can be missed by a race or because the daemon may
 not look into it). Rules: if more than one distinct process has the pipe open for reading, the request
 is denied (`fifo_ambiguous`); with `enforce_acl = true` the single identified reader must pass the
 secret's ACL, and an unidentifiable reader is denied (`fifo_reader_unknown`); just before writing, the
-reader set is checked again and a different process (or none) aborts the release with
+reader set is checked again and a different process, a different uid/gid, or none aborts the release with
 `caller_changed` and writes nothing. A deny, a timeout or a reader that left gives EOF without data.
 After every request the pipe stays closed for `cooldown_secs` (at least 250 ms) and at most
-`attempts_per_min` readers per minute are considered, so a program that retries in a loop cannot
+`attempts_per_min` readers per minute that reach you are counted (openers refused as ambiguous, unknown
+or failing the ACL are not counted, only paced by the cool-down), so a program that retries in a loop cannot
 flood you.
 
 **Readers must tolerate blocking:** their `open` or `read` waits for the owner's approval, up to

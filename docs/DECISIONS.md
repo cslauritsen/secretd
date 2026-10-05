@@ -351,7 +351,11 @@ Choices the specification left open, recorded as simply as possible.
   10 s timeout; an application-level `ping` every 30 s and a dead-connection cut-off after 75 s without
   traffic. Reconnect delay doubles from `backoff_min_ms` (1000) to `backoff_max_ms` (60000) and
   resets after a connection that authenticated; both are configurable only so the tests can use
-  small values. An `auth_invalid` reply is treated like any other connection failure (same backoff).
+  small values. An `auth_invalid` reply is *not* retried with that backoff: HA bans an address after repeated
+  failed logins (`ip_ban_enabled`), so the retry delay is 5 minutes, doubling to 30, and
+  `ha_auth_invalid` is audited once per episode (a later successful login re-arms it). Fixing the
+  token needs a restart (the token file is read once). Every command queued to the connection has a
+  10 s timeout, as has every write to the socket, so a stalled peer cannot wedge callers.
 - Reading the entity uses the WebSocket `get_states` command and picks the one entity out of the
   answer (HA has no per-entity read command on the WebSocket API; REST would need a second
   connection and client). It transfers all states of the HA instance for each Approve; the state
@@ -361,12 +365,42 @@ Choices the specification left open, recorded as simply as possible.
 - Clearing: `input_text.set_value` with `value: ""` right after the read (before the unseal, so
   also on every failure path), 3 attempts 200 ms apart; if all fail, `ha_clear_failed` is audited and
   the approval still proceeds ("the clear has been attempted"). The clear is skipped when the entity
-  was empty. When a request ends for any reason other than a release, its `closed` hook clears the
-  notification and the entity again (so a passphrase typed and never submitted does not linger).
-  Consequence: a timeout of request A can clear a passphrase the owner is typing for request B;
-  B's Approve then re-prompts. At connect (and on reconnect while no request announced on HA is
-  pending) the entity is read once and cleared if non-empty, audited as `ha_entity_cleared`
-  (outcome `stale`); this is an extra event beside the four in the spec.
+  was empty. A read that *fails* (timeout, reset, HA error, over-size answer, missing entity) also
+  triggers a clear, because the passphrase may still be there; the owner is told to retype.
+  Review fix (security review of the channel): the entity is channel-wide state, so `EntityState`
+  tracks whether it *may hold a typed passphrase* (`dirty`: an actionable prompt went out and no clear
+  succeeded since; a clear that raced with a new prompt leaves it set) and whether a clear is *owed*
+  (the last attempt failed or HA was unreachable). When a request closes, its notification is cleared
+  and, only if no other request announced on HA is still pending (the owner may be typing for it),
+  the entity is cleared if `dirty` or owed, whatever the reason, including a release through web/admin
+  that never read it. The previous rule (clear on every non-release close) let any local client wipe
+  another request's passphrase just by cancelling its own. A failed clear is retried 3 times,
+  audited (`ha_clear_failed`) and stays owed: retried before the next announcement and at every
+  (re)connect, there even with requests pending (that passphrase was already used or is dead).
+  Notification clears that fail (disconnected) are remembered per tag and redone at reconnect. At
+  connect (with nothing owed and no request pending) the entity is read once and cleared if non-empty,
+  audited as `ha_entity_cleared` (outcome `stale`, or `owed`); this is an extra event beside the four
+  in the spec. The guarantee is "cleared as soon as HA is reachable", not "never present".
+- Outcome follow-ups: busy, gone, aborted, caller changed, not-in-store, internal and final-wrong
+  results send a separate action-less notification (tag `secretd-result-<id>`, so the request's own
+  clear does not remove it). The approval gate is released as soon as `Core::approve` returns (before
+  any follow-up is sent): the passphrase is already gone, and holding it made an Approve tapped right
+  after a wrong passphrase answer "busy" (the flaky `three_wrong_passphrases_deny_and_clear`).
+- Reload: `HaChannel::apply_config` swaps the allowlist (`owner_user_ids`, `ha_require_user_id`)
+  under a lock on SIGHUP, and a removed section rejects everyone; `reload::restart_required` names
+  other changed sections (logged as warnings). The audit lines `ha_connected` / `ha_disconnected` go
+  through the coalescer (first per minute in full, then a count) so a flapping link cannot flood the
+  log.
+- `get_states` is kept for the read. `render_template` was considered (narrower), but it is a
+  subscription (needs event frames and `unsubscribe_events`), HA coerces its result to native types
+  (a passphrase like `123` or `1e5` would come back as a number), and it cannot be verified here
+  against a real HA.
+- **The HA user must be an administrator.** Checked in HA core (`websocket_api/commands.py`,
+  `auth/permissions/events.py`, `dev` branch, October 2026): `subscribe_events` for an event type
+  outside `SUBSCRIBE_ALLOWLIST` raises `Unauthorized` for non-admins and `mobile_app_notification_action`
+  is not in the list. The README's earlier "dedicated non-administrator user" advice was wrong; it now
+  says a dedicated *admin* user. Not tested against a live HA. Residual risk recorded: the per-request
+  token travels in the `notify` `call_service` event, readable by HA admins.
 - Authorization order of an action event: prefix check (other apps' actions are ignored silently),
   user id (`user_missing` / `user_not_allowed`), id/token syntax (`malformed_action`), request still
   pending (`unknown_request`), constant-time token compare (`bad_token`). Each rejection is audited
@@ -524,3 +558,31 @@ Choices the specification left open, recorded as simply as possible.
   triples, `clippy -D warnings` for aarch64) with a stub C compiler for `ring`'s build script, which is enough for
   type-checking but produces no binary. Nothing was executed on macOS here; the macOS CI job is the first
   real run.
+
+## Security review fixes (HA channel and FIFOs)
+
+- **In-flight announces.** `request_approval` no longer drops its `JoinSet` when the request
+  resolves. Announcements still running continue in a detached task for up to 15 s (`Core::set_announce_grace`
+  test hook); their `notified` / `notify_failed` lines are written with a "finished after the request was
+  closed" detail (timeout: `notify_failed`, outcome `timeout`), and a channel's `closed` hook runs only
+  after its own announce ended (finished or abandoned), so it can remove what it just sent. The
+  once-per-channel `closed` contract is unchanged.
+- `acl_denied` / `acl_changed` now carries `channel` and `source_ip` of the approver.
+- **FIFO scanner.** Linux: `O_PATH` descriptors (access mode bits read as read-only) are not readers
+  (`flags_mean_reader`), nor are write-only ones; the scanner's own pid is excluded. macOS counts only
+  descriptors with `FREAD`; there is no `O_PATH` (the analogue `O_EVTONLY` could not be exercised and is
+  not special-cased; XNU behaviour is unverified). The scanner tests are cross-platform except the
+  `O_PATH` one (Linux-only); the macOS side is compile-checked only.
+- Release-time verification also compares uid and gid of the reader. Only readers that reach the
+  owner count towards `attempts_per_min` (refused openers are paced by the cool-down and audited
+  coalesced). Directories created for a pipe (and missing parents) get an explicit 0755 via `fchmod`
+  (the unit's `UMask=0077` would give 0700; on macOS the documented `install -d -m 0711` directory is
+  unaffected, and a daemon-created one gets the same 0755).
+- Pipe removal: before unlinking (shutdown or a reload that drops/changes a `[[fifo]]`), readers blocked
+  in `open(O_RDONLY)` (typically during the cool-down, when the pipe is not probed) are released by
+  opening and closing the write end, so they get EOF instead of hanging forever.
+  `FifoHandle::shutdown_within(grace)` exists so the "busy task, pipe still removed" path is testable.
+- Not done: a test for a stalled HA socket (write timeout) needs a stalled TCP window; compile-verified
+  only. Surviving-mutation notes: the MAX_HANDLERS cap and the release-time `POLLERR` check now have
+  tests; the `shutdown` removal loop is only reachable when a task outlives the grace period and is
+  covered by `shutdown_removes_the_pipe_even_if_a_task_is_still_busy`.

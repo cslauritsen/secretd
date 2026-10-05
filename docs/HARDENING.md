@@ -104,7 +104,10 @@ systemd sandboxing as shipped.
 
 | Threat | Control |
 |---|---|
-| Passphrase lingers in HA | entity read only on a valid Approve (and once at connect), cleared immediately after the read on every path, cleared again when a request ends without a release, stale value cleared at start-up; `ha_clear_failed` audited after 3 failed attempts |
+| Passphrase lingers in HA | entity read only on a valid Approve (and once at connect), cleared immediately after the read on every path (also after a *failed* read), cleared again when the **last** request announced to HA closes for any reason (including a release through web/admin), never while another request is still pending (a local client cannot wipe what the owner is typing for someone else's request), stale value cleared at start-up; a failed clear is retried 3 times, audited (`ha_clear_failed`) and owed: retried at the next announcement and at every (re)connect even with requests pending |
+| Wrong/revoked HA token triggers an HA `ip_ban` | `auth_invalid` is retried after 5 min (doubling, capped at 30 min) and audited once (`ha_auth_invalid`), not with the 1 s reconnect backoff |
+| Owner's typed passphrase consumed silently | busy/gone/aborted/caller-changed/failed results send a separate follow-up notification |
+| Revoked approver keeps working until restart | `SIGHUP` applies `owner_user_ids`/`ha_require_user_id` live; other HA/notify/approval/channel/socket changes are named in a warning as needing a restart |
 | Forged action events on the HA bus | `context.user_id` must be in `owner_user_ids`, request must be pending, per-request token compared in constant time; rejections audited (`ha_event_rejected`, coalesced) without the action id |
 | Token or passphrase in notification text/logs/audit | text carries neither (token only inside action ids); `Notification` redacts url/token in `Debug`; tests assert audit and daemon log never contain the passphrase, the HA token or the action token |
 | HA token on the wire | `https://` required (loopback or `allow_insecure_http = true` excepted, with a warning); optional `ca_file` pin |
@@ -115,7 +118,16 @@ event bus, WebSocket, possibly recorder/history/logbook if not excluded) and is 
 administrators while it is set; a compromised HA host or long-lived token holder acting as the owner
 user can approve (still needing the per-request token, which only the notification contains).
 `get_states` is used to read the entity, so each Approve pulls the full state list of HA into
-`secretd`'s memory (dropped at once). Passphrases over 255 characters are not supported on this channel.
+`secretd`'s memory (dropped at once); an answer above 16 MiB makes the read (and the connection) fail,
+which then only clears the entity. The narrower `render_template` command is not used: it is a
+subscription whose result HA coerces to native types (a passphrase such as `1e5` or `123` would be
+mangled) and it cannot be checked here against a running HA.
+**The HA token must belong to an administrator**: non-administrators may not subscribe to
+`mobile_app_notification_action` (HA's `SUBSCRIBE_ALLOWLIST`), so the token is administrator-grade.
+**The per-request approval token is visible to HA administrators** in the `call_service` event that
+carries the notification actions; an HA administrator can therefore act as the owner on this channel.
+A passphrase that is typed but not submitted stays in the entity while HA is unreachable or refuses
+the clear, and while any request is pending. Passphrases over 255 characters are not supported on this channel.
 Transient copies of the passphrase and of the access token in WebSocket/JSON buffers are not
 zeroized (same class as the HTTP form path).
 
@@ -125,8 +137,10 @@ zeroized (same class as the HTTP form path).
 |---|---|
 | Planted or swapped pipe (symlink, other file type, other owner) | `lstat` + refuse; directory must be daemon-owned and not group/other-writable and not a symlink; `O_NOFOLLOW`; every later open is checked to be our inode; a leftover FIFO is replaced, not reused |
 | Wrong owner/mode through the umask | `fchown`/`fchmod` on a descriptor, then verified; modes above `0660` or with `other` bits are config errors; the daemon's own write access is verified |
-| A process that is not the one the owner saw gets the secret | more than one reader process -> `fifo_ambiguous`; release-time re-scan must show the same pid/exe/cmdline/start time or the release aborts (`caller_changed`); somebody must still hold the read end (`POLLERR`); optional `enforce_acl` |
-| Notification flood by a looping reader | one request per pipe, `attempts_per_min` (10), cool-down (5 s, never below 250 ms), global `max_pending_total`, coalesced audit lines for locally triggerable rejections |
+| A process that is not the one the owner saw gets the secret | more than one reader process -> `fifo_ambiguous`; release-time re-scan must show the same pid/exe/cmdline/start time or the release aborts (`caller_changed`); same uid/gid too; somebody must still hold the read end (`POLLERR`); `O_PATH` and write-only descriptors are not readers (Linux; macOS needs `FREAD`); optional `enforce_acl` |
+| Notification flood by a looping reader | one request per pipe, `attempts_per_min` (10), cool-down (5 s, never below 250 ms), global `max_pending_total`, coalesced audit lines for locally triggerable rejections; openers refused as ambiguous/unknown/ACL-failing do not use up `attempts_per_min` (only the cool-down paces them) |
+| Reader stranded when a pipe is removed (reload, shutdown) | readers blocked in `open` are released with EOF before the pipe is unlinked |
+| Pipe directory unreadable under `UMask=0077` | directories the daemon creates get an explicit 0755 (`fchmod`) |
 | Stuck or malicious reader holding the secret in memory | non-blocking write with a deadline (`write_deadline_secs`, 5 s), then the value is dropped and the pipe closed; `aborted` with a byte count |
 | Secret in logs | audit lines carry the pipe path, identities and byte counts, never data (asserted in tests) |
 
@@ -268,8 +282,14 @@ poll.
 * **OIDC availability.** Login depends on Google being reachable; discovery is retried on the
   next login and the last good metadata is reused. The terminal fallback (`secretctl approve`)
   works without Google.
-* **Reload scope.** SIGHUP re-reads ACLs, limits and timeouts and reopens the audit log; sockets,
-  the approval listener's limits, notifier and OIDC settings need a restart.
+* **Reload scope.** SIGHUP re-reads ACLs, limits and timeouts, re-arms changed pipes, applies the
+  Home Assistant approver allowlist and reopens the audit log; sockets, the user, the channel set, the
+  approval listener, notifier, OIDC and the rest of `[homeassistant]` need a restart, and the log says
+  which of them changed (`[section] ... NOT applied`).
+* **Announcements in flight when a request resolves** keep running for up to 15 s (audited as late
+  `notified`/`notify_failed`) before being abandoned.
+* **HA socket stall.** Commands and writes to Home Assistant time out after 10 s; there is no automated
+  test for a peer that stops reading (needs a stalled TCP window).
 * **Dependency audit.** CI runs `cargo audit`; `cargo build` currently prints a
   future-incompatibility notice for a transitive proc-macro crate.
 
