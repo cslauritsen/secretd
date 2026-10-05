@@ -2,6 +2,7 @@
 //! Shared integration-test harness: an in-process daemon core on a temp
 //! socket with injectable peer credentials, `/proc` reader and notifier.
 
+pub mod ha;
 pub mod mock;
 pub mod web;
 
@@ -10,10 +11,11 @@ use secret_proto::config::{Config, NameResolver};
 use secret_proto::store::{self, Entry};
 use secret_proto::{Request, Response};
 use secretd::audit::Audit;
+use secretd::channel::Channel;
 use secretd::core::Core;
 use secretd::notify::{Notification, Notifier, NotifyError};
 use secretd::peer::{PeerCred, PeerCredProvider, StaticPeerCred};
-use secretd::procinfo::{ProcInfo, ProcReader, StaticProcReader};
+use secretd::procinfo::{ProcInfo, ProcInfoReader, StaticProcReader};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -86,11 +88,15 @@ pub struct Opts {
     pub limits: String,
     pub timeout_secs: u64,
     pub notifier: Option<Arc<dyn Notifier>>,
+    /// Explicit channel set (replaces the default web+admin pair).
+    pub channels: Option<Vec<Arc<dyn Channel>>>,
+    /// Channels added to the default web+admin pair.
+    pub extra_channels: Vec<Arc<dyn Channel>>,
     #[allow(clippy::type_complexity)]
     pub notifier_from_cfg: Option<Box<dyn FnOnce(&Config) -> Arc<dyn Notifier>>>,
     pub audit_writer: Option<Box<dyn std::io::Write + Send>>,
     pub peer: Option<Arc<dyn PeerCredProvider>>,
-    pub procs: Option<Arc<dyn ProcReader>>,
+    pub procs: Option<Arc<dyn ProcInfoReader>>,
     pub notify_url: String,
     pub oidc_issuer: String,
     pub listen: String,
@@ -108,6 +114,8 @@ impl Default for Opts {
             limits: String::new(),
             timeout_secs: 30,
             notifier: None,
+            channels: None,
+            extra_channels: Vec::new(),
             notifier_from_cfg: None,
             audit_writer: None,
             peer: None,
@@ -263,8 +271,19 @@ impl Harness {
             (None, Some(f)) => f(&cfg),
             (None, None) => notifier.clone(),
         };
-        let p: Arc<dyn ProcReader> = o.procs.unwrap_or_else(|| procs.clone());
-        let core = Core::new(cfg.clone(), audit, n, p);
+        let p: Arc<dyn ProcInfoReader> = o.procs.unwrap_or_else(|| procs.clone());
+        let core = match o.channels {
+            Some(ch) => Core::with_channels(cfg.clone(), audit, ch, p),
+            None if o.extra_channels.is_empty() => Core::new(cfg.clone(), audit, n, p),
+            None => {
+                let mut ch: Vec<Arc<dyn Channel>> = vec![
+                    Arc::new(secretd::channel::WebChannel::new(n)),
+                    Arc::new(secretd::channel::AdminChannel),
+                ];
+                ch.extend(o.extra_channels);
+                Core::with_channels(cfg.clone(), audit, ch, p)
+            }
+        };
 
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).unwrap();

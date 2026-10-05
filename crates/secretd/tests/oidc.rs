@@ -421,13 +421,13 @@ async fn login_when_provider_down_is_502() {
         OidcClient::new(
             secret_proto::config::OidcCfg {
                 issuer: "http://127.0.0.1:1".into(),
-                ..w.h.cfg.approval.oidc.clone()
+                ..w.h.cfg.approval.as_ref().unwrap().oidc.clone()
             },
             pw("s"),
         )
         .unwrap(),
     );
-    let app = secretd::approval::router(w.h.core.clone(), w.h.cfg.approval.clone(), dead);
+    let app = secretd::approval::router(w.h.core.clone(), w.h.cfg.approval.clone().unwrap(), dead);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     tokio::spawn(async move {

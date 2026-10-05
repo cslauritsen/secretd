@@ -11,7 +11,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-const DEFAULT_SOCKET: &str = "/run/secretd/secretd.sock";
+const DEFAULT_SOCKET: &str = secret_proto::DEFAULT_SOCKET;
 const MAX_TEMPLATE: usize = 64 * 1024 * 1024;
 
 #[derive(Parser)]
@@ -23,7 +23,8 @@ struct Cli {
 
 #[derive(clap::Args, Clone)]
 struct Common {
-    /// secretd socket path (default: $SECRETD_SOCKET or /run/secretd/secretd.sock).
+    /// secretd socket path (default: $SECRETD_SOCKET or /run/secretd/secretd.sock,
+    /// /var/run/secretd/secretd.sock on macOS).
     #[arg(long, global = true, env = "SECRETD_SOCKET")]
     socket: Option<PathBuf>,
 }

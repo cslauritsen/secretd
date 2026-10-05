@@ -291,3 +291,298 @@ Choices the specification left open, recorded as simply as possible.
   `/etc/secretd`, so nothing but the daemon user should be able to read secrets there. systemd
   `LoadCredential=` is an alternative. `secretctl check-config` warns when a credential file is
   readable by the client socket group.
+
+## Channels (milestone 7)
+
+- `[channels] enabled` defaults to `["web", "admin"]` when the table is absent, so existing configs
+  behave as before. `web` needs `[notify]`, `[approval]` and `[approval.oidc]` (both are now optional
+  in the config model: `Config.notify` / `Config.approval` are `Option`, `Some` exactly when `web` is
+  enabled). Tables present while `web` is off are ignored with a warning. Duplicates, unknown names
+  and an empty list are config errors, which `secretctl check-config` reports (it loads the config
+  with the same validator as the daemon).
+- `Channel` trait (`secretd::channel`): `announce` (push to the owner), `announces()` (false for the
+  pull-based admin channel) and `closed` (the request left the pending state). The *decision* half of
+  a channel is a call to `Core::approve` / `Core::deny` with a `Source` (`Http(ip)`, `Admin`,
+  `HomeAssistant`), so first-resolution-wins stays a single mechanism: the pending registry and the
+  reply-channel handoff that already decided approve vs deny vs timeout.
+- `Core::new(cfg, audit, notifier, procs)` is kept (web + admin around one `Notifier`) so the in-process
+  test harness and the CLI tests are unchanged; `Core::with_channels` takes an explicit set.
+- Announcing: every announcing channel is called concurrently. The request becomes answerable as soon
+  as the first one succeeded *and its `notified` event was written* (audit order stays
+  `request_received`, `notified`, ...); slower channels keep going and are audited when they finish.
+  If all announcing channels failed, the request fails `INTERNAL`. If there is none (admin only), the
+  request is answerable immediately and no `notified` event exists. A failing audit write on
+  `notified` still fails closed.
+- `closed` is called once per request on every channel, detached (a slow channel never delays the
+  client's reply), with `Released | Denied | Timeout | Cancelled | Failed`. The web channel needs
+  nothing (unknown request ids already answer 410).
+- Audit `channel` is set on events that have a channel: `notified` / `notify_failed` (the announcing
+  channel), `approve_attempt`, `approved`, `denied`, `decrypt_failed`, `released`, `aborted` (the
+  resolving channel), the web endpoint's `admin_action` / `rate_limited` lines (`web`) and the admin
+  socket's `admin_action` (`admin`). Events that belong to no channel (`request_received`, `timeout`,
+  `client_disconnected`, `acl_denied`, `rate_limited` for socket clients) have none.
+- `Notification` gained `approval_token` (channels other than web build their action ids from it) and
+  its `approval_url` is empty without the web channel. Its `Debug` output redacts both, so a stray
+  `{:?}` cannot log a token.
+
+## Home Assistant channel (milestone 8)
+
+- **Does the Companion app event carry `context.user_id`?** Checked in Home Assistant core
+  (`homeassistant/components/mobile_app/webhook.py`, `dev` branch, October 2026): the app delivers
+  notification actions through the `fire_event` webhook command, which does
+  `hass.bus.async_fire(event_type, data, EventOrigin.remote, context=registration_context(config_entry.data))`,
+  and `registration_context()` in `helpers.py` is `Context(user_id=registration[CONF_USER_ID])`.
+  So `mobile_app_notification_action` events carry the id of the HA user who registered the device
+  (not the user currently logged in to the HA frontend, and not necessarily the person holding the
+  phone). It was verified by reading the source; it was **not** tested against a live Companion app
+  (none is available here). Caveats: a registration without a user id yields `user_id: null`; events
+  fired from automations/scripts inherit the context of whatever triggered them; and anyone who can
+  fire events as the owner's user (their long-lived token) is indistinguishable from the owner.
+  Hence the allowlist (`owner_user_ids`) is mandatory by default and `ha_require_user_id = false`
+  exists as the opt-out the spec asks for: with it, events *without* a user id are accepted
+  (events with a user id must still be in `owner_user_ids` when that list is non-empty), and the
+  daemon warns at start-up. Even then the per-request token (only inside the notification) must match.
+- Event name: only `mobile_app_notification_action` is subscribed (Android and current iOS
+  Companion). Legacy iOS builds that fire `ios.notification_action_fired` are not supported.
+- Library: `tokio-tungstenite` 0.30 with rustls (`ring`), no new async runtime. TLS roots: the
+  system store, or only `ca_file` when set (a pin: nothing else is trusted). `wss://` handshakes
+  use the `ring` provider explicitly, so the process-wide default provider is never needed.
+- Protocol: one connection; command ids are assigned by the connection task; every call has a
+  10 s timeout; an application-level `ping` every 30 s and a dead-connection cut-off after 75 s without
+  traffic. Reconnect delay doubles from `backoff_min_ms` (1000) to `backoff_max_ms` (60000) and
+  resets after a connection that authenticated; both are configurable only so the tests can use
+  small values. An `auth_invalid` reply is *not* retried with that backoff: HA bans an address after repeated
+  failed logins (`ip_ban_enabled`), so the retry delay is 5 minutes, doubling to 30, and
+  `ha_auth_invalid` is audited once per episode (a later successful login re-arms it). Fixing the
+  token needs a restart (the token file is read once). Every command queued to the connection has a
+  10 s timeout, as has every write to the socket, so a stalled peer cannot wedge callers.
+- Reading the entity uses the WebSocket `get_states` command and picks the one entity out of the
+  answer (HA has no per-entity read command on the WebSocket API; REST would need a second
+  connection and client). It transfers all states of the HA instance for each Approve; the state
+  list is dropped immediately and only the entity value is kept in a zeroizing buffer. A
+  `render_template` subscription would be leaner but is event based and stays subscribed.
+  `unknown` and `unavailable` count as empty.
+- Clearing: `input_text.set_value` with `value: ""` right after the read (before the unseal, so
+  also on every failure path), 3 attempts 200 ms apart; if all fail, `ha_clear_failed` is audited and
+  the approval still proceeds ("the clear has been attempted"). The clear is skipped when the entity
+  was empty. A read that *fails* (timeout, reset, HA error, over-size answer, missing entity) also
+  triggers a clear, because the passphrase may still be there; the owner is told to retype.
+  Review fix (security review of the channel): the entity is channel-wide state, so `EntityState`
+  tracks whether it *may hold a typed passphrase* (`dirty`: an actionable prompt went out and no clear
+  succeeded since; a clear that raced with a new prompt leaves it set) and whether a clear is *owed*
+  (the last attempt failed or HA was unreachable). When a request closes, its notification is cleared
+  and, only if no other request announced on HA is still pending (the owner may be typing for it),
+  the entity is cleared if `dirty` or owed, whatever the reason, including a release through web/admin
+  that never read it. The previous rule (clear on every non-release close) let any local client wipe
+  another request's passphrase just by cancelling its own. A failed clear is retried 3 times,
+  audited (`ha_clear_failed`) and stays owed: retried before the next announcement and at every
+  (re)connect, there even with requests pending (that passphrase was already used or is dead).
+  Notification clears that fail (disconnected) are remembered per tag and redone at reconnect. At
+  connect (with nothing owed and no request pending) the entity is read once and cleared if non-empty,
+  audited as `ha_entity_cleared` (outcome `stale`, or `owed`); this is an extra event beside the four
+  in the spec. The guarantee is "cleared as soon as HA is reachable", not "never present".
+- Outcome follow-ups: busy, gone, aborted, caller changed, not-in-store, internal and final-wrong
+  results send a separate action-less notification (tag `secretd-result-<id>`, so the request's own
+  clear does not remove it). The approval gate is released as soon as `Core::approve` returns (before
+  any follow-up is sent): the passphrase is already gone, and holding it made an Approve tapped right
+  after a wrong passphrase answer "busy" (the flaky `three_wrong_passphrases_deny_and_clear`).
+- Reload: `HaChannel::apply_config` swaps the allowlist (`owner_user_ids`, `ha_require_user_id`)
+  under a lock on SIGHUP, and a removed section rejects everyone; `reload::restart_required` names
+  other changed sections (logged as warnings). The audit lines `ha_connected` / `ha_disconnected` go
+  through the coalescer (first per minute in full, then a count) so a flapping link cannot flood the
+  log.
+- `get_states` is kept for the read. `render_template` was considered (narrower), but it is a
+  subscription (needs event frames and `unsubscribe_events`), HA coerces its result to native types
+  (a passphrase like `123` or `1e5` would come back as a number), and it cannot be verified here
+  against a real HA.
+- **The HA user must be an administrator.** Checked in HA core (`websocket_api/commands.py`,
+  `auth/permissions/events.py`, `dev` branch, October 2026): `subscribe_events` for an event type
+  outside `SUBSCRIBE_ALLOWLIST` raises `Unauthorized` for non-admins and `mobile_app_notification_action`
+  is not in the list. The README's earlier "dedicated non-administrator user" advice was wrong; it now
+  says a dedicated *admin* user. Not tested against a live HA. Residual risk recorded: the per-request
+  token travels in the `notify` `call_service` event, readable by HA admins.
+- Authorization order of an action event: prefix check (other apps' actions are ignored silently),
+  user id (`user_missing` / `user_not_allowed`), id/token syntax (`malformed_action`), request still
+  pending (`unknown_request`), constant-time token compare (`bad_token`). Each rejection is audited
+  as `ha_event_rejected` through the coalescer (one line per outcome and user per minute plus a
+  summary) with the user id in `detail` and the request id when it parsed, **never** the action id
+  or token. At most 16 action events are handled concurrently; extra ones are dropped (warning).
+- Busy: a channel-wide flag taken by the first Approve; a concurrent Approve is answered with a
+  "Busy, try again" notification and does not read the entity. A Deny of a request that is being
+  unsealed answers "approval in progress" (core refuses it as busy).
+- The notification is sent with `data.tag = <request id>`, `ttl: 0`, `priority: high`; re-prompts
+  (empty entity, wrong passphrase with attempts left, busy) reuse the tag and carry the two actions
+  again, because a notification replaced by a plain message would leave no Approve button. The token
+  is kept in memory in the channel to rebuild them.
+- Config: `homeassistant.url` must be http(s); plain http to a non-loopback host is an error without
+  `allow_insecure_http = true` (warning with). `notify_service` must look like `notify.<name>`,
+  `passphrase_entity` like `input_text.<name>`. `owner_user_ids` may be empty only with
+  `ha_require_user_id = false`.
+- The passphrase read from HA passes through the WebSocket message buffer and `serde_json::Value`
+  before it reaches the zeroizing buffer; like the HTTP form path, those transient copies are not
+  zeroized (see HARDENING known gaps). The same is true of the access token in the auth message.
+- Tests use `tests/common/ha.rs`, a mock HA WebSocket server (auth, subscription, `call_service`,
+  `get_states`, event injection, connection drops, rejected connections, failing services).
+
+## Named-pipe (FIFO) secrets (milestone 9)
+
+- **The spec's own example cannot work, and these are the deviations.** `owner = "app"`, `group =
+  "app"`, `mode = "0440"` leaves the daemon (user `secretd`) with no write access to the pipe, yet it
+  must `open(O_WRONLY)` it for every request (a reader cannot be served otherwise); chown to
+  another user also needs `CAP_CHOWN`, which the unit does not grant. So: (a) the daemon must be able
+  to open the pipe for writing, verified at set-up with `faccessat(W_OK, AT_EACCESS)` (and by
+  `secretctl check-config` from the config alone): it is the owner with the owner write bit, or in
+  `group` with the group write bit; (b) `owner` is optional and defaults to the daemon user (another
+  owner is accepted only if the process may chown to it, i.e. it is root or has `CAP_CHOWN`); readers
+  get access through `group`, which an unprivileged daemon can only set to a group it belongs to;
+  (c) the default `mode` is `"0640"`, not `0440`; allowed modes are subsets of `0660` that someone can
+  read (no setuid/setgid/sticky, no execute, nothing for `other`); `mode` must be a quoted octal string
+  (a bare TOML integer is refused, `440` and `0o440` mean different things); a mode that lets the
+  owner/group write only warns (they could feed the reader data).
+- Creation: parent directory must be a real directory (not a symlink), owned by the daemon uid, not
+  group/other-writable (created with 0755 if missing; the packaged tmpfiles use `0711`). The path is
+  inspected with `lstat`: a symlink or non-FIFO refuses start-up; a FIFO owned by the daemon user or
+  by the configured owner (a leftover of a crash) is removed and recreated rather than reused, so
+  mode, owner and inode are always known. `mkfifo(0600)`, a path `chmod` (the directory is not
+  writable by others), then `open(O_RDWR|O_NONBLOCK|O_NOFOLLOW)` whose `fstat` must match the
+  `lstat`, then `fchown`/`fchmod` on the descriptor and a final verification of owner, group and mode;
+  a failure at any step removes the pipe and refuses to start. On shutdown only the inode we created
+  is removed.
+- Arming: `open(O_WRONLY|O_NONBLOCK|O_NOFOLLOW)` every 100 ms (no inotify: a poll is simplest,
+  cancellable and enough). The descriptor that succeeds is kept as the write end for the whole
+  request and its `fstat` must still be our inode. Cancellation (shutdown, SIGHUP re-arm) is checked
+  at every step; an in-flight request is cancelled the same way as a client disconnect; an approved
+  value that is already being written finishes within the write deadline. `SIGPIPE` is ignored.
+- **Re-arm race (found while testing):** a reader blocked in `read()` only gets EOF if the pipe has no
+  writer when it wakes. Re-opening the write end immediately after closing it (cool-down 0) made
+  readers hang through repeated requests. So the pause after every request is `max(cooldown_secs,
+  250 ms)`. Likewise our `open` can return before the reader's own `open` has installed its
+  descriptor, so an empty `/proc` scan right after detection is retried (8 x 25 ms) before the reader
+  counts as unknown.
+- Reader detection and identity: for every `/proc/<pid>/fd/<n>` whose link is an absolute path
+  (pipes, sockets and anonymous inodes are skipped without a `stat`), `stat` follows the link and
+  compares `(st_dev, st_ino)` with the pipe; `/proc/<pid>/fdinfo/<n>` flags (octal) must not be
+  `O_WRONLY`. One entry per process, own pid excluded. uid/gid are the effective ids from
+  `/proc/<pid>/status`, exe/cmdline/start time from the `ProcReader` as for sockets. Processes whose
+  `fd` directory cannot be read (other uid without `CAP_SYS_PTRACE`) are not seen; a reader whose
+  `/proc` entry cannot be read still counts for the ambiguity rule but is unidentified. The scan is a
+  blocking walk of `/proc` and runs on the blocking pool.
+- Rules: ambiguity (>1 process) at request time and at release -> `fifo_ambiguous` (`at_request` /
+  `at_release`); `enforce_acl` with nobody identified -> `fifo_reader_unknown`, identified but failing
+  uid/gid/exe -> `acl_denied` (outcome `fifo_acl`); release-time check compares pid, exe, cmdline and
+  start time with the request-time snapshot and also requires that somebody still has the read end
+  open (`POLLERR` on our write end); when nobody could be identified either time only that last
+  condition is checked. A difference -> `caller_changed` (`at_release`), nothing written, the approver
+  is told `CallerChanged`. These rejections go through the audit coalescer (per pipe) because anyone
+  who may open the pipe can trigger them.
+- Requests reuse `Core::request_approval` (shared with `secret.get`): a pending entry of origin
+  `Fifo(path)`, the channel list of section 19.1, `reason = "read of <path>"`, the daemon's
+  `request_timeout_secs`. Per-request limits are keyed on the pipe: one pending request per pipe
+  (inherent: one reader flow per pipe, also enforced in the registry), `attempts_per_min` (sliding 60 s
+  window, `rate_limited` / `fifo_attempt_rate`) and the global `max_pending_total`; the per-uid caps
+  and duplicate suppression do not apply (the reader is not necessarily known). A pipe request is not
+  counted against the per-uid attempt limiter of `secret.get`. `request_received` is audited one by
+  one (outcome `fifo_open`) and fails closed like for sockets. Audit events carry a `fifo` field; the
+  reader that went away is `client_disconnected` with outcome `reader_gone`.
+- Delivery: `Grant` carries the value to the pipe handler instead of the socket handler; the approver
+  is told the real result through `Delivery` (`Released`, `CallerChanged`, `Aborted`, `Failed`; the
+  old boolean ack became this enum). Write: the held descriptor is registered with `AsyncFd`, written
+  in a loop with a deadline (`write_deadline_secs`), then dropped (EOF). `EPIPE` -> `aborted` /
+  `reader_gone`; deadline -> `aborted` / `write_timeout`; both with `detail: "wrote N of M bytes"`
+  (never data). `released` is audited only after the whole value was written; if that audit write then
+  fails the value is already out, so it is logged and the approver is still told "released". A
+  partially written value is not retried on a later open.
+- The notification says `Requested via FIFO <path> (caller identity is best effort)`; an unidentified
+  reader is shown as `unknown (no reader process could be identified)` (`Notification.identified`,
+  `PendingInfo.via`; `secretctl pending` and the approval page show the same).
+- Config `[[fifo]]` fields: `path`, `secret`, `owner`, `group`, `mode`, `enforce_acl`, plus the
+  tunables `attempts_per_min` (10), `cooldown_secs` (5; 0 allowed, the 250 ms floor applies) and
+  `write_deadline_secs` (5). The path must be absolute and normalised, unique, and must not be one of
+  the daemon's own files; the secret must exist.
+- Packaging: unit `ReadWritePaths=... -/run/secretd/pipes` (the `-` tolerates a missing directory when
+  no pipe is configured), tmpfiles `d /run/secretd/pipes 0711 secretd secretd -` (traverse-only for
+  others, not listable, not writable). `SystemCallFilter=@system-service` is kept (it includes
+  `mknod`); this could not be verified under real systemd here.
+- Not implemented: inotify (`IN_OPEN`) based detection; pipes created by anything but the daemon at
+  runtime; a per-pipe policy beyond `enforce_acl`; readers that use `O_NONBLOCK` and poll are served
+  like any other reader (their first read may return EAGAIN until the value is written).
+
+## Platform support: Linux and macOS (milestone 10)
+
+* **Seams, not forks.** Existing seams were kept (`PeerCredProvider`, `ProcInfoReader`,
+  `ReaderScanner`); OS code is in `cfg(target_os)` blocks and one macOS-only module
+  (`secretd::macos`, the libproc/sysctl/launchd wrappers). `ProcReader` was renamed
+  `ProcInfoReader` (mechanical; `RealProcReader` and `StaticProcReader` kept their names, and
+  `RealProcReader` is the OS's real implementation on both). Pure parsers (`KERN_PROCARGS2`,
+  `/proc/<pid>/stat`, cmdline joining) are not gated, so they are unit-tested on Linux.
+* **Peer pid on macOS is `LOCAL_PEERPID`, read by us.** tokio's `peer_cred` returns
+  `LOCAL_PEEREPID` there (the effective pid, different for delegated sockets); uid/gid from it are
+  the `LOCAL_PEERCRED`/`getpeereid` values and are used as is.
+* **No pidfd on macOS.** `peer_pidfd` returns `None`, `pidfd_alive` fails closed. Pid reuse is caught
+  by the start time (microseconds since the epoch from `pbi_start_tvsec/usec`; value type
+  documented as OS-specific because it is only compared for equality).
+* **Start time falls back to `sysctl(KERN_PROC_PID)`** when `proc_pidinfo(PROC_PIDTBSDINFO)` is
+  refused, reading only the leading `struct timeval` of `kinfo_proc` (libc has no such struct). A
+  macOS unit test asserts both sources agree for the test process; if that ever fails the fallback
+  is wrong and must not be trusted.
+* **Unresolvable means denied, and the daemon says so at start-up.** No reduced-identity mode was
+  added: `Core::allowed` still needs `proc` for every ACL. Instead `platform::check_process_inspection`
+  probes pid 1 on macOS and refuses to start with an exe-pinned ACL for another uid/any gid that the
+  daemon cannot inspect (warning for `allow_any_exe`). Linux keeps its per-request fail-closed
+  behaviour without a start-up refusal (the unit grants `CAP_SYS_PTRACE`).
+* **macOS runs as root, then drops to `_secretd`.** A LaunchDaemon with `UserName=_secretd` cannot
+  recreate `/var/run/secretd` after a reboot, so the plist has no `UserName`: the daemon binds as
+  root and drops (the pre-existing root path). `daemon.user = "root"` is the supported way to keep
+  full inspection. Deviation from "run as `_secretd`": the process does run as `_secretd` after start-up.
+* **Hardening.** macOS: `ptrace(PT_DENY_ATTACH)` best effort; `disable_core_dumps` still returns
+  whether every applicable step worked and `main` only warns.
+* **`initgroups` / `getgrouplist` via libc.** `nix` 0.29 does not provide them on macOS;
+  `secret_proto::sys` wraps the libc calls for both OSes (one code path, tested on Linux).
+* **FIFO.** Reader scan via libproc (`proc_listpids`, `PROC_PIDLISTFDS`, `PROC_PIDFDVNODEPATHINFO`);
+  the `proc_fileinfo`/`vnode_fdinfowithpath` structs are not in libc, so they are declared locally
+  with compile-time size assertions (24/136/152/1200 bytes). `st_dev` is compared on its low 32 bits
+  (libproc's `vst_dev` is 32-bit while `MetadataExt::dev` sign-extends). `FREAD` (kernel flag, not
+  `O_*`) marks readers. `mode_t` is 16 bits on macOS, so the `fchmod` argument is cast.
+* **Socket activation.** Linux: `LISTEN_FDS` as before. macOS: plain bind by default; launchd
+  `launch_activate_socket` for `Sockets` entries named `secretd`/`admin` is implemented (small, and
+  ESRCH/ENOENT/EALREADY mean "not activated") but untested; the plist ships it commented out.
+* **Per-OS defaults** for sockets (`/var/run/secretd`) and store (`/var/db/secretd/store.age`) live
+  in `secret_proto` constants shared by the config default and the `secret` CLI; explicit config is
+  unaffected. The audit log default (`/var/log/secretd`) is the same on both.
+* **Tests.** Gated for Linux: the `setpriv` multi-uid test, the pidfd tests (moved into a `pidfd`
+  module in `tests/identity.rs`), `SO_PEERPIDFD`. `/proc/<pid>/exe` reads in tests became
+  `RealProcReader`. The systemd packaging text tests read static files and run everywhere; launchd
+  text tests were added next to them. macOS-only unit tests cover the libproc wrappers,
+  `LOCAL_PEERPID`, and the sysctl start time.
+* **Verification limits.** The macOS code was cross-compiled (`cargo check --all-targets` for both Apple
+  triples, `clippy -D warnings` for aarch64) with a stub C compiler for `ring`'s build script, which is enough for
+  type-checking but produces no binary. Nothing was executed on macOS here; the macOS CI job is the first
+  real run.
+
+## Security review fixes (HA channel and FIFOs)
+
+- **In-flight announces.** `request_approval` no longer drops its `JoinSet` when the request
+  resolves. Announcements still running continue in a detached task for up to 15 s (`Core::set_announce_grace`
+  test hook); their `notified` / `notify_failed` lines are written with a "finished after the request was
+  closed" detail (timeout: `notify_failed`, outcome `timeout`), and a channel's `closed` hook runs only
+  after its own announce ended (finished or abandoned), so it can remove what it just sent. The
+  once-per-channel `closed` contract is unchanged.
+- `acl_denied` / `acl_changed` now carries `channel` and `source_ip` of the approver.
+- **FIFO scanner.** Linux: `O_PATH` descriptors (access mode bits read as read-only) are not readers
+  (`flags_mean_reader`), nor are write-only ones; the scanner's own pid is excluded. macOS counts only
+  descriptors with `FREAD`; there is no `O_PATH` (the analogue `O_EVTONLY` could not be exercised and is
+  not special-cased; XNU behaviour is unverified). The scanner tests are cross-platform except the
+  `O_PATH` one (Linux-only); the macOS side is compile-checked only.
+- Release-time verification also compares uid and gid of the reader. Only readers that reach the
+  owner count towards `attempts_per_min` (refused openers are paced by the cool-down and audited
+  coalesced). Directories created for a pipe (and missing parents) get an explicit 0755 via `fchmod`
+  (the unit's `UMask=0077` would give 0700; on macOS the documented `install -d -m 0711` directory is
+  unaffected, and a daemon-created one gets the same 0755).
+- Pipe removal: before unlinking (shutdown or a reload that drops/changes a `[[fifo]]`), readers blocked
+  in `open(O_RDONLY)` (typically during the cool-down, when the pipe is not probed) are released by
+  opening and closing the write end, so they get EOF instead of hanging forever.
+  `FifoHandle::shutdown_within(grace)` exists so the "busy task, pipe still removed" path is testable.
+- Not done: a test for a stalled HA socket (write timeout) needs a stalled TCP window; compile-verified
+  only. Surviving-mutation notes: the MAX_HANDLERS cap and the release-time `POLLERR` check now have
+  tests; the `shutdown` removal loop is only reachable when a task outlives the grace period and is
+  covered by `shutdown_removes_the_pipe_even_if_a_task_is_still_busy`.

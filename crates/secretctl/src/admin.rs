@@ -65,12 +65,22 @@ pub fn pending(cli: &Cli) -> Result<()> {
         return Ok(());
     }
     for p in list {
-        println!(
-            "{}  {}  uid={} ({})  pid={}  expires {}",
-            p.request_id, p.secret_name, p.uid, p.username, p.pid, p.expires_at
-        );
-        println!("    exe:     {}", p.exe);
-        println!("    cmdline: {}", p.cmdline);
+        if let (Some(via), 0) = (&p.via, p.pid) {
+            println!(
+                "{}  {}  {via}  caller unknown  expires {}",
+                p.request_id, p.secret_name, p.expires_at
+            );
+        } else {
+            println!(
+                "{}  {}  uid={} ({})  pid={}  expires {}",
+                p.request_id, p.secret_name, p.uid, p.username, p.pid, p.expires_at
+            );
+            if let Some(via) = &p.via {
+                println!("    {via} (caller identity is best effort)");
+            }
+            println!("    exe:     {}", p.exe);
+            println!("    cmdline: {}", p.cmdline);
+        }
         if let Some(r) = p.reason {
             println!("    reason (client-supplied, untrusted): {r}");
         }

@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 
 /// Everything shown to the owner. Never contains a secret or key.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Notification {
     pub request_id: String,
     pub secret_name: String,
@@ -17,7 +17,31 @@ pub struct Notification {
     /// Client supplied (untrusted), already sanitised.
     pub reason: Option<String>,
     pub expires_at: String,
+    /// Web approval link (contains the token); empty when the web channel is off.
     pub approval_url: String,
+    /// The per-request approval token. Channels other than web use it to build
+    /// their action ids. Never shown in message text.
+    pub approval_token: String,
+    /// Set for requests that do not come from a socket client, e.g.
+    /// `via FIFO /run/secretd/pipes/db`. The caller identity is then best effort.
+    pub via: Option<String>,
+    /// False when no process could be identified (named-pipe requests only);
+    /// `uid`, `username`, `pid` and `exe` are then placeholders.
+    pub identified: bool,
+}
+
+impl std::fmt::Debug for Notification {
+    // The URL and token are credentials: keep them out of any `{:?}` log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Notification")
+            .field("request_id", &self.request_id)
+            .field("secret_name", &self.secret_name)
+            .field("uid", &self.uid)
+            .field("pid", &self.pid)
+            .field("approval_url", &"<redacted>")
+            .field("approval_token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

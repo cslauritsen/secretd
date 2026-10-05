@@ -27,7 +27,7 @@ fn service_unit_is_hardened() {
         "MemoryDenyWriteExecute=yes",
         "LockPersonality=yes",
         "SystemCallFilter=@system-service",
-        "ReadWritePaths=/var/lib/secretd /var/log/secretd",
+        "ReadWritePaths=/var/lib/secretd /var/log/secretd -/run/secretd/pipes",
         "User=secretd",
         "Sockets=secretd.socket secretd-admin.socket",
     ] {
@@ -111,4 +111,97 @@ fn clients_group_is_dedicated() {
         !cfg.contains("root:secretd 0640 ("),
         "credential files must not be group-readable"
     );
+}
+
+#[test]
+fn pipe_directory_is_provisioned() {
+    // The named pipes need a daemon-owned directory that nobody else can write
+    // to, and the unit must be allowed to write there.
+    let t = read("tmpfiles.d/secretd.conf");
+    assert!(has_line(&t, "d /run/secretd/pipes 0711 secretd secretd -"));
+    let s = read("secretd.service");
+    assert!(s
+        .lines()
+        .any(|l| l.trim().starts_with("ReadWritePaths=") && l.contains("-/run/secretd/pipes")));
+    // Pipes need mknod: the syscall filter must stay on a group that has it.
+    assert!(has_line(&s, "SystemCallFilter=@system-service"));
+    // The example config documents the pipe and the Home Assistant channel.
+    let c = read("config.example.toml");
+    assert!(c.contains("[[fifo]]") && c.contains("[homeassistant]"));
+}
+
+// ------------------------------------------------------------------ macOS
+// These read static files, so they run on every OS (the systemd tests above
+// do too; only checks that need Linux itself are gated elsewhere).
+
+fn read_launchd(name: &str) -> String {
+    read(&format!("launchd/{name}"))
+}
+
+/// The plist with XML comments removed.
+fn uncommented(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some((before, after)) = rest.split_once("<!--") {
+        out.push_str(before);
+        rest = after.split_once("-->").map_or("", |x| x.1);
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn launchd_plist_runs_the_daemon_restarts_it_and_logs() {
+    let p = uncommented(&read_launchd("org.secretd.secretd.plist"));
+    assert!(p.contains("<string>org.secretd.secretd</string>"));
+    assert!(p.contains("<string>/usr/local/bin/secretd</string>"));
+    assert!(p.contains("<string>--config</string>"));
+    assert!(p.contains("<string>/etc/secretd/config.toml</string>"));
+    for key in [
+        "<key>KeepAlive</key>",
+        "<key>RunAtLoad</key>",
+        "<key>ThrottleInterval</key>",
+        "<key>StandardErrorPath</key>",
+        "<key>StandardOutPath</key>",
+        "<key>SoftResourceLimits</key>",
+        "<key>Umask</key>",
+    ] {
+        assert!(p.contains(key), "missing {key}");
+    }
+    assert!(p.contains("/var/log/secretd/secretd.log"));
+    // The job starts as root and the daemon drops to `_secretd` itself (the
+    // socket directory under /var/run must be recreated at every boot).
+    assert!(!p.contains("<key>UserName</key>"));
+    // The optional launchd socket activation block stays commented out.
+    assert!(!p.contains("<key>Sockets</key>"));
+}
+
+#[test]
+fn launchd_example_config_uses_macos_paths_and_dedicated_groups() {
+    let c = read_launchd("config.macos.example.toml");
+    assert!(has_line(&c, "user = \"_secretd\""));
+    assert!(has_line(&c, "socket = \"/var/run/secretd/secretd.sock\""));
+    assert!(has_line(
+        &c,
+        "admin_socket = \"/var/run/secretd/admin.sock\""
+    ));
+    assert!(has_line(&c, "store = \"/var/db/secretd/store.age\""));
+    assert!(has_line(&c, "socket_group = \"_secretd-clients\""));
+    assert!(!c.lines().any(|l| l.contains("\"/run/secretd/")));
+    assert!(!c.lines().any(|l| l.starts_with("store = \"/var/lib")));
+}
+
+#[test]
+fn launchd_readme_documents_user_directories_and_install() {
+    let r = read_launchd("README.md");
+    for want in [
+        "dscl . -create /Users/_secretd",
+        "dscl . -create /Groups/_secretd-clients",
+        "dseditgroup",
+        "/Library/LaunchDaemons/org.secretd.secretd.plist",
+        "launchctl bootstrap system",
+        "install -d -o _secretd",
+    ] {
+        assert!(r.contains(want), "README misses {want}");
+    }
 }

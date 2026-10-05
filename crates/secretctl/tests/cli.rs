@@ -240,6 +240,136 @@ fn check_config() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("writable"));
 }
 
+#[test]
+fn check_config_validates_channels() {
+    let e = Env::new();
+    let base = std::fs::read_to_string(e.path("config.toml")).unwrap();
+    let with = |extra: &str| {
+        std::fs::write(e.path("config.toml"), format!("{base}\n{extra}\n")).unwrap();
+        e.run(&["check-config"], None)
+    };
+    // No approval channel at all: refused.
+    let o = with("[channels]\nenabled = []");
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("at least one approval channel"));
+    // Unknown channel: refused.
+    assert!(!with("[channels]\nenabled = [\"sms\"]").status.success());
+    // Subset: accepted, and the summary names the channels.
+    let o = with("[channels]\nenabled = [\"web\", \"admin\"]");
+    ok(&o);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("channels: web, admin"));
+}
+
+#[test]
+fn check_config_home_assistant() {
+    let e = Env::new();
+    let base = std::fs::read_to_string(e.path("config.toml")).unwrap();
+    let ha = |token_file: &str, extra: &str| {
+        format!(
+            "{base}\n[channels]\nenabled = [\"web\", \"homeassistant\"]\n[homeassistant]\n\
+             url = \"https://ha.example.com\"\ntoken_file = \"{token_file}\"\n\
+             notify_service = \"notify.mobile_app_phone\"\n\
+             passphrase_entity = \"input_text.secretd_passphrase\"\n\
+             owner_user_ids = [\"abc\"]\n{extra}\n"
+        )
+    };
+    // Missing token file: an error.
+    let missing = e.path("ha.token").display().to_string();
+    std::fs::write(e.path("config.toml"), ha(&missing, "")).unwrap();
+    let o = e.run(&["check-config"], None);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("homeassistant.token_file"));
+    // With the token file: OK, plus the documented limits.
+    std::fs::write(e.path("ha.token"), "tok\n").unwrap();
+    std::fs::set_permissions(e.path("ha.token"), std::fs::Permissions::from_mode(0o400)).unwrap();
+    let o = e.run(&["check-config"], None);
+    ok(&o);
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(out.contains("channels: web, homeassistant"), "{out}");
+    assert!(
+        out.contains("255"),
+        "passphrase length limit is documented: {out}"
+    );
+    assert!(out.contains("transits Home Assistant"), "{out}");
+    // Plain http to a LAN host is refused by the validator.
+    let cfg = ha(&e.path("ha.token").display().to_string(), "")
+        .replace("https://ha.example.com", "http://homeassistant.local:8123");
+    std::fs::write(e.path("config.toml"), cfg).unwrap();
+    let o = e.run(&["check-config"], None);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("allow_insecure_http"));
+    // Web off: no [notify]/[approval] needed at all.
+    let only = format!(
+        "[daemon]\nstore = \"{d}/store.age\"\nsocket = \"{d}/s.sock\"\n\
+         admin_socket = \"{d}/a.sock\"\naudit_log = \"{d}/audit.jsonl\"\n\
+         [channels]\nenabled = [\"homeassistant\"]\n[homeassistant]\n\
+         url = \"https://ha.example.com\"\ntoken_file = \"{d}/ha.token\"\n\
+         notify_service = \"notify.mobile_app_phone\"\n\
+         passphrase_entity = \"input_text.secretd_passphrase\"\nowner_user_ids = [\"abc\"]\n",
+        d = e.dir.path().display()
+    );
+    std::fs::write(e.path("config.toml"), only).unwrap();
+    let o = e.run(&["check-config"], None);
+    ok(&o);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("Home Assistant at https://ha.example.com"));
+}
+
+#[test]
+fn check_config_named_pipes() {
+    // Needs a user that is not root to reason about; `nobody` exists on most systems.
+    let Some(nobody) = nix::unistd::User::from_name("nobody").ok().flatten() else {
+        eprintln!("no user 'nobody'; skipping");
+        return;
+    };
+    let (nuid, ngid) = (nobody.uid.as_raw(), nobody.gid.as_raw());
+    let e = Env::new();
+    let d = e.dir.path().display().to_string();
+    let base = std::fs::read_to_string(e.path("config.toml")).unwrap();
+    let cfg = |fifo: &str| {
+        base.replace("[daemon]\n", "[daemon]\nuser = \"nobody\"\n")
+            + &format!("\n[[fifo]]\npath = \"{d}/pipes/db\"\nsecret = \"db\"\n{fifo}\n")
+    };
+    let run = |text: String| {
+        std::fs::write(e.path("config.toml"), text).unwrap();
+        e.run(&["check-config"], None)
+    };
+    // Workable: the daemon owns the pipe (default owner) and may write it; the
+    // missing directory is only a warning.
+    let o = run(cfg(&format!(
+        "group = {ngid}\nmode = \"0640\"\nenforce_acl = true"
+    )));
+    ok(&o);
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(out.contains("OK: 1 named pipe(s)"), "{out}");
+    assert!(out.contains("does not exist"), "{out}");
+    // The daemon could never write a 0440 pipe.
+    let o = run(cfg(&format!("group = {ngid}\nmode = \"0440\"")));
+    assert!(!o.status.success());
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(out.contains("cannot open it for writing"), "{out}");
+    // A group the daemon user is not in cannot be applied without privilege.
+    let o = run(cfg("group = 4242\nmode = \"0640\""));
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("not a member of group 4242"));
+    // A different owner needs CAP_CHOWN.
+    let o = run(cfg(&format!(
+        "owner = {}\ngroup = {ngid}\nmode = \"0660\"",
+        nuid + 1
+    )));
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("cannot chown"));
+    // Config-level rules reach check-config too.
+    let o = run(cfg("group = 1\nmode = \"0644\""));
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("mode"));
+    // An existing symlink at the path is refused.
+    std::fs::create_dir_all(e.path("pipes")).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", e.path("pipes/db")).unwrap();
+    let o = run(cfg(&format!("group = {ngid}\nmode = \"0640\"")));
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("not a FIFO"));
+}
+
 // ------------------------------------------------------------ admin socket
 
 mod admin {

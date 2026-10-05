@@ -2,14 +2,11 @@
 //! arrives, pidfd liveness and the order of capture vs connection caps.
 mod common;
 use common::*;
-use secretd::peer::{PeerCred, PeerCredProvider, StaticPeerCred};
-use secretd::procinfo::{ProcInfo, ProcReader};
+use secretd::procinfo::{ProcInfo, ProcInfoReader};
 use serde_json::json;
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::net::UnixStream;
 
 #[tokio::test]
 async fn exec_between_accept_and_get_is_caught_at_request_time() {
@@ -65,10 +62,10 @@ async fn list_hides_names_from_a_changed_caller() {
 /// Counts `/proc` reads so tests can see that capture happens even for
 /// connections that are then refused by a cap.
 struct Counting {
-    inner: Arc<dyn ProcReader>,
+    inner: Arc<dyn ProcInfoReader>,
     reads: Arc<AtomicUsize>,
 }
-impl ProcReader for Counting {
+impl ProcInfoReader for Counting {
     fn read(&self, pid: u32) -> io::Result<ProcInfo> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read(pid)
@@ -99,60 +96,73 @@ async fn identity_is_captured_before_the_connection_cap_is_checked() {
     );
 }
 
-/// Provider that reports a pidfd for a given child process.
-struct WithPidfd {
-    base: StaticPeerCred,
-    fd: std::os::fd::RawFd,
-}
-impl PeerCredProvider for WithPidfd {
-    fn peer_cred(&self, s: &UnixStream) -> io::Result<PeerCred> {
-        self.base.peer_cred(s)
-    }
-    fn peer_pidfd(&self, _s: &UnixStream) -> Option<OwnedFd> {
-        // SAFETY: dup of a descriptor owned by the test for its whole duration.
-        let d = unsafe { libc::dup(self.fd) };
-        (d >= 0).then(|| unsafe { OwnedFd::from_raw_fd(d) })
-    }
-}
+/// pidfd liveness exists on Linux only (macOS has no pidfd; pid reuse there is
+/// caught by the start time, covered by the tests above).
+#[cfg(target_os = "linux")]
+mod pidfd {
+    use crate::common::*;
+    use secretd::peer::{PeerCred, PeerCredProvider, StaticPeerCred};
+    use serde_json::json;
+    use std::io;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::sync::Arc;
+    use tokio::net::UnixStream;
 
-#[tokio::test]
-async fn a_dead_pidfd_means_the_caller_changed() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    // SAFETY: plain syscall, result checked.
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
-    if raw < 0 {
-        eprintln!("pidfd_open unsupported; skipping");
-        let _ = child.kill();
-        let _ = child.wait();
-        return;
+    /// Provider that reports a pidfd for a given child process.
+    struct WithPidfd {
+        base: StaticPeerCred,
+        fd: std::os::fd::RawFd,
     }
-    let pid = child.id();
-    let procs = Arc::new(secretd::procinfo::StaticProcReader::new());
-    procs.set(pid, psql_proc());
-    let h = Harness::start(Opts {
-        peer: Some(Arc::new(WithPidfd {
-            base: StaticPeerCred::new(PeerCred {
-                uid: 1000,
-                gid: 100,
-                pid,
-            }),
-            fd: raw as i32,
-        })),
-        procs: Some(procs),
-        ..Opts::default()
-    })
-    .await;
-    let mut c = h.connect().await;
-    // Alive: ordinary request waits for the owner.
-    c.send("secret.get", json!({"name": "db-password"})).await;
-    let n = h.notifier.wait_for(1).await;
-    h.core.deny(&n[0].request_id, secretd::core::Source::Admin);
-    assert_eq!(err_kind(&c.recv().await.unwrap()), "DENIED");
-    // The process dies; /proc still (wrongly, as after pid reuse) looks the same.
-    child.kill().unwrap();
-    child.wait().unwrap();
-    assert_eq!(err_kind(&c.get("second").await), "CALLER_CHANGED");
+    impl PeerCredProvider for WithPidfd {
+        fn peer_cred(&self, s: &UnixStream) -> io::Result<PeerCred> {
+            self.base.peer_cred(s)
+        }
+        fn peer_pidfd(&self, _s: &UnixStream) -> Option<OwnedFd> {
+            // SAFETY: dup of a descriptor owned by the test for its whole duration.
+            let d = unsafe { libc::dup(self.fd) };
+            (d >= 0).then(|| unsafe { OwnedFd::from_raw_fd(d) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dead_pidfd_means_the_caller_changed() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        // SAFETY: plain syscall, result checked.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
+        if raw < 0 {
+            eprintln!("pidfd_open unsupported; skipping");
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        let pid = child.id();
+        let procs = Arc::new(secretd::procinfo::StaticProcReader::new());
+        procs.set(pid, psql_proc());
+        let h = Harness::start(Opts {
+            peer: Some(Arc::new(WithPidfd {
+                base: StaticPeerCred::new(PeerCred {
+                    uid: 1000,
+                    gid: 100,
+                    pid,
+                }),
+                fd: raw as i32,
+            })),
+            procs: Some(procs),
+            ..Opts::default()
+        })
+        .await;
+        let mut c = h.connect().await;
+        // Alive: ordinary request waits for the owner.
+        c.send("secret.get", json!({"name": "db-password"})).await;
+        let n = h.notifier.wait_for(1).await;
+        h.core.deny(&n[0].request_id, secretd::core::Source::Admin);
+        assert_eq!(err_kind(&c.recv().await.unwrap()), "DENIED");
+        // The process dies; /proc still (wrongly, as after pid reuse) looks the same.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(err_kind(&c.get("second").await), "CALLER_CHANGED");
+    }
 }

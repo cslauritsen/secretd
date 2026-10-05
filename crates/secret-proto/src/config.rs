@@ -22,10 +22,91 @@ struct RawConfig {
     daemon: DaemonCfg,
     #[serde(default)]
     limits: LimitsCfg,
-    notify: NotifyCfg,
-    approval: RawApproval,
+    #[serde(default)]
+    channels: Option<RawChannels>,
+    notify: Option<NotifyCfg>,
+    approval: Option<RawApproval>,
+    homeassistant: Option<RawHa>,
     #[serde(default, rename = "secret")]
     secrets: Vec<RawSecret>,
+    #[serde(default, rename = "fifo")]
+    fifos: Vec<RawFifo>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFifo {
+    path: PathBuf,
+    secret: String,
+    /// Owner of the pipe (default: the daemon user).
+    owner: Option<IdSpec>,
+    group: IdSpec,
+    /// Octal string, e.g. "0640". A TOML integer is refused on purpose (440 vs 0o440).
+    #[serde(default = "default_fifo_mode")]
+    mode: String,
+    #[serde(default)]
+    enforce_acl: bool,
+    #[serde(default = "default_fifo_attempts")]
+    attempts_per_min: usize,
+    #[serde(default = "default_fifo_cooldown")]
+    cooldown_secs: u64,
+    #[serde(default = "default_fifo_deadline")]
+    write_deadline_secs: u64,
+}
+
+fn default_fifo_mode() -> String {
+    "0640".into()
+}
+fn default_fifo_attempts() -> usize {
+    10
+}
+fn default_fifo_cooldown() -> u64 {
+    5
+}
+fn default_fifo_deadline() -> u64 {
+    5
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawChannels {
+    enabled: Vec<ChannelKind>,
+}
+
+/// An approval channel (spec section 19.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelKind {
+    /// Push notification plus the OIDC-protected approval page.
+    Web,
+    /// The root-only admin socket (`secretctl approve|deny`).
+    Admin,
+    /// Home Assistant (notification actions and a passphrase entity).
+    HomeAssistant,
+}
+
+impl ChannelKind {
+    /// The name used in the configuration and in the audit log `channel` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChannelKind::Web => "web",
+            ChannelKind::Admin => "admin",
+            ChannelKind::HomeAssistant => "homeassistant",
+        }
+    }
+}
+
+/// Which channels are enabled. Without a `[channels]` table: `web` and `admin`
+/// (the behaviour before channels existed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelsCfg {
+    pub enabled: Vec<ChannelKind>,
+}
+
+impl ChannelsCfg {
+    pub fn has(&self, k: ChannelKind) -> bool {
+        self.enabled.contains(&k)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +167,36 @@ struct RawOidc {
     session_ttl_secs: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHa {
+    url: String,
+    token_file: PathBuf,
+    notify_service: String,
+    passphrase_entity: String,
+    #[serde(default)]
+    owner_user_ids: Vec<String>,
+    #[serde(default)]
+    allow_insecure_http: bool,
+    ca_file: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    ha_require_user_id: bool,
+    #[serde(default = "default_ha_backoff_min")]
+    backoff_min_ms: u64,
+    #[serde(default = "default_ha_backoff_max")]
+    backoff_max_ms: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_ha_backoff_min() -> u64 {
+    1000
+}
+fn default_ha_backoff_max() -> u64 {
+    60_000
+}
+
 fn default_listen() -> String {
     "127.0.0.1:8443".into()
 }
@@ -140,9 +251,9 @@ impl Default for DaemonCfg {
     fn default() -> Self {
         DaemonCfg {
             user: "secretd".into(),
-            socket: "/run/secretd/secretd.sock".into(),
-            admin_socket: "/run/secretd/admin.sock".into(),
-            store: "/var/lib/secretd/store.age".into(),
+            socket: crate::DEFAULT_SOCKET.into(),
+            admin_socket: crate::DEFAULT_ADMIN_SOCKET.into(),
+            store: crate::DEFAULT_STORE.into(),
             audit_log: "/var/log/secretd/audit.jsonl".into(),
             request_timeout_secs: 300,
             socket_mode: 0o660,
@@ -314,6 +425,53 @@ pub struct ApprovalCfg {
     pub oidc: OidcCfg,
 }
 
+/// Home Assistant channel settings (spec section 19.2).
+#[derive(Debug, Clone)]
+pub struct HaCfg {
+    /// Base URL as configured, without a trailing slash.
+    pub url: String,
+    /// `ws://` or `wss://` URL of the WebSocket API (`<url>/api/websocket`).
+    pub ws_url: String,
+    /// File with the long-lived access token (never inline).
+    pub token_file: PathBuf,
+    /// `notify.<service>` that reaches the owner's phone.
+    pub notify_service: String,
+    /// `input_text.<name>`: where the owner types the store passphrase.
+    pub passphrase_entity: String,
+    /// HA user ids whose notification actions are accepted.
+    pub owner_user_ids: Vec<String>,
+    pub allow_insecure_http: bool,
+    /// Optional CA certificate (PEM) that pins the trust anchor for `https`.
+    pub ca_file: Option<PathBuf>,
+    /// Require `context.user_id` on action events (default). `false` is the
+    /// documented opt-out (`ha_require_user_id = false`).
+    pub require_user_id: bool,
+    /// Reconnect backoff bounds in milliseconds (default 1 s up to 60 s).
+    pub backoff_min_ms: u64,
+    pub backoff_max_ms: u64,
+}
+
+/// A named-pipe secret (spec section 20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FifoCfg {
+    pub path: PathBuf,
+    /// Name of the secret released through this pipe (exists in `[[secret]]`).
+    pub secret: String,
+    /// `None`: the daemon user (the pipe is then not chown'ed).
+    pub owner: Option<u32>,
+    pub gid: u32,
+    /// Permission bits (octal), at most `0660`.
+    pub mode: u32,
+    /// Require the single identified reader to satisfy the secret's ACL.
+    pub enforce_acl: bool,
+    /// Reader detections per minute before further ones are refused.
+    pub attempts_per_min: usize,
+    /// Seconds to wait after a request ends before the pipe is armed again.
+    pub cooldown_secs: u64,
+    /// Seconds allowed to push the value into the pipe.
+    pub write_deadline_secs: u64,
+}
+
 /// A secret's name, description and resolved ACL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretAcl {
@@ -329,8 +487,14 @@ pub struct SecretAcl {
 pub struct Config {
     pub daemon: DaemonCfg,
     pub limits: LimitsCfg,
-    pub notify: NotifyCfg,
-    pub approval: ApprovalCfg,
+    pub channels: ChannelsCfg,
+    /// Push notification settings; present exactly when `web` is enabled.
+    pub notify: Option<NotifyCfg>,
+    /// Approval endpoint and OIDC settings; present exactly when `web` is enabled.
+    pub approval: Option<ApprovalCfg>,
+    /// Home Assistant settings; present exactly when `homeassistant` is enabled.
+    pub homeassistant: Option<HaCfg>,
+    pub fifos: Vec<FifoCfg>,
     pub secrets: Vec<SecretAcl>,
     /// Non-fatal findings from validation.
     pub warnings: Vec<String>,
@@ -410,111 +574,55 @@ impl Config {
             return err("limits must be non-zero");
         }
 
-        // notify
-        let n = &raw.notify;
-        if !(n.url.starts_with("https://") || n.url.starts_with("http://")) {
-            return err("notify.url must be an http(s) URL");
-        }
-        if n.url.starts_with("http://") {
-            warnings.push("notify.url uses plain http".into());
-        }
-        if n.attempts == 0 {
-            return err("notify.attempts must be >= 1");
-        }
-        if n.kind == NotifyKind::Ntfy && n.hmac_secret_file.is_some() {
-            warnings.push("notify.hmac_secret_file is ignored for kind = \"ntfy\"".into());
-        }
-        if n.kind == NotifyKind::Webhook && n.auth_token_file.is_some() {
-            warnings.push("notify.auth_token_file is ignored for kind = \"webhook\"".into());
-        }
-
-        // approval
-        let a = &raw.approval;
-        let listen: SocketAddr = a
-            .listen
-            .parse()
-            .map_err(|_| ConfigError(format!("approval.listen {:?} is not host:port", a.listen)))?;
-        if !listen.ip().is_loopback() {
-            if !a.allow_non_loopback {
-                return err(format!(
-                    "approval.listen {listen} is not a loopback address; \
-                     set approval.allow_non_loopback = true to allow it"
-                ));
-            }
-            warnings.push(format!(
-                "approval.listen {listen} is not loopback: ensure only the TLS reverse proxy can reach it"
-            ));
-        }
-        let ext = url::Url::parse(&a.external_url)
-            .map_err(|_| ConfigError("approval.external_url is not a valid URL".into()))?;
-        if ext.scheme() != "https" {
-            return err("approval.external_url must be an https:// URL");
-        }
-        let host = ext
-            .host_str()
-            .ok_or_else(|| ConfigError("approval.external_url has no host".into()))?;
-        if ext.path() != "/" && !ext.path().is_empty() || ext.query().is_some() {
-            return err("approval.external_url must not contain a path or query");
-        }
-        let external_host = match ext.port() {
-            Some(p) => format!("{host}:{p}"),
-            None => host.to_string(),
+        // channels
+        let enabled = match &raw.channels {
+            Some(c) => c.enabled.clone(),
+            None => vec![ChannelKind::Web, ChannelKind::Admin],
         };
-        let external_url = format!("https://{external_host}");
-        let trusted_proxies = a
-            .trusted_proxies
-            .iter()
-            .map(|s| Cidr::parse(s))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        if a.max_connections == 0
-            || a.header_read_timeout_secs == 0
-            || a.request_timeout_secs == 0
-            || a.max_login_starts_per_min == 0
-        {
-            return err("approval connection limits and timeouts must be non-zero");
+        if enabled.is_empty() {
+            return err("channels.enabled is empty: at least one approval channel must be enabled");
         }
-
-        let o = &a.oidc;
-        let issuer = url::Url::parse(&o.issuer)
-            .map_err(|_| ConfigError("approval.oidc.issuer is not a valid URL".into()))?;
-        match issuer.scheme() {
-            "https" => {}
-            // Plain http is tolerated only towards this machine (local mock
-            // providers); a network issuer over http would let anyone on the
-            // path forge the discovery document and the signing keys.
-            "http" if issuer_is_loopback(&issuer) => warnings.push(
-                "approval.oidc.issuer uses plain http (loopback only; for local testing)".into(),
-            ),
-            _ => return err("approval.oidc.issuer must be an https:// URL"),
-        }
-        if o.client_id.trim().is_empty() {
-            return err("approval.oidc.client_id is empty");
-        }
-        if o.owner_emails.is_empty() || o.owner_emails.iter().any(|e| !e.contains('@')) {
-            return err("approval.oidc.owner_emails must list at least one email address");
-        }
-        if o.session_ttl_secs == 0 {
-            return err("approval.oidc.session_ttl_secs must be > 0");
-        }
-        let redirect_url = match &o.redirect_url {
-            Some(r) => {
-                let u = url::Url::parse(r)
-                    .map_err(|_| ConfigError("approval.oidc.redirect_url is invalid".into()))?;
-                if u.scheme() != "https" {
-                    return err("approval.oidc.redirect_url must be https");
-                }
-                r.clone()
+        for (i, k) in enabled.iter().enumerate() {
+            if enabled[..i].contains(k) {
+                return err(format!("channels.enabled lists {:?} twice", k.as_str()));
             }
-            None => format!("{external_url}/auth/callback"),
+        }
+        let channels = ChannelsCfg { enabled };
+        let web = channels.has(ChannelKind::Web);
+        if web && (raw.notify.is_none() || raw.approval.is_none()) {
+            return err(
+                "channel \"web\" is enabled but [notify], [approval] and [approval.oidc] are \
+                 not all configured",
+            );
+        }
+        if !web && (raw.notify.is_some() || raw.approval.is_some()) {
+            warnings.push(
+                "[notify]/[approval] are configured but the \"web\" channel is not enabled; \
+                 they are ignored"
+                    .into(),
+            );
+        }
+
+        let ha_on = channels.has(ChannelKind::HomeAssistant);
+        if ha_on && raw.homeassistant.is_none() {
+            return err(
+                "channel \"homeassistant\" is enabled but [homeassistant] is not configured",
+            );
+        }
+        if !ha_on && raw.homeassistant.is_some() {
+            warnings.push(
+                "[homeassistant] is configured but the \"homeassistant\" channel is not enabled; \
+                 it is ignored"
+                    .into(),
+            );
+        }
+        let homeassistant = match (ha_on, &raw.homeassistant) {
+            (true, Some(h)) => Some(parse_ha(h, &mut warnings)?),
+            _ => None,
         };
-        let oidc = OidcCfg {
-            issuer: o.issuer.clone(),
-            client_id: o.client_id.clone(),
-            client_secret_file: o.client_secret_file.clone(),
-            redirect_url,
-            owner_emails: o.owner_emails.iter().map(|e| e.to_lowercase()).collect(),
-            session_ttl_secs: o.session_ttl_secs,
+        let (notify, approval) = match (web, &raw.notify, &raw.approval) {
+            (true, Some(n), Some(a)) => (Some(n.clone()), Some(parse_web(n, a, &mut warnings)?)),
+            _ => (None, None),
         };
 
         // secrets
@@ -599,24 +707,46 @@ impl Config {
             });
         }
 
+        // fifos
+        let mut fifos: Vec<FifoCfg> = Vec::new();
+        for f in &raw.fifos {
+            let id = |spec: &IdSpec, user: bool| -> Result<u32, ConfigError> {
+                match spec {
+                    IdSpec::Num(n) => Ok(*n),
+                    IdSpec::Name(nm) => (if user {
+                        resolver.uid(nm)
+                    } else {
+                        resolver.gid(nm)
+                    })
+                    .ok_or_else(|| {
+                        ConfigError(format!(
+                            "fifo {}: unknown {} {nm:?}",
+                            f.path.display(),
+                            if user { "user" } else { "group" }
+                        ))
+                    }),
+                }
+            };
+            fifos.push(parse_fifo(
+                f,
+                &secrets,
+                &fifos,
+                &raw.daemon,
+                id(&f.group, false)?,
+                f.owner.as_ref().map(|o| id(o, true)).transpose()?,
+                &mut warnings,
+            )?);
+        }
+
         Ok(Config {
             daemon: raw.daemon,
             limits: raw.limits,
-            notify: raw.notify,
-            approval: ApprovalCfg {
-                listen,
-                external_url,
-                external_host,
-                trusted_proxies,
-                allow_non_loopback: a.allow_non_loopback,
-                max_failed_attempts_per_min: a.max_failed_attempts_per_min,
-                max_login_starts_per_min: a.max_login_starts_per_min,
-                max_connections: a.max_connections,
-                header_read_timeout_secs: a.header_read_timeout_secs,
-                request_timeout_secs: a.request_timeout_secs,
-                oidc,
-            },
+            channels,
+            homeassistant,
+            notify,
+            approval,
             secrets,
+            fifos,
             warnings,
         })
     }
@@ -657,6 +787,333 @@ impl Config {
     pub fn secret(&self, name: &str) -> Option<&SecretAcl> {
         self.secrets.iter().find(|s| s.name == name)
     }
+}
+
+/// Validate the `[notify]` and `[approval]` tables (the `web` channel).
+fn parse_web(
+    n: &NotifyCfg,
+    a: &RawApproval,
+    warnings: &mut Vec<String>,
+) -> Result<ApprovalCfg, ConfigError> {
+    if !(n.url.starts_with("https://") || n.url.starts_with("http://")) {
+        return err("notify.url must be an http(s) URL");
+    }
+    if n.url.starts_with("http://") {
+        warnings.push("notify.url uses plain http".into());
+    }
+    if n.attempts == 0 {
+        return err("notify.attempts must be >= 1");
+    }
+    if n.kind == NotifyKind::Ntfy && n.hmac_secret_file.is_some() {
+        warnings.push("notify.hmac_secret_file is ignored for kind = \"ntfy\"".into());
+    }
+    if n.kind == NotifyKind::Webhook && n.auth_token_file.is_some() {
+        warnings.push("notify.auth_token_file is ignored for kind = \"webhook\"".into());
+    }
+
+    // approval
+    let listen: SocketAddr = a
+        .listen
+        .parse()
+        .map_err(|_| ConfigError(format!("approval.listen {:?} is not host:port", a.listen)))?;
+    if !listen.ip().is_loopback() {
+        if !a.allow_non_loopback {
+            return err(format!(
+                "approval.listen {listen} is not a loopback address; \
+                     set approval.allow_non_loopback = true to allow it"
+            ));
+        }
+        warnings.push(format!(
+                "approval.listen {listen} is not loopback: ensure only the TLS reverse proxy can reach it"
+            ));
+    }
+    let ext = url::Url::parse(&a.external_url)
+        .map_err(|_| ConfigError("approval.external_url is not a valid URL".into()))?;
+    if ext.scheme() != "https" {
+        return err("approval.external_url must be an https:// URL");
+    }
+    let host = ext
+        .host_str()
+        .ok_or_else(|| ConfigError("approval.external_url has no host".into()))?;
+    if ext.path() != "/" && !ext.path().is_empty() || ext.query().is_some() {
+        return err("approval.external_url must not contain a path or query");
+    }
+    let external_host = match ext.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    };
+    let external_url = format!("https://{external_host}");
+    let trusted_proxies = a
+        .trusted_proxies
+        .iter()
+        .map(|s| Cidr::parse(s))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if a.max_connections == 0
+        || a.header_read_timeout_secs == 0
+        || a.request_timeout_secs == 0
+        || a.max_login_starts_per_min == 0
+    {
+        return err("approval connection limits and timeouts must be non-zero");
+    }
+
+    let o = &a.oidc;
+    let issuer = url::Url::parse(&o.issuer)
+        .map_err(|_| ConfigError("approval.oidc.issuer is not a valid URL".into()))?;
+    match issuer.scheme() {
+        "https" => {}
+        // Plain http is tolerated only towards this machine (local mock
+        // providers); a network issuer over http would let anyone on the
+        // path forge the discovery document and the signing keys.
+        "http" if issuer_is_loopback(&issuer) => warnings
+            .push("approval.oidc.issuer uses plain http (loopback only; for local testing)".into()),
+        _ => return err("approval.oidc.issuer must be an https:// URL"),
+    }
+    if o.client_id.trim().is_empty() {
+        return err("approval.oidc.client_id is empty");
+    }
+    if o.owner_emails.is_empty() || o.owner_emails.iter().any(|e| !e.contains('@')) {
+        return err("approval.oidc.owner_emails must list at least one email address");
+    }
+    if o.session_ttl_secs == 0 {
+        return err("approval.oidc.session_ttl_secs must be > 0");
+    }
+    let redirect_url = match &o.redirect_url {
+        Some(r) => {
+            let u = url::Url::parse(r)
+                .map_err(|_| ConfigError("approval.oidc.redirect_url is invalid".into()))?;
+            if u.scheme() != "https" {
+                return err("approval.oidc.redirect_url must be https");
+            }
+            r.clone()
+        }
+        None => format!("{external_url}/auth/callback"),
+    };
+    let oidc = OidcCfg {
+        issuer: o.issuer.clone(),
+        client_id: o.client_id.clone(),
+        client_secret_file: o.client_secret_file.clone(),
+        redirect_url,
+        owner_emails: o.owner_emails.iter().map(|e| e.to_lowercase()).collect(),
+        session_ttl_secs: o.session_ttl_secs,
+    };
+
+    Ok(ApprovalCfg {
+        listen,
+        external_url,
+        external_host,
+        trusted_proxies,
+        allow_non_loopback: a.allow_non_loopback,
+        max_failed_attempts_per_min: a.max_failed_attempts_per_min,
+        max_login_starts_per_min: a.max_login_starts_per_min,
+        max_connections: a.max_connections,
+        header_read_timeout_secs: a.header_read_timeout_secs,
+        request_timeout_secs: a.request_timeout_secs,
+        oidc,
+    })
+}
+
+/// Validate `[homeassistant]` (spec section 19.2, 19.4).
+fn parse_ha(h: &RawHa, warnings: &mut Vec<String>) -> Result<HaCfg, ConfigError> {
+    let u = url::Url::parse(&h.url)
+        .map_err(|_| ConfigError("homeassistant.url is not a valid URL".into()))?;
+    let secure = match u.scheme() {
+        "https" => true,
+        "http" => false,
+        _ => return err("homeassistant.url must be an http:// or https:// URL"),
+    };
+    if u.host_str().is_none() {
+        return err("homeassistant.url has no host");
+    }
+    if u.query().is_some() || u.fragment().is_some() {
+        return err("homeassistant.url must not contain a query or fragment");
+    }
+    if !secure {
+        // The long-lived token (and the passphrase) travel over this connection.
+        let loopback = match u.host() {
+            Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        };
+        if !loopback {
+            if !h.allow_insecure_http {
+                return err(
+                    "homeassistant.url is plain http to a non-loopback host: the access token \
+                     and the passphrase would cross the network unencrypted. Use https:// or set \
+                     homeassistant.allow_insecure_http = true",
+                );
+            }
+            warnings.push(
+                "homeassistant.url uses plain http (allow_insecure_http = true): the access token \
+                 and the store passphrase travel unencrypted; acceptable only on a trusted LAN"
+                    .into(),
+            );
+        }
+        if h.ca_file.is_some() {
+            warnings.push("homeassistant.ca_file is ignored for an http:// url".into());
+        }
+    }
+    let service_ok = |s: &str, domain: &str| {
+        s.strip_prefix(domain)
+            .and_then(|r| r.strip_prefix('.'))
+            .is_some_and(|n| {
+                !n.is_empty()
+                    && n.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+    };
+    if !service_ok(&h.notify_service, "notify") {
+        return err("homeassistant.notify_service must look like notify.mobile_app_<device>");
+    }
+    if !service_ok(&h.passphrase_entity, "input_text") {
+        return err("homeassistant.passphrase_entity must look like input_text.<name>");
+    }
+    if h.owner_user_ids
+        .iter()
+        .any(|i| i.trim().is_empty() || i.chars().any(char::is_whitespace))
+    {
+        return err("homeassistant.owner_user_ids entries must be non-empty ids without spaces");
+    }
+    if h.owner_user_ids.is_empty() && h.ha_require_user_id {
+        return err(
+            "homeassistant.owner_user_ids is empty: list the HA user id(s) allowed to approve",
+        );
+    }
+    if !h.ha_require_user_id {
+        warnings.push(
+            "homeassistant.ha_require_user_id = false: action events without a user id are \
+             accepted; only the per-request token protects approvals from other HA users"
+                .into(),
+        );
+        if h.owner_user_ids.is_empty() {
+            warnings.push(
+                "homeassistant.owner_user_ids is empty: any event carrying the token is accepted"
+                    .into(),
+            );
+        }
+    }
+    if h.backoff_min_ms == 0 || h.backoff_max_ms < h.backoff_min_ms {
+        return err("homeassistant.backoff_min_ms must be > 0 and <= backoff_max_ms");
+    }
+    let base = h.url.trim_end_matches('/').to_string();
+    let ws_url = format!(
+        "{}{}/api/websocket",
+        if secure { "wss" } else { "ws" },
+        &base[base.find("://").unwrap_or(0)..]
+    );
+    Ok(HaCfg {
+        url: base,
+        ws_url,
+        token_file: h.token_file.clone(),
+        notify_service: h.notify_service.clone(),
+        passphrase_entity: h.passphrase_entity.clone(),
+        owner_user_ids: h.owner_user_ids.clone(),
+        allow_insecure_http: h.allow_insecure_http,
+        ca_file: h.ca_file.clone(),
+        require_user_id: h.ha_require_user_id,
+        backoff_min_ms: h.backoff_min_ms,
+        backoff_max_ms: h.backoff_max_ms,
+    })
+}
+
+/// Validate one `[[fifo]]` entry (spec section 20.1).
+fn parse_fifo(
+    f: &RawFifo,
+    secrets: &[SecretAcl],
+    done: &[FifoCfg],
+    daemon: &DaemonCfg,
+    gid: u32,
+    owner: Option<u32>,
+    warnings: &mut Vec<String>,
+) -> Result<FifoCfg, ConfigError> {
+    let label = f.path.display().to_string();
+    if !f.path.is_absolute() {
+        return err(format!("fifo path {label} must be absolute"));
+    }
+    if f.path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) || f.path.file_name().is_none()
+        || label.ends_with('/')
+    {
+        return err(format!(
+            "fifo path {label} must be a normalised file path (no `.`, `..` or trailing `/`)"
+        ));
+    }
+    if done.iter().any(|d| d.path == f.path) {
+        return err(format!("fifo path {label} is configured twice"));
+    }
+    for (n, p) in [
+        ("socket", &daemon.socket),
+        ("admin_socket", &daemon.admin_socket),
+        ("store", &daemon.store),
+        ("audit_log", &daemon.audit_log),
+    ] {
+        if *p == f.path {
+            return err(format!("fifo path {label} is the same as daemon.{n}"));
+        }
+    }
+    if !secrets.iter().any(|s| s.name == f.secret) {
+        return err(format!(
+            "fifo {label}: secret {:?} is not defined in [[secret]]",
+            f.secret
+        ));
+    }
+    let mode = f
+        .mode
+        .strip_prefix('0')
+        .filter(|m| !m.is_empty() && m.bytes().all(|b| (b'0'..=b'7').contains(&b)))
+        .and_then(|m| u32::from_str_radix(m, 8).ok())
+        .ok_or_else(|| {
+            ConfigError(format!(
+                "fifo {label}: mode {:?} must be an octal string such as \"0640\"",
+                f.mode
+            ))
+        })?;
+    if mode & !0o660 != 0 {
+        return err(format!(
+            "fifo {label}: mode {:04o} grants access beyond owner/group read-write (max 0660, \
+             no `other`, setuid, setgid or sticky bits)",
+            mode
+        ));
+    }
+    if mode & 0o440 == 0 {
+        return err(format!(
+            "fifo {label}: mode {mode:04o} lets nobody read the pipe"
+        ));
+    }
+    if mode & 0o220 != 0 {
+        warnings.push(format!(
+            "fifo {label}: mode {mode:04o} lets its owner/group write to the pipe as well as the \
+             daemon; any process they run may feed the reader data of its own"
+        ));
+    }
+    if f.attempts_per_min == 0 {
+        return err(format!("fifo {label}: attempts_per_min must be > 0"));
+    }
+    if f.write_deadline_secs == 0 {
+        return err(format!("fifo {label}: write_deadline_secs must be > 0"));
+    }
+    if !f.enforce_acl {
+        warnings.push(format!(
+            "fifo {label}: enforce_acl = false: the pipe's owner/group/mode is the only gate and \
+             no executable is pinned; the reader identity shown to the owner is best effort"
+        ));
+    }
+    Ok(FifoCfg {
+        path: f.path.clone(),
+        secret: f.secret.clone(),
+        owner,
+        gid,
+        mode,
+        enforce_acl: f.enforce_acl,
+        attempts_per_min: f.attempts_per_min,
+        cooldown_secs: f.cooldown_secs,
+        write_deadline_secs: f.write_deadline_secs,
+    })
 }
 
 fn issuer_is_loopback(u: &url::Url) -> bool {
@@ -742,16 +1199,25 @@ owner_emails = ["Owner@Example.com"]
     #[test]
     fn defaults() {
         let c = parse("").unwrap();
-        assert_eq!(c.approval.listen.to_string(), "127.0.0.1:8443");
-        assert_eq!(c.approval.external_host, "secretd.example.com");
         assert_eq!(
-            c.approval.oidc.redirect_url,
+            c.approval.as_ref().unwrap().listen.to_string(),
+            "127.0.0.1:8443"
+        );
+        assert_eq!(
+            c.approval.as_ref().unwrap().external_host,
+            "secretd.example.com"
+        );
+        assert_eq!(
+            c.approval.as_ref().unwrap().oidc.redirect_url,
             "https://secretd.example.com/auth/callback"
         );
-        assert_eq!(c.approval.oidc.owner_emails, vec!["owner@example.com"]);
+        assert_eq!(
+            c.approval.as_ref().unwrap().oidc.owner_emails,
+            vec!["owner@example.com"]
+        );
         assert_eq!(c.limits.max_pending_per_uid, 3);
         assert_eq!(c.daemon.request_timeout_secs, 300);
-        assert_eq!(c.approval.trusted_proxies.len(), 2);
+        assert_eq!(c.approval.as_ref().unwrap().trusted_proxies.len(), 2);
     }
 
     #[test]
@@ -821,7 +1287,10 @@ owner_emails = ["Owner@Example.com"]
         assert!(Config::parse(&b, &R).is_err());
         let b = BASE.replace("https://secretd.example.com", "https://x.example.com:8444/");
         let c = Config::parse(&b, &R).unwrap();
-        assert_eq!(c.approval.external_host, "x.example.com:8444");
+        assert_eq!(
+            c.approval.as_ref().unwrap().external_host,
+            "x.example.com:8444"
+        );
         let b = BASE.replace("https://secretd.example.com", "https://x.example.com/sub");
         assert!(Config::parse(&b, &R).is_err());
     }
@@ -897,13 +1366,214 @@ owner_emails = ["Owner@Example.com"]
     }
 
     #[test]
+    fn channels_default_and_rules() {
+        let c = parse("").unwrap();
+        assert_eq!(
+            c.channels.enabled,
+            vec![ChannelKind::Web, ChannelKind::Admin]
+        );
+        let with = |ch: &str| Config::parse(&format!("{BASE}\n[channels]\nenabled = {ch}\n"), &R);
+        // Explicit subset, web off: [notify]/[approval] are ignored with a warning.
+        let c = with("[\"admin\"]").unwrap();
+        assert!(c.notify.is_none() && c.approval.is_none());
+        assert!(c.warnings.iter().any(|w| w.contains("ignored")));
+        // At least one approval channel.
+        assert!(with("[]").unwrap_err().0.contains("at least one"));
+        assert!(with("[\"web\", \"web\"]").unwrap_err().0.contains("twice"));
+        assert!(with("[\"carrier-pigeon\"]").is_err());
+        // Web needs its tables.
+        let no_web = "[channels]\nenabled = [\"web\"]\n";
+        let e = Config::parse(no_web, &R).unwrap_err();
+        assert!(e.0.contains("web"), "{e}");
+        // Admin only, no [notify]/[approval] at all: valid.
+        let c = Config::parse("[channels]\nenabled = [\"admin\"]\n", &R).unwrap();
+        assert_eq!(c.channels.enabled, vec![ChannelKind::Admin]);
+        assert_eq!(ChannelKind::HomeAssistant.as_str(), "homeassistant");
+    }
+
+    #[test]
+    fn homeassistant_rules() {
+        let ha = |extra: &str| {
+            Config::parse(
+                &format!(
+                    "{BASE}\n[channels]\nenabled = [\"homeassistant\"]\n[homeassistant]\n\
+                     token_file = \"/etc/secretd/ha.token\"\n\
+                     notify_service = \"notify.mobile_app_owner_phone\"\n\
+                     passphrase_entity = \"input_text.secretd_passphrase\"\n\
+                     owner_user_ids = [\"abc123\"]\n{extra}\n"
+                ),
+                &R,
+            )
+        };
+        let url = |u: &str, extra: &str| ha(&format!("url = \"{u}\"\n{extra}"));
+        // https is fine; the WebSocket URL is derived.
+        let c = url("https://ha.example.com:8123/", "").unwrap();
+        let h = c.homeassistant.unwrap();
+        assert_eq!(h.ws_url, "wss://ha.example.com:8123/api/websocket");
+        assert!(
+            c.approval.is_none() && c.notify.is_none(),
+            "HA-only needs no web"
+        );
+        // Plain http: refused off-loopback unless opted in (then a warning).
+        let e = url("http://homeassistant.local:8123", "").unwrap_err();
+        assert!(e.0.contains("allow_insecure_http"), "{e}");
+        let c = url(
+            "http://homeassistant.local:8123",
+            "allow_insecure_http = true",
+        )
+        .unwrap();
+        assert!(c.warnings.iter().any(|w| w.contains("unencrypted")));
+        assert_eq!(
+            c.homeassistant.unwrap().ws_url,
+            "ws://homeassistant.local:8123/api/websocket"
+        );
+        // Loopback http needs no opt-in and no warning.
+        for l in [
+            "http://127.0.0.1:8123",
+            "http://localhost:8123",
+            "http://[::1]:8123",
+        ] {
+            let c = url(l, "").unwrap();
+            assert!(!c.warnings.iter().any(|w| w.contains("unencrypted")), "{l}");
+        }
+        assert!(url("http://127.0.0.1.evil.example", "").is_err());
+        assert!(url("ftp://ha", "").is_err());
+        // Shape of the service and entity names.
+        let bad = |k: &str, v: &str| {
+            Config::parse(
+                &format!(
+                    "{BASE}\n[channels]\nenabled = [\"homeassistant\"]\n[homeassistant]\n\
+                     url = \"https://ha\"\ntoken_file = \"/t\"\nowner_user_ids = [\"a\"]\n\
+                     notify_service = \"{}\"\npassphrase_entity = \"{}\"\n",
+                    if k == "svc" { v } else { "notify.mobile_app_x" },
+                    if k == "ent" { v } else { "input_text.p" }
+                ),
+                &R,
+            )
+        };
+        assert!(bad("svc", "light.turn_on").is_err());
+        assert!(bad("ent", "sensor.x").is_err());
+        assert!(bad("ent", "input_text.p").is_ok());
+        // owner_user_ids is mandatory unless the user-id requirement is opted out.
+        let no_ids = |extra: &str| {
+            Config::parse(
+                &format!(
+                    "{BASE}\n[channels]\nenabled = [\"homeassistant\"]\n[homeassistant]\n\
+                     url = \"https://ha\"\ntoken_file = \"/t\"\n\
+                     notify_service = \"notify.mobile_app_x\"\n\
+                     passphrase_entity = \"input_text.p\"\n{extra}\n"
+                ),
+                &R,
+            )
+        };
+        assert!(no_ids("").is_err());
+        let c = no_ids("ha_require_user_id = false").unwrap();
+        assert!(c.warnings.iter().any(|w| w.contains("ha_require_user_id")));
+        assert!(!c.homeassistant.unwrap().require_user_id);
+        // Enabled without the table, and the table without the channel.
+        assert!(Config::parse(
+            &format!("{BASE}\n[channels]\nenabled = [\"homeassistant\"]\n"),
+            &R
+        )
+        .is_err());
+        let c = Config::parse(
+            &format!(
+                "{BASE}\n[homeassistant]\nurl = \"https://ha\"\ntoken_file = \"/t\"\n\
+                 notify_service = \"notify.x\"\npassphrase_entity = \"input_text.p\"\n"
+            ),
+            &R,
+        )
+        .unwrap();
+        assert!(c.homeassistant.is_none());
+        assert!(c.warnings.iter().any(|w| w.contains("homeassistant")));
+    }
+
+    #[test]
+    fn fifo_rules() {
+        let fifo = |body: &str| {
+            Config::parse(
+                &format!(
+                    "{BASE}\n[[secret]]\nname='db'\nallow_uids=[1000]\nallow_exes=['/x']\n\
+                     [[fifo]]\npath = \"/run/secretd/pipes/db\"\nsecret = \"db\"\n\
+                     group = \"devs\"\n{body}\n"
+                ),
+                &R,
+            )
+        };
+        let c = fifo("").unwrap();
+        let f = &c.fifos[0];
+        assert_eq!((f.gid, f.owner, f.mode), (100, None, 0o640));
+        assert!(!f.enforce_acl);
+        assert_eq!(
+            (f.attempts_per_min, f.cooldown_secs, f.write_deadline_secs),
+            (10, 5, 5)
+        );
+        assert!(c.warnings.iter().any(|w| w.contains("enforce_acl = false")));
+        let c = fifo("owner = \"alice\"\nmode = \"0460\"\nenforce_acl = true").unwrap();
+        assert_eq!((c.fifos[0].owner, c.fifos[0].mode), (Some(1000), 0o460));
+        assert!(!c.warnings.iter().any(|w| w.contains("enforce_acl = false")));
+        // Modes: octal strings only, nothing for `other`, nobody unable to read.
+        for bad in [
+            "\"0644\"", "\"0666\"", "\"4640\"", "\"0200\"", "\"640\"", "\"0x40\"", "\"0480\"",
+            "440",
+        ] {
+            assert!(fifo(&format!("mode = {bad}")).is_err(), "{bad}");
+        }
+        assert!(fifo("mode = \"0440\"").is_ok());
+        assert!(fifo("mode = \"0660\"")
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|w| w.contains("write")));
+        // Secret must exist, names must resolve, paths must be sane and unique.
+        let raw = |path: &str, secret: &str, extra: &str| {
+            Config::parse(
+                &format!(
+                    "{BASE}\n[[secret]]\nname='db'\nallow_uids=[1000]\nallow_exes=['/x']\n\
+                     [[fifo]]\npath = \"{path}\"\nsecret = \"{secret}\"\ngroup = 100\n{extra}\n"
+                ),
+                &R,
+            )
+        };
+        assert!(raw("/p/a", "db", "").is_ok());
+        assert!(raw("/p/a", "missing", "")
+            .unwrap_err()
+            .0
+            .contains("not defined"));
+        assert!(raw("rel/p", "db", "").is_err());
+        assert!(raw("/p/../a", "db", "").is_err());
+        assert!(raw("/p/a/", "db", "").is_err());
+        assert!(raw("/p/a", "db", "owner = \"bob\"").is_err());
+        assert!(raw("/p/a", "db", "attempts_per_min = 0").is_err());
+        assert!(raw("/p/a", "db", "write_deadline_secs = 0").is_err());
+        assert!(raw("/p/a", "db", "cooldown_secs = 0").is_ok());
+        assert!(raw("/var/lib/secretd/store.age", "db", "").is_err());
+        // Two pipes may serve the same secret; the same path twice is an error.
+        let two = |p2: &str| {
+            Config::parse(
+                &format!(
+                    "{BASE}\n[[secret]]\nname='db'\nallow_uids=[1000]\nallow_exes=['/x']\n\
+                     [[fifo]]\npath = \"/p/a\"\nsecret = \"db\"\ngroup = 100\n\
+                     [[fifo]]\npath = \"{p2}\"\nsecret = \"db\"\ngroup = 100\n"
+                ),
+                &R,
+            )
+        };
+        assert_eq!(two("/p/b").unwrap().fifos.len(), 2);
+        assert!(two("/p/a").is_err());
+    }
+
+    #[test]
     fn packaged_example_config_parses() {
         let text = include_str!("../../../packaging/config.example.toml");
         let c = Config::parse(text, &R).unwrap();
         assert_eq!(c.secrets[0].name, "db-password");
         assert_eq!(c.daemon.socket_mode, 0o660);
-        assert_eq!(c.approval.external_host, "secretd.example.com");
-        assert_eq!(c.notify.attempts, 3);
+        assert_eq!(
+            c.approval.as_ref().unwrap().external_host,
+            "secretd.example.com"
+        );
+        assert_eq!(c.notify.as_ref().unwrap().attempts, 3);
     }
 
     #[test]

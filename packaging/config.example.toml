@@ -36,6 +36,12 @@ max_rejections_per_conn = 8
 # type the passphrase on this connection).
 admin_idle_timeout_secs = 600
 
+# Approval channels (default: web + admin). Add "homeassistant" to approve from a Home
+# Assistant notification (see [homeassistant] below and the README). With "web" disabled,
+# [notify], [approval] and [approval.oidc] are not needed.
+# [channels]
+# enabled = ["web", "admin", "homeassistant"]
+
 [notify]
 # "ntfy" (POST to a topic URL) or "webhook" (JSON POST, optionally HMAC signed).
 kind = "ntfy"
@@ -80,6 +86,18 @@ redirect_url = "https://secretd.example.com/auth/callback"
 owner_emails = ["owner@example.com"]
 session_ttl_secs = 3600
 
+# Home Assistant channel (enable it in [channels] above). The passphrase transits HA: read
+# "Home Assistant channel" in the README (recorder/history/logbook exclusion!) first.
+# [homeassistant]
+# url = "https://homeassistant.example.com:8123"   # http:// needs allow_insecure_http (or loopback)
+# token_file = "/etc/secretd/ha.token"             # secretd:secretd 0400
+# notify_service = "notify.mobile_app_owner_phone"
+# passphrase_entity = "input_text.secretd_passphrase"   # input_text, mode: password, max: 255
+# owner_user_ids = ["0123456789abcdef0123456789abcdef"] # context.user_id of the owner's phone
+# allow_insecure_http = false
+# ca_file = "/etc/secretd/ha-ca.pem"
+# ha_require_user_id = true
+
 # One block per secret. Names: [A-Za-z0-9._/-]+. A secret with no allow_uids/allow_gids
 # is unreachable. allow_exes must be absolute; allow_any_exe = true is the only way to
 # omit it (a warning is logged).
@@ -94,3 +112,22 @@ allow_exes = ["/usr/bin/psql", "/opt/app/bin/app"]
 # name = "deploy-token"
 # allow_uids = ["deploy"]
 # allow_any_exe = true
+
+# Named-pipe secrets: a legacy program reads a secret by opening a pipe. Opening it triggers
+# the normal notification/approval flow; on approval the raw value is written to the pipe and
+# the pipe is closed (EOF). The reader blocks meanwhile (up to request_timeout_secs).
+#
+# The daemon must be able to open the pipe for WRITING: be the owner (default) with the owner
+# write bit, or a member of `group` with the group write bit. The readers get access through
+# the group, so the daemon user must also belong to that group (an unprivileged daemon can only
+# chgrp to its own groups and chown to itself). Needs the pipe directory: see tmpfiles.d.
+# [[fifo]]
+# path = "/run/secretd/pipes/db-password"
+# secret = "db-password"          # must exist in [[secret]]; several pipes may share one secret
+# group = "app"                   # readers' group (secretd must be a member)
+# # owner = "secretd"             # default: the daemon user
+# mode = "0640"                   # octal string; at most 0660 (default 0640)
+# enforce_acl = false             # true: the single identified reader must pass the secret's ACL
+# attempts_per_min = 10           # reader detections per minute before they are refused
+# cooldown_secs = 5               # pause after a request before the pipe is armed again
+# write_deadline_secs = 5         # time allowed to push the value into the pipe

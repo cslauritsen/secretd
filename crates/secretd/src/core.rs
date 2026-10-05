@@ -2,16 +2,17 @@
 //! the approve/deny/release logic shared by the HTTP and admin endpoints.
 
 use crate::audit::{Audit, AuditEvent};
+use crate::channel::{AdminChannel, Channel, Closed, WebChannel};
 use crate::notify::{Notification, Notifier};
 use crate::peer::PeerCred;
-use crate::procinfo::{ProcInfo, ProcReader};
+use crate::procinfo::{ProcInfo, ProcInfoReader};
 use secret_proto::acl::{self, CallerIds};
-use secret_proto::config::Config;
+use secret_proto::config::{ChannelKind, Config};
 use secret_proto::rpc::{ErrorKind, GetParams, PendingInfo, RpcError};
 use secret_proto::sanitize;
 use secret_proto::store::{self, Passphrase, StoreError};
 use secret_proto::{valid_secret_name, Encoding, MAX_REASON_CHARS};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
@@ -33,7 +34,7 @@ pub struct Caller {
     pub gid: u32,
     pub pid: u32,
     pub username: String,
-    /// `None` when `/proc` resolution failed: every request is then denied.
+    /// `None` when process resolution (`/proc`, libproc) failed: every request is then denied.
     pub proc: Option<ProcInfo>,
     /// `SO_PEERPIDFD` handle, when the kernel provides one: lets a recycled
     /// pid be told apart from the process that connected.
@@ -53,8 +54,8 @@ enum Outcome {
     /// only told "released" when that is true).
     Released {
         rel: Released,
-        source_ip: Option<IpAddr>,
-        ack: oneshot::Sender<bool>,
+        source: Source,
+        ack: oneshot::Sender<Delivery>,
     },
     Denied,
     DecryptFailed,
@@ -68,13 +69,24 @@ enum Outcome {
 pub enum Source {
     Http(IpAddr),
     Admin,
+    HomeAssistant,
 }
 
 impl Source {
-    fn ip(self) -> Option<IpAddr> {
+    /// Source address of an HTTP action; `None` for other channels.
+    pub fn ip(self) -> Option<IpAddr> {
         match self {
             Source::Http(ip) => Some(ip),
-            Source::Admin => None,
+            Source::Admin | Source::HomeAssistant => None,
+        }
+    }
+
+    /// The approval channel the action arrived through.
+    pub fn channel(self) -> ChannelKind {
+        match self {
+            Source::Http(_) => ChannelKind::Web,
+            Source::Admin => ChannelKind::Admin,
+            Source::HomeAssistant => ChannelKind::HomeAssistant,
         }
     }
 }
@@ -121,9 +133,63 @@ pub enum TokenCheck {
     Ok,
 }
 
+/// Where a request came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// A client on the Unix socket (`secret.get`).
+    Socket,
+    /// A reader that opened the named pipe at this path (section 20).
+    Fifo(String),
+}
+
+/// What [`Core::request_approval`] needs to know about a request.
+pub struct RequestSpec {
+    pub origin: Origin,
+    pub secret: String,
+    /// Already sanitised.
+    pub reason: Option<String>,
+    /// The client (socket) or the one identified reader (FIFO; `None` when no
+    /// reader process could be identified).
+    pub caller: Option<Caller>,
+    /// How long the owner has to answer.
+    pub wait: Duration,
+}
+
+/// What became of an approved value (reported back to the approver).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Fully delivered (and audited, for socket clients).
+    Released,
+    /// The requester could not be re-verified at release time; nothing was sent.
+    CallerChanged,
+    /// The requester went away or the write failed; nothing (complete) was sent.
+    Aborted,
+    /// Any other failure (for example the audit log).
+    Failed,
+}
+
+/// An approved request on its way to the requester. The approver is told
+/// "released" only after [`Grant::finish`] confirmed that the value really
+/// reached the requester (and was audited).
+pub struct Grant {
+    pub id: String,
+    pub rel: Released,
+    pub source: Source,
+    ack: oneshot::Sender<Delivery>,
+}
+
+impl Grant {
+    /// Report the delivery result to the approver and take the value.
+    pub fn finish(self, result: Delivery) -> Released {
+        let _ = self.ack.send(result);
+        self.rel
+    }
+}
+
 struct Pending {
     token: String,
-    caller: Caller,
+    caller: Option<Caller>,
+    origin: Origin,
     secret: String,
     description: Option<String>,
     reason: Option<String>,
@@ -140,6 +206,31 @@ struct State {
     gets: HashMap<u32, VecDeque<Instant>>,
     conns_by_uid: HashMap<u32, usize>,
     conns_total: usize,
+}
+
+/// How long an announcement that is still in flight when its request is
+/// resolved may keep going before it is abandoned.
+const ANNOUNCE_GRACE: Duration = Duration::from_secs(15);
+
+/// Announcements still running when their request was resolved.
+struct LateAnnounces {
+    tasks: tokio::task::JoinSet<(usize, ChannelKind, Result<(), ()>)>,
+    /// Task id -> index into the channel list.
+    idx: HashMap<tokio::task::Id, usize>,
+}
+
+/// Add the identity of the requester (and the pipe) to an audit event.
+fn stamp(mut ev: AuditEvent, caller: Option<&Caller>, origin: &Origin) -> AuditEvent {
+    if let Origin::Fifo(p) = origin {
+        ev.fifo = Some(p.clone());
+    }
+    if let Some(c) = caller {
+        ev.uid = Some(c.uid);
+        ev.gid = Some(c.gid);
+        ev.pid = Some(c.pid);
+        ev.exe = c.proc.as_ref().map(|p| p.exe.clone());
+    }
+    ev
 }
 
 /// Default window over which repeated rejections are folded into one summary line.
@@ -160,14 +251,17 @@ pub struct Core {
     state: Mutex<State>,
     coalesce: Mutex<HashMap<CoalesceKey, Slot>>,
     coalesce_window: Mutex<Duration>,
-    audit: Audit,
-    notifier: Arc<dyn Notifier>,
-    procs: Arc<dyn ProcReader>,
+    audit: Arc<Audit>,
+    channels: Vec<Arc<dyn Channel>>,
+    procs: Arc<dyn ProcInfoReader>,
     /// Serialises unsealing: one scrypt derivation can need hundreds of MiB.
     unseal_gate: tokio::sync::Semaphore,
     /// Test hook: artificial delay inside the blocking unseal task, to widen
     /// the race window between approve and deny/timeout/disconnect.
     unseal_delay: Mutex<Duration>,
+    /// How long announcements still running after their request resolved may
+    /// continue (test hook; defaults to [`ANNOUNCE_GRACE`]).
+    announce_grace: Mutex<Duration>,
 }
 
 /// Decrements the connection counters when dropped.
@@ -213,22 +307,40 @@ fn internal() -> RpcError {
 }
 
 impl Core {
+    /// A core with the classic channel pair: `web` (announcing through
+    /// `notifier`) and `admin`.
     pub fn new(
         cfg: Config,
         audit: Audit,
         notifier: Arc<dyn Notifier>,
-        procs: Arc<dyn ProcReader>,
+        procs: Arc<dyn ProcInfoReader>,
+    ) -> Arc<Core> {
+        Self::with_channels(
+            cfg,
+            audit,
+            vec![Arc::new(WebChannel::new(notifier)), Arc::new(AdminChannel)],
+            procs,
+        )
+    }
+
+    /// A core with an explicit set of enabled channels.
+    pub fn with_channels(
+        cfg: Config,
+        audit: Audit,
+        channels: Vec<Arc<dyn Channel>>,
+        procs: Arc<dyn ProcInfoReader>,
     ) -> Arc<Core> {
         Arc::new(Core {
             cfg: RwLock::new(Arc::new(cfg)),
             state: Mutex::new(State::default()),
             coalesce: Mutex::new(HashMap::new()),
             coalesce_window: Mutex::new(COALESCE_WINDOW),
-            audit,
-            notifier,
+            audit: Arc::new(audit),
+            channels,
             procs,
             unseal_gate: tokio::sync::Semaphore::new(1),
             unseal_delay: Mutex::new(Duration::ZERO),
+            announce_grace: Mutex::new(ANNOUNCE_GRACE),
         })
     }
 
@@ -236,6 +348,15 @@ impl Core {
     #[doc(hidden)]
     pub fn set_unseal_delay(&self, d: Duration) {
         *self.unseal_delay.lock().unwrap_or_else(|e| e.into_inner()) = d;
+    }
+
+    /// Test hook: shorten the grace period of in-flight announcements.
+    #[doc(hidden)]
+    pub fn set_announce_grace(&self, d: Duration) {
+        *self
+            .announce_grace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = d;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -264,6 +385,17 @@ impl Core {
         ev.pid = Some(caller.pid);
         ev.exe = caller.proc.as_ref().map(|p| p.exe.clone());
         self.audit(&ev)
+    }
+
+    /// Audit an event about a request: identity of the requester when known,
+    /// and the FIFO path for pipe requests.
+    pub fn audit_req(
+        &self,
+        ev: AuditEvent,
+        caller: Option<&Caller>,
+        origin: &Origin,
+    ) -> io::Result<()> {
+        self.audit(&stamp(ev, caller, origin))
     }
 
     fn rejection_event(
@@ -442,7 +574,8 @@ impl Core {
         c
     }
 
-    fn allowed(cfg: &Config, caller: &Caller, name: &str) -> bool {
+    /// Does `caller` pass the ACL of secret `name` (uid/gid and executable)?
+    pub fn allowed(cfg: &Config, caller: &Caller, name: &str) -> bool {
         let Some(proc) = &caller.proc else {
             return false;
         };
@@ -556,55 +689,151 @@ impl Core {
         // minute and uid get this far.
         self.audit_for(AuditEvent::new("request_received").secret(&name), caller)
             .map_err(|_| internal())?;
-        let secret_cfg = cfg.secret(&name).ok_or_else(internal)?;
-        let proc = caller.proc.as_ref().ok_or_else(internal)?;
+        if caller.proc.is_none() {
+            return Err(internal());
+        }
 
         let max_wait = cfg.daemon.request_timeout_secs;
         let wait = params
             .timeout_secs
             .map_or(max_wait, |t| t.clamp(1, max_wait));
+        let grant = self
+            .request_approval(
+                RequestSpec {
+                    origin: Origin::Socket,
+                    secret: name.clone(),
+                    reason,
+                    caller: Some(caller.clone()),
+                    wait: Duration::from_secs(wait),
+                },
+                disconnect,
+            )
+            .await?;
+        // The handler that waits for the client audits the release; the
+        // approver is told "released" only if that succeeded.
+        let audited = self
+            .audit_for(
+                AuditEvent::new("released")
+                    .request(&grant.id)
+                    .secret(&name)
+                    .source(grant.source.ip())
+                    .channel(grant.source.channel()),
+                caller,
+            )
+            .is_ok();
+        let rel = grant.finish(if audited {
+            Delivery::Released
+        } else {
+            Delivery::Failed
+        });
+        if audited {
+            Ok(rel)
+        } else {
+            Err(internal())
+        }
+    }
+
+    /// Create a pending request, announce it on every notification channel and
+    /// wait for the owner: the part of a release that is the same for socket
+    /// clients and named pipes. Returns the [`Grant`] once approved; the caller
+    /// delivers the value, audits `released` and calls [`Grant::finish`].
+    /// `disconnect` resolves when the requester went away.
+    pub async fn request_approval(
+        &self,
+        spec: RequestSpec,
+        disconnect: impl Future<Output = ()>,
+    ) -> Result<Grant, RpcError> {
+        let RequestSpec {
+            origin,
+            secret: name,
+            reason,
+            caller,
+            wait,
+        } = spec;
+        let cfg = self.config();
+        let secret_cfg = cfg.secret(&name).ok_or_else(internal)?;
+        let caller = caller.as_ref();
+        let proc = caller.and_then(|c| c.proc.as_ref());
+        if origin == Origin::Socket && proc.is_none() {
+            return Err(internal());
+        }
         let now = Instant::now();
-        let deadline = now + Duration::from_secs(wait);
+        let deadline = now + wait;
         let id = random_hex(16).ok_or_else(internal)?;
         let token = random_token().ok_or_else(internal)?;
         let (tx, mut rx) = oneshot::channel();
 
-        let expires_at = SystemTime::now() + Duration::from_secs(wait);
+        let expires_at = SystemTime::now() + wait;
         {
             let mut st = self.lock();
-            let dup = st.pending.values().any(|p| {
-                p.secret == name
-                    && p.caller.uid == caller.uid
-                    && p.caller.proc.as_ref().map(|x| &x.exe) == Some(&proc.exe)
-            });
-            let per_uid = st
-                .pending
-                .values()
-                .filter(|p| p.caller.uid == caller.uid)
-                .count();
-            let limited = if dup {
-                Some("duplicate")
-            } else if per_uid >= cfg.limits.max_pending_per_uid {
-                Some("pending_per_uid")
-            } else if st.pending.len() >= cfg.limits.max_pending_total {
-                Some("pending_total")
-            } else {
-                None
+            let limited = match &origin {
+                Origin::Socket => {
+                    let c = caller.ok_or_else(internal)?;
+                    let socket = |p: &&Pending| p.origin == Origin::Socket;
+                    let dup = st.pending.values().filter(socket).any(|p| {
+                        p.secret == name
+                            && p.caller.as_ref().map(|x| x.uid) == Some(c.uid)
+                            && p.caller
+                                .as_ref()
+                                .and_then(|x| x.proc.as_ref())
+                                .map(|x| &x.exe)
+                                == proc.map(|x| &x.exe)
+                    });
+                    let per_uid = st
+                        .pending
+                        .values()
+                        .filter(socket)
+                        .filter(|p| p.caller.as_ref().map(|x| x.uid) == Some(c.uid))
+                        .count();
+                    if dup {
+                        Some("duplicate")
+                    } else if per_uid >= cfg.limits.max_pending_per_uid {
+                        Some("pending_per_uid")
+                    } else if st.pending.len() >= cfg.limits.max_pending_total {
+                        Some("pending_total")
+                    } else {
+                        None
+                    }
+                }
+                // Per-request limits of a pipe are keyed on the pipe: one
+                // pending request at a time, plus the global cap.
+                Origin::Fifo(path) => {
+                    if st
+                        .pending
+                        .values()
+                        .any(|p| p.origin == Origin::Fifo(path.clone()))
+                    {
+                        Some("fifo_pending")
+                    } else if st.pending.len() >= cfg.limits.max_pending_total {
+                        Some("pending_total")
+                    } else {
+                        None
+                    }
+                }
             };
             if let Some(why) = limited {
                 drop(st);
-                self.audit_coalesced(
-                    self.rejection_event("rate_limited", &name, why, caller),
-                    &subject,
-                )
-                .map_err(|_| internal())?;
+                let (ev, subject) = match (&origin, caller) {
+                    (Origin::Socket, Some(c)) => (
+                        self.rejection_event("rate_limited", &name, why, c),
+                        c.uid.to_string(),
+                    ),
+                    (Origin::Fifo(path), _) => {
+                        let mut ev = AuditEvent::new("rate_limited").secret(&name).outcome(why);
+                        ev.fifo = Some(path.clone());
+                        (ev, path.clone())
+                    }
+                    _ => return Err(internal()),
+                };
+                self.audit_coalesced(ev, &subject).map_err(|_| internal())?;
                 return Err(RpcError::new(ErrorKind::RateLimited));
             }
             st.pending.insert(
                 id.clone(),
                 Pending {
                     token: token.clone(),
-                    caller: caller.clone(),
+                    caller: caller.cloned(),
+                    origin: origin.clone(),
                     secret: name.clone(),
                     description: secret_cfg.description.clone(),
                     reason: reason.clone(),
@@ -617,32 +846,55 @@ impl Core {
             );
         }
 
-        let notification = Notification {
+        let notification = Arc::new(Notification {
             request_id: id.clone(),
             secret_name: name.clone(),
             description: secret_cfg.description.clone(),
-            uid: caller.uid,
-            username: caller.username.clone(),
-            pid: caller.pid,
-            exe: sanitize::clean(&proc.exe, 512),
-            cmdline: proc.cmdline.clone(),
+            uid: caller.map_or(0, |c| c.uid),
+            username: caller.map_or_else(|| "unknown".into(), |c| c.username.clone()),
+            pid: caller.map_or(0, |c| c.pid),
+            exe: proc.map_or_else(|| "unknown".into(), |p| sanitize::clean(&p.exe, 512)),
+            cmdline: proc.map(|p| p.cmdline.clone()).unwrap_or_default(),
             reason,
             expires_at: rfc3339(expires_at),
-            approval_url: format!("{}/approve/{id}?t={token}", cfg.approval.external_url),
-        };
+            approval_url: cfg
+                .approval
+                .as_ref()
+                .map(|a| format!("{}/approve/{id}?t={token}", a.external_url))
+                .unwrap_or_default(),
+            approval_token: token.clone(),
+            via: match &origin {
+                Origin::Socket => None,
+                Origin::Fifo(p) => Some(format!("via FIFO {}", sanitize::clean(p, 512))),
+            },
+            identified: caller.is_some(),
+        });
 
-        let notify_fut = async {
-            if let Err(e) = self.notifier.notify(&notification).await {
-                tracing::error!("{e}");
-                return Err(());
-            }
-            self.audit_for(
-                AuditEvent::new("notified").request(&id).secret(&name),
-                caller,
-            )
-            .map_err(|_| ())
-        };
-        tokio::pin!(notify_fut);
+        // Announce on every enabled notification channel at once.
+        let mut announces: tokio::task::JoinSet<(usize, ChannelKind, Result<(), ()>)> =
+            tokio::task::JoinSet::new();
+        let mut task_idx: HashMap<tokio::task::Id, usize> = HashMap::new();
+        for (idx, ch) in self
+            .channels
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.announces())
+        {
+            let (ch, n) = (ch.clone(), notification.clone());
+            let handle = announces.spawn(async move {
+                let kind = ch.kind();
+                match ch.announce(&n).await {
+                    Ok(()) => (idx, kind, Ok(())),
+                    Err(e) => {
+                        tracing::error!("{} channel: {e}", kind.as_str());
+                        (idx, kind, Err(()))
+                    }
+                }
+            });
+            task_idx.insert(handle.id(), idx);
+        }
+        // With no announcing channel (admin only) the request is armed at once.
+        let mut notified = announces.is_empty();
         tokio::pin!(disconnect);
 
         enum Done {
@@ -651,15 +903,49 @@ impl Core {
             Timeout,
             Gone,
         }
-        // The owner cannot act before `notified` is audited, so the outcome
-        // channel is only polled afterwards (keeps the audit order stable).
-        let mut notified = false;
+        // The owner cannot act before the first `notified` is audited, so the
+        // outcome channel is only polled afterwards (keeps the audit order
+        // stable). A channel that fails is audited (`notify_failed`) but only
+        // ends the request when every announcing channel failed.
         let mut done = loop {
             tokio::select! {
-                r = &mut notify_fut, if !notified => match r {
-                    Ok(()) => notified = true,
-                    Err(()) => break Done::NotifyFailed,
-                },
+                Some(joined) = announces.join_next_with_id(), if !announces.is_empty() => {
+                    let (tid, joined) = match joined {
+                        Ok((tid, v)) => (tid, Ok(v)),
+                        Err(e) => (e.id(), Err(e)),
+                    };
+                    task_idx.remove(&tid);
+                    let Ok((_, kind, res)) = joined else {
+                        // The announce task itself panicked: count it as a failure.
+                        if announces.is_empty() && !notified {
+                            break Done::NotifyFailed;
+                        }
+                        continue;
+                    };
+                    match res {
+                        Ok(()) => {
+                            let ev = AuditEvent::new("notified")
+                                .request(&id)
+                                .secret(&name)
+                                .channel(kind);
+                            if self.audit_req(ev, caller, &origin).is_err() {
+                                // Fail closed: an unlogged notification must not arm the request.
+                                break Done::NotifyFailed;
+                            }
+                            notified = true;
+                        }
+                        Err(()) => {
+                            let ev = AuditEvent::new("notify_failed")
+                                .request(&id)
+                                .secret(&name)
+                                .channel(kind);
+                            let _ = self.audit_req(ev, caller, &origin);
+                            if announces.is_empty() && !notified {
+                                break Done::NotifyFailed;
+                            }
+                        }
+                    }
+                }
                 o = &mut rx, if notified => break Done::Outcome(o.ok()),
                 _ = tokio::time::sleep_until(deadline) => break Done::Timeout,
                 _ = &mut disconnect => break Done::Gone,
@@ -675,67 +961,155 @@ impl Core {
             }
         }
 
-        match done {
+        let (result, why) = match done {
             Done::Outcome(Some(outcome)) => match outcome {
-                Outcome::Released {
-                    rel,
-                    source_ip,
-                    ack,
-                } => {
-                    let audited = self
-                        .audit_for(
-                            AuditEvent::new("released")
-                                .request(&id)
-                                .secret(&name)
-                                .source(source_ip),
-                            caller,
-                        )
-                        .is_ok();
-                    let _ = ack.send(audited);
-                    if audited {
-                        Ok(rel)
-                    } else {
-                        Err(internal())
-                    }
+                Outcome::Released { rel, source, ack } => (
+                    Ok(Grant {
+                        id: id.clone(),
+                        rel,
+                        source,
+                        ack,
+                    }),
+                    Closed::Released,
+                ),
+                Outcome::Denied => (Err(RpcError::new(ErrorKind::Denied)), Closed::Denied),
+                Outcome::DecryptFailed => {
+                    (Err(RpcError::new(ErrorKind::DecryptFailed)), Closed::Failed)
                 }
-                Outcome::Denied => Err(RpcError::new(ErrorKind::Denied)),
-                Outcome::DecryptFailed => Err(RpcError::new(ErrorKind::DecryptFailed)),
-                Outcome::CallerChanged => Err(RpcError::new(ErrorKind::CallerChanged)),
-                Outcome::NotFound => Err(RpcError::new(ErrorKind::NotFound)),
-                Outcome::Internal => Err(internal()),
+                Outcome::CallerChanged => {
+                    (Err(RpcError::new(ErrorKind::CallerChanged)), Closed::Failed)
+                }
+                Outcome::NotFound => (Err(RpcError::new(ErrorKind::NotFound)), Closed::Failed),
+                Outcome::Internal => (Err(internal()), Closed::Failed),
             },
             Done::Outcome(None) => {
                 self.remove(&id);
-                Err(internal())
+                (Err(internal()), Closed::Failed)
             }
             Done::NotifyFailed => {
+                // Each failing channel was audited above.
                 self.remove(&id);
-                let _ = self.audit_for(
-                    AuditEvent::new("notify_failed").request(&id).secret(&name),
-                    caller,
-                );
-                Err(internal())
+                (Err(internal()), Closed::Failed)
             }
             Done::Timeout => {
                 self.remove(&id);
-                self.audit_for(
+                let audited = self.audit_req(
                     AuditEvent::new("timeout").request(&id).secret(&name),
                     caller,
-                )
-                .map_err(|_| internal())?;
-                Err(RpcError::new(ErrorKind::Timeout))
+                    &origin,
+                );
+                let r = if audited.is_ok() {
+                    Err(RpcError::new(ErrorKind::Timeout))
+                } else {
+                    Err(internal())
+                };
+                (r, Closed::Timeout)
             }
             Done::Gone => {
                 self.remove(&id);
-                let _ = self.audit_for(
+                let outcome = match origin {
+                    Origin::Socket => "cancelled",
+                    Origin::Fifo(_) => "reader_gone",
+                };
+                let _ = self.audit_req(
                     AuditEvent::new("client_disconnected")
                         .request(&id)
-                        .secret(&name),
+                        .secret(&name)
+                        .outcome(outcome),
                     caller,
+                    &origin,
                 );
-                Err(internal())
+                (Err(internal()), Closed::Cancelled)
+            }
+        };
+        // Tell every channel that the request is closed (first resolution
+        // wins: a Home Assistant notification is cleared, the web URL already
+        // answers 410). Detached so a slow channel never delays the client.
+        // Announcements still in flight are not abandoned: they finish (within
+        // a grace period), are audited, and only then is their channel told.
+        let late = (!announces.is_empty()).then(|| LateAnnounces {
+            tasks: announces,
+            idx: task_idx,
+        });
+        self.close_channels(&id, &name, why, late, caller.cloned(), origin);
+        result
+    }
+
+    fn close_channels(
+        &self,
+        id: &str,
+        name: &str,
+        why: Closed,
+        late: Option<LateAnnounces>,
+        caller: Option<Caller>,
+        origin: Origin,
+    ) {
+        let waiting: HashSet<usize> = late
+            .as_ref()
+            .map(|l| l.idx.values().copied().collect())
+            .unwrap_or_default();
+        for (i, ch) in self.channels.iter().enumerate() {
+            if !waiting.contains(&i) {
+                let (ch, id) = (ch.clone(), id.to_string());
+                tokio::spawn(async move { ch.closed(&id, why).await });
             }
         }
+        let Some(mut late) = late else { return };
+        let (chans, audit) = (self.channels.clone(), self.audit.clone());
+        let (id, name) = (id.to_string(), name.to_string());
+        let grace = *self
+            .announce_grace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tokio::spawn(async move {
+            let deadline = Instant::now() + grace;
+            let log = |ev: AuditEvent| {
+                let ev = stamp(ev.request(&id).secret(&name), caller.as_ref(), &origin);
+                if let Err(e) = audit.log(&ev) {
+                    tracing::error!("audit log write failed: {e}");
+                }
+            };
+            let close = |idx: usize| {
+                let (ch, id) = (chans[idx].clone(), id.clone());
+                tokio::spawn(async move { ch.closed(&id, why).await });
+            };
+            let mut waiting = waiting;
+            loop {
+                match tokio::time::timeout_at(deadline, late.tasks.join_next_with_id()).await {
+                    Ok(None) => break,
+                    Ok(Some(Ok((_, (idx, kind, res))))) => {
+                        let ev = match res {
+                            Ok(()) => AuditEvent::new("notified"),
+                            Err(()) => AuditEvent::new("notify_failed"),
+                        };
+                        log(ev
+                            .channel(kind)
+                            .detail("announcement finished after the request was closed"));
+                        waiting.remove(&idx);
+                        close(idx);
+                    }
+                    Ok(Some(Err(e))) => {
+                        if let Some(idx) = late.idx.get(&e.id()).copied() {
+                            waiting.remove(&idx);
+                            close(idx);
+                        }
+                    }
+                    Err(_) => {
+                        // Grace period over: give up on the stragglers.
+                        late.tasks.abort_all();
+                        while late.tasks.join_next().await.is_some() {}
+                        for idx in waiting.drain() {
+                            log(AuditEvent::new("notify_failed")
+                                .channel(chans[idx].kind())
+                                .outcome("timeout")
+                                .detail("still announcing after the request was closed"));
+                            close(idx);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Returns false if the uid exceeded its per-minute `secret.get` budget.
@@ -769,16 +1143,23 @@ impl Core {
     fn info(id: &str, p: &Pending) -> PendingInfo {
         let (exe, cmdline) = p
             .caller
-            .proc
             .as_ref()
+            .and_then(|c| c.proc.as_ref())
             .map(|x| (sanitize::clean(&x.exe, 512), x.cmdline.clone()))
-            .unwrap_or_default();
+            .unwrap_or_else(|| ("unknown".to_string(), String::new()));
         PendingInfo {
             request_id: id.to_string(),
             secret_name: p.secret.clone(),
-            uid: p.caller.uid,
-            username: p.caller.username.clone(),
-            pid: p.caller.pid,
+            uid: p.caller.as_ref().map_or(0, |c| c.uid),
+            username: p
+                .caller
+                .as_ref()
+                .map_or_else(|| "unknown".to_string(), |c| c.username.clone()),
+            pid: p.caller.as_ref().map_or(0, |c| c.pid),
+            via: match &p.origin {
+                Origin::Socket => None,
+                Origin::Fifo(path) => Some(format!("via FIFO {}", sanitize::clean(path, 512))),
+            },
             exe,
             cmdline,
             reason: p.reason.clone(),
@@ -846,12 +1227,14 @@ impl Core {
             st.pending.remove(id).expect("checked above")
         };
         let audited = self
-            .audit_for(
+            .audit_req(
                 AuditEvent::new("denied")
                     .request(id)
                     .secret(&p.secret)
-                    .source(source.ip()),
-                &p.caller,
+                    .source(source.ip())
+                    .channel(source.channel()),
+                p.caller.as_ref(),
+                &p.origin,
             )
             .is_ok();
         if let Some(tx) = p.tx.take() {
@@ -906,7 +1289,7 @@ impl Core {
         source: Source,
     ) -> ApproveOutcome {
         // Claim the request.
-        let (caller, name, attempts, tx) = {
+        let (caller, origin, name, attempts, tx) = {
             let mut st = self.lock();
             match st.pending.get_mut(id) {
                 Some(p) if p.expires > Instant::now() => {
@@ -917,7 +1300,13 @@ impl Core {
                         return ApproveOutcome::Gone;
                     };
                     p.busy = true;
-                    (p.caller.clone(), p.secret.clone(), p.attempts, tx)
+                    (
+                        p.caller.clone(),
+                        p.origin.clone(),
+                        p.secret.clone(),
+                        p.attempts,
+                        tx,
+                    )
                 }
                 _ => return ApproveOutcome::Gone,
             }
@@ -927,12 +1316,14 @@ impl Core {
         // Record the attempt before doing anything with the passphrase. This
         // is *not* an approval: that is audited only after the store opened.
         if self
-            .audit_for(
+            .audit_req(
                 AuditEvent::new("approve_attempt")
                     .request(id)
                     .secret(&name)
-                    .source(source.ip()),
-                &caller,
+                    .source(source.ip())
+                    .channel(source.channel()),
+                caller.as_ref(),
+                &origin,
             )
             .is_err()
         {
@@ -941,27 +1332,38 @@ impl Core {
         }
 
         // Re-verify the caller (pid reuse / exec-after-connect) and the ACL.
-        if !self.verify_caller(&caller) {
+        // Pipe requests are re-verified by the reader-set check that the pipe
+        // handler runs just before it writes (section 20.3).
+        let socket_caller = match (&origin, caller.as_ref()) {
+            (Origin::Socket, Some(c)) => Some(c),
+            _ => None,
+        };
+        if socket_caller.is_some_and(|c| !self.verify_caller(c)) {
             // The request is aborted either way (fail-safe), so a dead audit
             // log is only logged (Core::audit reports the error).
-            let _ = self.audit_for(
+            let _ = self.audit_req(
                 AuditEvent::new("caller_changed")
                     .request(id)
                     .secret(&name)
                     .outcome("at_release")
-                    .source(source.ip()),
-                &caller,
+                    .source(source.ip())
+                    .channel(source.channel()),
+                caller.as_ref(),
+                &origin,
             );
             self.conclude(id, tx, Outcome::CallerChanged);
             return ApproveOutcome::CallerChanged;
         }
-        if !Self::allowed(&cfg, &caller, &name) {
-            let _ = self.audit_for(
+        if socket_caller.is_some_and(|c| !Self::allowed(&cfg, c, &name)) {
+            let _ = self.audit_req(
                 AuditEvent::new("acl_denied")
                     .request(id)
                     .secret(&name)
-                    .outcome("acl_changed"),
-                &caller,
+                    .outcome("acl_changed")
+                    .source(source.ip())
+                    .channel(source.channel()),
+                caller.as_ref(),
+                &origin,
             );
             self.conclude(id, tx, Outcome::NotFound);
             return ApproveOutcome::Gone;
@@ -992,12 +1394,14 @@ impl Core {
                 drop(entry);
                 // The passphrase opened the store: this is the approval.
                 if self
-                    .audit_for(
+                    .audit_req(
                         AuditEvent::new("approved")
                             .request(id)
                             .secret(&name)
-                            .source(source.ip()),
-                        &caller,
+                            .source(source.ip())
+                            .channel(source.channel()),
+                        caller.as_ref(),
+                        &origin,
                     )
                     .is_err()
                 {
@@ -1010,37 +1414,43 @@ impl Core {
                 let (ack, ack_rx) = oneshot::channel();
                 let sent = tx.send(Outcome::Released {
                     rel: released,
-                    source_ip: source.ip(),
+                    source,
                     ack,
                 });
                 if sent.is_err() {
-                    let _ = self.audit_for(
+                    let _ = self.audit_req(
                         AuditEvent::new("aborted")
                             .request(id)
                             .secret(&name)
                             .outcome("client_gone")
-                            .source(source.ip()),
-                        &caller,
+                            .source(source.ip())
+                            .channel(source.channel()),
+                        caller.as_ref(),
+                        &origin,
                     );
                     return ApproveOutcome::Aborted;
                 }
                 // The handler audits `released` and confirms; only then is
                 // the owner told that the secret was released.
                 match ack_rx.await {
-                    Ok(true) => ApproveOutcome::Released,
+                    Ok(Delivery::Released) => ApproveOutcome::Released,
+                    Ok(Delivery::CallerChanged) => ApproveOutcome::CallerChanged,
+                    Ok(Delivery::Aborted) => ApproveOutcome::Aborted,
                     _ => ApproveOutcome::Internal,
                 }
             }
             Ok(Err(StoreError::WrongPassphrase)) => {
                 let remaining = MAX_ATTEMPTS.saturating_sub(attempts + 1);
                 let audited = self
-                    .audit_for(
+                    .audit_req(
                         AuditEvent::new("decrypt_failed")
                             .request(id)
                             .secret(&name)
                             .outcome(if remaining == 0 { "final" } else { "retry" })
-                            .source(source.ip()),
-                        &caller,
+                            .source(source.ip())
+                            .channel(source.channel()),
+                        caller.as_ref(),
+                        &origin,
                     )
                     .is_ok();
                 if !audited {
@@ -1067,26 +1477,30 @@ impl Core {
             }
             Ok(Err(StoreError::NoSuchSecret)) => {
                 tracing::warn!("secret {name:?} is configured but missing from the store");
-                let _ = self.audit_for(
+                let _ = self.audit_req(
                     AuditEvent::new("decrypt_failed")
                         .request(id)
                         .secret(&name)
                         .outcome("not_in_store")
-                        .source(source.ip()),
-                    &caller,
+                        .source(source.ip())
+                        .channel(source.channel()),
+                    caller.as_ref(),
+                    &origin,
                 );
                 self.conclude(id, tx, Outcome::NotFound);
                 ApproveOutcome::NotInStore
             }
             Ok(Err(e)) => {
                 tracing::error!("store error: {e}");
-                let _ = self.audit_for(
+                let _ = self.audit_req(
                     AuditEvent::new("decrypt_failed")
                         .request(id)
                         .secret(&name)
                         .outcome("store_error")
-                        .source(source.ip()),
-                    &caller,
+                        .source(source.ip())
+                        .channel(source.channel()),
+                    caller.as_ref(),
+                    &origin,
                 );
                 self.conclude(id, tx, Outcome::Internal);
                 ApproveOutcome::Internal

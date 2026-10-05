@@ -1,13 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use secret_proto::config::{Config, SystemResolver};
+use secret_proto::config::{ChannelKind, Config, SystemResolver};
 use secretd::audit::Audit;
+use secretd::channel::{AdminChannel, Channel, WebChannel};
 use secretd::core::Core;
+use secretd::homeassistant::HaChannel;
 use secretd::notify_http::HttpNotifier;
 use secretd::oidc::OidcClient;
 use secretd::peer::RealPeerCred;
-use secretd::procinfo::RealProcReader;
-use secretd::{runtime, server};
+use secretd::procinfo::{ProcInfoReader, RealProcReader};
+use secretd::{platform, runtime, server};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,7 +47,11 @@ fn main() -> Result<()> {
 /// and a pidfd per client connection, the approval connections, plus headroom
 /// for listeners, the audit log, the store and outbound notification calls.
 fn nofile_needed(cfg: &Config) -> u64 {
-    2 * cfg.limits.max_conns_total as u64 + cfg.approval.max_connections as u64 + 64
+    let web = cfg
+        .approval
+        .as_ref()
+        .map_or(0, |a| a.max_connections as u64);
+    2 * cfg.limits.max_conns_total as u64 + web + 64
 }
 
 fn warn_if_nofile_low(cfg: &Config) {
@@ -61,8 +67,8 @@ fn warn_if_nofile_low(cfg: &Config) {
         if cur < need {
             tracing::warn!(
                 "RLIMIT_NOFILE is {} but the configured limits can need {need} descriptors; \
-                 raise LimitNOFILE= in the unit or lower limits.max_conns_total / \
-                 approval.max_connections",
+                 raise LimitNOFILE= in the unit (SoftResourceLimits/NumberOfFiles in the \
+                 launchd plist) or lower limits.max_conns_total / approval.max_connections",
                 rl.rlim_cur
             );
         }
@@ -93,7 +99,7 @@ async fn run() -> Result<()> {
     }
 
     // Bind (or inherit) sockets while still privileged, then drop root.
-    let activated = runtime::systemd_sockets().context("socket activation")?;
+    let activated = runtime::activated_sockets().context("socket activation")?;
     let client_l = match activated.client {
         Some(l) => l,
         None => {
@@ -108,37 +114,108 @@ async fn run() -> Result<()> {
             l
         }
     };
-    let admin_l = match activated.admin {
-        Some(l) => l,
-        None => runtime::bind_unix(&cfg.daemon.admin_socket, 0o600)?,
+    let want_admin = cfg.channels.has(ChannelKind::Admin);
+    let admin_l = match (activated.admin, want_admin) {
+        (Some(l), true) => Some(l),
+        (Some(_), false) => None, // channel disabled: drop the inherited socket
+        (None, true) => Some(runtime::bind_unix(&cfg.daemon.admin_socket, 0o600)?),
+        (None, false) => None,
     };
     runtime::drop_privileges(&cfg.daemon.user).context("dropping privileges")?;
 
+    // macOS: identifying callers of other users needs root (spec section 22).
+    // Refuse a configuration that pins executables for such callers instead of
+    // starting a daemon that would deny all of them. Linux keeps its documented
+    // per-request fail-closed behaviour (CAP_SYS_PTRACE is granted by the unit).
+    if cfg!(target_os = "macos") {
+        let probe = RealProcReader.read(1).map(|_| ());
+        let rep = platform::check_process_inspection(&cfg, nix::unistd::geteuid().as_raw(), &probe);
+        for w in &rep.warnings {
+            tracing::warn!("process inspection: {w}");
+        }
+        if !rep.errors.is_empty() {
+            return Err(anyhow!(
+                "cannot identify callers of other users: {}",
+                rep.errors.join("; ")
+            ));
+        }
+    }
+
     let audit = Audit::open(&cfg.daemon.audit_log)
         .with_context(|| format!("opening audit log {}", cfg.daemon.audit_log.display()))?;
-    let notifier = HttpNotifier::new(&cfg.notify).context("setting up notifier")?;
-    let client_secret =
-        secret_proto::config::read_secret_file(&cfg.approval.oidc.client_secret_file)
+
+    let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
+    let mut web_parts = None;
+    if let (true, Some(notify_cfg), Some(approval_cfg)) = (
+        cfg.channels.has(ChannelKind::Web),
+        &cfg.notify,
+        &cfg.approval,
+    ) {
+        let notifier = HttpNotifier::new(notify_cfg).context("setting up notifier")?;
+        let client_secret =
+            secret_proto::config::read_secret_file(&approval_cfg.oidc.client_secret_file)
+                .map_err(|e| anyhow!("{e}"))?;
+        let oidc = Arc::new(OidcClient::new(approval_cfg.oidc.clone(), client_secret)?);
+        channels.push(Arc::new(WebChannel::new(Arc::new(notifier))));
+        web_parts = Some((approval_cfg.clone(), oidc));
+    }
+    let mut ha_channel = None;
+    let mut ha_reload: Option<Arc<HaChannel>> = None;
+    if let (true, Some(ha_cfg)) = (
+        cfg.channels.has(ChannelKind::HomeAssistant),
+        &cfg.homeassistant,
+    ) {
+        let token = secret_proto::config::read_secret_file(&ha_cfg.token_file)
             .map_err(|e| anyhow!("{e}"))?;
-    let oidc = Arc::new(OidcClient::new(cfg.approval.oidc.clone(), client_secret)?);
-    let approval_cfg = cfg.approval.clone();
-    let core = Core::new(cfg, audit, Arc::new(notifier), Arc::new(RealProcReader));
-    let http_listener = tokio::net::TcpListener::bind(approval_cfg.listen)
-        .await
-        .with_context(|| format!("binding approval endpoint {}", approval_cfg.listen))?;
-    tracing::info!(
-        "approval endpoint on {} (plain HTTP; terminate TLS in a reverse proxy)",
-        approval_cfg.listen
-    );
-    let serve_opts = secretd::approval::ServeOpts::from_cfg(&approval_cfg);
-    tokio::spawn(secretd::approval::serve_with(
-        http_listener,
-        secretd::approval::router(core.clone(), approval_cfg, oidc),
-        serve_opts,
-    ));
+        let ha = HaChannel::new(ha_cfg, token).context("setting up the Home Assistant channel")?;
+        channels.push(ha.clone());
+        ha_reload = Some(ha.clone());
+        ha_channel = Some(ha);
+    }
+    if want_admin {
+        channels.push(Arc::new(AdminChannel));
+    }
+    let core = Core::with_channels(cfg, audit, channels, Arc::new(RealProcReader));
+    if let Some(ha) = ha_channel {
+        // Connects (and reconnects with backoff); until it is up, the channel
+        // counts as failed for new requests.
+        tokio::spawn(ha.run(core.clone()));
+    }
+
+    if let Some((approval_cfg, oidc)) = web_parts {
+        let http_listener = tokio::net::TcpListener::bind(approval_cfg.listen)
+            .await
+            .with_context(|| format!("binding approval endpoint {}", approval_cfg.listen))?;
+        tracing::info!(
+            "approval endpoint on {} (plain HTTP; terminate TLS in a reverse proxy)",
+            approval_cfg.listen
+        );
+        let serve_opts = secretd::approval::ServeOpts::from_cfg(&approval_cfg);
+        tokio::spawn(secretd::approval::serve_with(
+            http_listener,
+            secretd::approval::router(core.clone(), approval_cfg, oidc),
+            serve_opts,
+        ));
+    }
     let peer: Arc<dyn secretd::peer::PeerCredProvider> = Arc::new(RealPeerCred);
     tokio::spawn(server::serve_clients(core.clone(), client_l, peer.clone()));
-    tokio::spawn(server::serve_admin(core.clone(), admin_l, peer));
+    if let Some(admin_l) = admin_l {
+        tokio::spawn(server::serve_admin(core.clone(), admin_l, peer));
+    }
+
+    // Named pipes (section 20): created now, as the daemon user.
+    let daemon_uid = nix::unistd::geteuid().as_raw();
+    let scanner: Arc<dyn secretd::fifo::ReaderScanner> =
+        Arc::new(secretd::fifo::ProcScanner::new(Arc::new(RealProcReader)));
+    let mut fifo_cfgs = core.config().fifos.clone();
+    let mut fifos = if fifo_cfgs.is_empty() {
+        None
+    } else {
+        Some(
+            secretd::fifo::start(core.clone(), scanner.clone(), &fifo_cfgs, daemon_uid)
+                .context("setting up the named pipes")?,
+        )
+    };
 
     let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -148,7 +225,49 @@ async fn run() -> Result<()> {
         tokio::select! {
             _ = hup.recv() => {
                 match load_config(&args.config) {
-                    Ok(c) => { core.set_config(c); tracing::info!("configuration reloaded"); }
+                    Ok(c) => {
+                        let new_fifos = c.fifos.clone();
+                        // Settings that only a restart applies are named, not
+                        // silently ignored; the Home Assistant approver
+                        // allowlist is applied now (revocation must not wait).
+                        let restart = secretd::reload::restart_required(&core.config(), &c);
+                        if let Some(ha) = &ha_reload {
+                            ha.apply_config(c.homeassistant.as_ref());
+                            tracing::info!(
+                                "home assistant approver allowlist reloaded ({} user id(s))",
+                                c.homeassistant.as_ref().map_or(0, |h| h.owner_user_ids.len())
+                            );
+                        }
+                        core.set_config(c);
+                        tracing::info!("configuration reloaded (secrets, limits, timeouts, pipes and the home assistant allowlist)");
+                        for section in &restart {
+                            tracing::warn!(
+                                "[{section}] changed in the configuration file but is NOT applied: \
+                                 it only takes effect after a restart of secretd"
+                            );
+                        }
+                        // Pipes are re-armed only if their configuration changed
+                        // (every wait is cancelled first).
+                        if new_fifos != fifo_cfgs {
+                            if let Some(f) = fifos.take() {
+                                f.shutdown().await;
+                            }
+                            fifo_cfgs = new_fifos;
+                            if !fifo_cfgs.is_empty() {
+                                match secretd::fifo::start(
+                                    core.clone(),
+                                    scanner.clone(),
+                                    &fifo_cfgs,
+                                    daemon_uid,
+                                ) {
+                                    Ok(f) => fifos = Some(f),
+                                    Err(e) => tracing::error!(
+                                        "named pipes not re-armed after reload: {e}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
                     Err(e) => tracing::error!("reload failed, keeping old config: {e}"),
                 }
                 // Log rotation: reopen the audit file on the same signal.
@@ -161,6 +280,9 @@ async fn run() -> Result<()> {
             _ = term.recv() => break,
             _ = int.recv() => break,
         }
+    }
+    if let Some(f) = fifos.take() {
+        f.shutdown().await; // cancels the waits and removes the pipes
     }
     core.flush_audit_summaries(true);
     tracing::info!("shutting down");

@@ -18,7 +18,7 @@ Secrets at rest are always encrypted. The decryption key is never stored on disk
 | `secret-client` | lib | Reusable Rust client for the JSON-RPC protocol |
 | `secret-proto` | lib | Shared types: JSON-RPC messages, error codes, framing |
 
-Language: Rust (stable, edition 2021 or later). Target: Linux only (`SO_PEERCRED`, `/proc`).
+Language: Rust (stable, edition 2021 or later). Targets: Linux (`SO_PEERCRED`, `/proc`) and macOS (`LOCAL_PEERCRED`/`LOCAL_PEERPID`, libproc); see §22.
 
 ## 2. Threat model
 
@@ -292,7 +292,7 @@ allow_exes = ["/usr/bin/psql"]
 
 ## 17. Non-goals (v1)
 
-Network-reachable secret access (Unix socket only), non-Linux platforms, grant caching or TTL leases, secret versioning/history, multi-owner or quorum approval, HSM/TPM integration, `secret run`.
+Network-reachable secret access (Unix socket only), platforms other than Linux and macOS (§22), grant caching or TTL leases, secret versioning/history, multi-owner or quorum approval, HSM/TPM integration, `secret run`. (Home Assistant and FIFO support are v1.1 extensions in §19-§20.)
 
 ## 18. Decisions and open questions
 
@@ -304,3 +304,177 @@ Resolved:
 Passkeys are not required; whatever sign-in methods Google offers (including passkeys) are sufficient (§7.2).
 
 Note: Google OIDC needs an HTTPS redirect URI on a real hostname (or `localhost`), so the reverse proxy must front a real domain with a valid certificate.
+
+## 19. Home Assistant channel (v1.1 extension)
+
+Adds Home Assistant (HA) as an additional notification and approval channel. The existing web/OIDC path (§7.2) and admin socket (§7.3) remain; which channels are enabled is a per-deployment choice.
+
+### 19.1 Channels
+- Introduce a channel abstraction: each enabled channel can (a) announce a pending request and (b) deliver an approve/deny decision plus the passphrase. Channels are `web` (§7.2), `admin` (§7.3) and `homeassistant`.
+- `[channels] enabled = ["web", "admin", "homeassistant"]`; at least one approval channel must be enabled, and `check-config` refuses to start otherwise.
+- A request may be resolved through any enabled channel. The first valid resolution wins; the others are told the request is closed (HA notification cleared, web URL gives 410).
+- A request fails with `INTERNAL` only if **every** enabled notification channel fails to announce it. A single channel failing is audited but not fatal.
+- If HA is the only channel, no HTTP listener or OIDC configuration is required.
+
+### 19.2 Connection to HA
+- Config:
+  ```toml
+  [homeassistant]
+  url = "http://homeassistant.local:8123"
+  token_file = "/etc/secretd/ha.token"          # long-lived access token, secretd-only (0400)
+  notify_service = "notify.mobile_app_owner_phone"
+  passphrase_entity = "input_text.secretd_passphrase"
+  owner_user_ids = ["<ha-user-id>"]             # allowlist, see 19.4
+  allow_insecure_http = false
+  ```
+- Use HA's WebSocket API (`/api/websocket`) for events and service calls, authenticated with the token. Reconnect with exponential backoff (1s up to 60s). While disconnected the channel is unavailable, which counts as a notification failure for new requests and is audited.
+- The token is sent over the network, so require an `https://` URL unless the host is loopback or `allow_insecure_http = true` is set explicitly (warn at startup, since a LAN-only HA is common). Never log the token.
+- Pin HA's CA/cert via an optional `ca_file`.
+
+### 19.3 Flow
+1. On a new pending request, call `notify_service` with the same details as §5 step 4 (secret name, uid/user, pid, exe, sanitized cmdline, labelled client reason, expiry, request id) and `data.tag = <request_id>`. Add two actions: `SECRETD_APPROVE_<request_id>_<approval_token>` and `SECRETD_DENY_<request_id>_<approval_token>`. The approval token is the same 256-bit per-request token as §5 and is **not** shown in the notification text.
+2. The owner types the passphrase into `passphrase_entity` (an `input_text` helper with `mode: password`, `max: 255`), then taps **Approve**. Passphrases longer than 255 characters are not supported on this channel; `check-config` documents this.
+3. On the `mobile_app_notification_action` event, secretd validates the action id (constant-time token compare, request still pending, event origin passes 19.4).
+   - **Deny:** resolve as denied, clear the notification.
+   - **Approve:** read the current state of `passphrase_entity`, then **immediately** call `input_text.set_value` with an empty string, whether or not decryption succeeds. If the entity was empty, do not attempt unseal. Re-notify "enter the passphrase first, then tap Approve" and keep the request pending. This does not count as a failed attempt.
+4. Run the normal approve path (§5 steps 6-7, including caller re-verification and the 3-attempt limit). On a wrong passphrase, send a follow-up notification with the attempts left, using the same tag.
+5. On success, failure or timeout, clear the notification (`message: clear_notification`, same tag).
+- Only one approval is processed at a time on this channel, since all requests share one entity. If a second Approve arrives while one is being processed, answer it with a "busy, try again" notification.
+
+### 19.4 Authorization of HA events
+- HA event context carries `user_id` for events caused by an authenticated user. Accept an action event only if `context.user_id` is present and in `owner_user_ids`. Events with a missing or non-listed user are ignored and audited (`ha_event_rejected`, with the user id if present, never the action id).
+- **Verify during implementation** that the Companion app's `mobile_app_notification_action` event reliably carries `context.user_id`. If it does not, document the weaker model (anyone who can fire events on the HA bus can still not approve without the per-request token, which only the notification contains) and add `ha_require_user_id = false` as an explicit opt-out. Record the finding in `docs/DECISIONS.md`.
+- The passphrase entity is read only in response to a valid Approve action for a pending request. Never read it on state changes.
+
+### 19.5 Security considerations
+- The passphrase transits HA: it is in the entity's state, the HA event bus and WebSocket, and may be written by the **recorder/history/logbook**. Anyone with admin access to HA can read it while it is set. This weakens the "owner device only" model and must be documented prominently in the README.
+- Required documentation: exclude `passphrase_entity` from `recorder`, `history` and `logbook` (give the YAML), use `mode: password`, keep HA behind its own strong auth/MFA, and use HTTPS to HA.
+- secretd must clear the entity immediately after reading it (step 3) and on request timeout/deny/disconnect. If clearing fails, retry and audit `ha_clear_failed`; do not release the secret until the clear has been attempted.
+- At startup, query the entity's current state. If it is non-empty, clear it and audit (a stale passphrase must not linger).
+- Notification text contains no passphrase and no approval token.
+- Audit events add a `channel` field (`web`, `admin`, `homeassistant`) to every approval-related event; new events: `ha_connected`, `ha_disconnected`, `ha_event_rejected`, `ha_clear_failed`.
+
+### 19.6 Tests
+- Mock HA WebSocket server: auth, reconnect with backoff, service calls recorded, event injection.
+- Approve with entity filled, approve with entity empty (re-prompt, no attempt consumed), deny, wrong passphrase then right, timeout clears notification.
+- Entity cleared after every read (verify via mock), including on wrong passphrase and on decrypt failure.
+- Event from a user not in `owner_user_ids`, a missing user id, a wrong token, an already-resolved request, and a second concurrent Approve (busy).
+- First-resolution-wins across channels (HA approve while web page is open → web gives 410).
+- Startup clears a stale non-empty entity.
+
+## 20. Named-pipe (FIFO) secrets (v1.1 extension)
+
+Lets a legacy program read a secret by opening a named pipe. A process opening the FIFO for reading triggers the same notification and approval flow as `secret.get`, and on approval the secret is written to the pipe.
+
+### 20.1 Config
+```toml
+[[fifo]]
+path = "/run/secretd/pipes/db-password"
+secret = "db-password"        # must exist in [[secret]]
+owner = "app"                 # user that may read; also the pipe's owner
+group = "app"
+mode = "0440"                 # default 0440; 0640/0660 only for owner/group use
+enforce_acl = false           # see 20.3
+```
+
+- `secretd` creates the FIFO at startup (`mkfifo`, then `fchown`/`chmod` to the configured values, ignoring umask) in a directory that is owned by the daemon user and not writable by others. If the path already exists it must be a FIFO owned by the daemon user, not a symlink (`lstat`); otherwise refuse to start. `O_NOFOLLOW` where available. Remove the FIFO on clean shutdown.
+- Access control is the FIFO's owner/group/mode. Permission to open the pipe is the first gate. The daemon user needs no extra privilege to create it.
+- Multiple `[[fifo]]` entries may map to the same secret.
+
+### 20.2 Detecting a reader
+- Keep the FIFO armed by repeatedly attempting `open(O_WRONLY | O_NONBLOCK)`: it fails with `ENXIO` until a reader exists and succeeds as soon as one opens. Poll (e.g. every 100-250 ms) or use `inotify` `IN_OPEN` to avoid busy polling. The wait must be cancellable at shutdown or SIGHUP reload. Do not use a blocking `open` that cannot be interrupted.
+- Ignore `SIGPIPE` process-wide; handle `EPIPE` on write as "reader went away".
+- When a reader is detected, start a pending request exactly as for `secret.get`, with the channel list from §19.1, with these differences:
+  - There is no `SO_PEERCRED` for pipes. Identify readers by scanning `/proc/*/fd/*` for entries resolving to the FIFO's `(st_dev, st_ino)`, excluding secretd itself, and keeping those whose `/proc/<pid>/fdinfo/<fd>` flags show read access. Capture pid, uid, gid, exe, sanitized cmdline and start time for each (same as §3.2). This needs the same `/proc` access as §3.2.
+  - The notification and audit entry say `via FIFO <path>` and mark the identities **best-effort** (a process may not be found because of a race or because it closed the fd).
+  - `reason` is `"read of <fifo path>"`.
+- The reader's open or read blocks while the owner approves. That is expected. Document that readers must tolerate blocking (up to the request timeout).
+
+### 20.3 Policy and verification
+- Per-request limits (§8) apply, keyed on the FIFO path: at most 1 pending request per FIFO, plus a per-FIFO attempt limit (default 10 per minute) and the global caps. After a denial or timeout, wait a cool-down (default 5 s) before re-arming to avoid notification spam from a program that retries in a loop. A new request is not started while one is pending for the same FIFO.
+- **Ambiguity rule:** if more than one distinct reader process holds the FIFO open for reading at request creation or at release, deny with audit `fifo_ambiguous`. A single write goes to one reader nondeterministically.
+- **Identity rule:** if `enforce_acl = true`, the single identified reader must satisfy the secret's ACL (§6: uid/gid and exe). If no reader can be identified, deny with audit `fifo_reader_unknown`. If `enforce_acl = false` (default), identification is informational for the owner and the FIFO's file permissions are the gate.
+- **Re-verification at release:** just before writing, re-scan; if the reader set differs from the snapshot (a different pid, exe or start time, or no readers left), abort with audit `caller_changed` and write nothing.
+- The same single-use approval rules apply: one approval releases the secret to exactly one open of the FIFO.
+
+### 20.4 Delivery
+- On approval, unseal and obtain the one secret (§4, `unseal_one`). Write the **raw** value (base64 secrets are decoded first) with no added newline, using a non-blocking write loop with a deadline (default 5 s) so a stuck reader cannot hold the secret in memory indefinitely. Then close the write end so the reader sees EOF, zeroize the value, and re-arm after the cool-down.
+- Handle `EPIPE`/`EAGAIN` timeouts: audit `aborted`, never retry the write on a later open.
+- Audit `released` only after the full value was written; if only part was written, audit `aborted` with the byte count (never the data).
+- A secret larger than the pipe buffer (64 KiB default) is supported through the loop; it is not required to be atomic.
+
+### 20.5 Security notes (document in README/HARDENING)
+- Any process allowed by file permissions can trigger a notification and, if approved, receives the secret. Without `enforce_acl` there is no exe pinning. Use a dedicated user/group, `0440`, and a private directory.
+- Reader identification by `/proc` scan is racy and best-effort. The owner's approval is still the real gate.
+- Same-uid readers can race to open the FIFO between the identified reader and the write, which the re-verification step narrows but cannot eliminate. A reader that is not the one the owner saw may get the secret if it opens the pipe at the right moment; the ambiguity check covers readers already present at release time.
+- The FIFO directory must not be reachable by untrusted users, and the daemon's systemd unit needs `ReadWritePaths` for it.
+
+### 20.6 Tests
+- Reader detection: open for read triggers a notification; no reader means no request; shutdown cancels the wait.
+- Approve → reader receives the exact bytes and then EOF; deny/timeout → EOF with no data; reader exits before approval → abort, nothing written, audited.
+- Identity capture (pid/uid/exe) in the notification; `enforce_acl` allow and deny; unknown-reader and two-readers (ambiguous) denial; reader-set change between request and release.
+- FIFO setup: refuses a symlink, a non-FIFO, wrong owner; sets owner/group/mode regardless of umask; cleans up on shutdown.
+- Cool-down and per-FIFO limits; binary secrets are written raw; large secret is written in full; stuck reader hits the write deadline.
+- Audit never contains the secret.
+
+## 21. Milestones for the extensions
+
+7. Channel abstraction: refactor notification and approval into channels without changing behavior (existing tests must still pass).
+8. Home Assistant channel (§19) with the mock HA server and docs on recorder exclusion.
+9. FIFO secrets (§20) with `[[fifo]]` config, `secretctl check-config` support, packaging (`ReadWritePaths`, tmpfiles) and docs.
+10. Security review of both extensions.
+
+## 22. Platform support (Linux and macOS)
+
+`secretd` builds, tests and runs on Linux and on macOS (Apple silicon and Intel). The OS-specific parts sit behind small traits or `cfg(target_os)` modules; behaviour on Linux is the reference and is unchanged by the macOS port. Other Unixes are not supported.
+
+### 22.1 Mechanisms per OS
+
+| Concern | Linux | macOS |
+|---|---|---|
+| Peer uid/gid | `SO_PEERCRED` (tokio `peer_cred`) | `LOCAL_PEERCRED` credentials via `getpeereid` (tokio `peer_cred`) |
+| Peer pid | `SO_PEERCRED` | `LOCAL_PEERPID` (`getsockopt(SOL_LOCAL)`), read by `secretd` itself: tokio would report `LOCAL_PEEREPID`, the effective pid, which differs for delegated sockets |
+| Pid-reuse handle | `SO_PEERPIDFD` pidfd where the kernel has it (liveness re-checked at release) | none; start time only |
+| Process identity (`ProcInfoReader`) | `/proc/<pid>/exe`, `cmdline` (256 bytes, sanitised), `stat` field 22 | `proc_pidpath` (exe), `sysctl(KERN_PROCARGS2)` argv only, environment never kept (best effort, same sanitising and 256-byte limit), `proc_pidinfo(PROC_PIDTBSDINFO)` `pbi_start_tvsec/tvusec` for the start time, `sysctl(KERN_PROC_PID)` `p_starttime` when `proc_pidinfo` is refused |
+| Process gone | `/proc/<pid>` missing | libproc/sysctl report `ESRCH` (mapped to `NotFound`) |
+| Deleted executable | ` (deleted)` suffix is always denied | no such concept: a binary whose vnode path cannot be resolved makes `proc_pidpath` fail, which is "unresolvable" and denied |
+| Core dumps / inspection | `RLIMIT_CORE=0`, `prctl(PR_SET_DUMPABLE, 0)` | `RLIMIT_CORE=0`, `ptrace(PT_DENY_ATTACH)` (best effort; a failure is only a warning) |
+| `mlock` | as before | as before (best effort) |
+| FIFO reader scan (§20.2) | `/proc/*/fd` and `fdinfo` flags | `proc_listpids`, `proc_pidinfo(PROC_PIDLISTFDS)`, `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`: match the file's device and inode, `FREAD` in the open flags means "reader" |
+| Socket activation | systemd `LISTEN_FDS`/`LISTEN_PID`/`LISTEN_FDNAMES` | none by default (plain bind); opt-in launchd activation of `Sockets` entries named `secretd` and `admin` through `launch_activate_socket` |
+| Default socket paths | `/run/secretd/secretd.sock`, `/run/secretd/admin.sock` | `/var/run/secretd/secretd.sock`, `/var/run/secretd/admin.sock` |
+| Default store | `/var/lib/secretd/store.age` | `/var/db/secretd/store.age` |
+| Service manager | `packaging/secretd.service`, `.socket`, `sysusers.d`, `tmpfiles.d` | `packaging/launchd/` (LaunchDaemon plist, example `[daemon]` section, `dscl` steps) |
+
+Explicit configuration works the same on both; only the defaults differ (`secret_proto::DEFAULT_RUN_DIR`, `DEFAULT_SOCKET`, `DEFAULT_ADMIN_SOCKET`, `DEFAULT_STORE`, also the default of the `secret` CLI).
+
+`start_time` in `ProcInfo` is OS-specific (clock ticks since boot on Linux, microseconds since the epoch on macOS) and is only ever compared for equality between two reads. The re-verification semantics of §3.2 are identical: a changed executable or start time gives `CALLER_CHANGED`; an unresolvable process is denied.
+
+### 22.2 Inspecting other users' processes
+
+A caller that cannot be resolved is denied (`proc_unavailable`, audited): that is the only failure mode, ACLs are never weakened. What the daemon may inspect decides which callers can work:
+
+* Linux: other uids need `CAP_SYS_PTRACE` (granted by the unit, see `docs/HARDENING.md`).
+* macOS: the same uid is always inspectable. For other uids the daemon needs root for descriptor tables (`PROC_PIDLISTFDS`, hence FIFO reader detection) and `KERN_PROCARGS2` (hence the command line, which is only context). `proc_pidpath` and the start time are expected to be available without root (`proc_pidpath` and `sysctl(KERN_PROC_PID)` are not restricted to the same user in XNU), but this is an observation about XNU, not an Apple-documented guarantee, so `secretd` checks it empirically at start-up.
+
+Start-up check (macOS only, after privileges were dropped): `secretd` reads the identity of pid 1 (`launchd`, owned by root). If that fails, then a secret whose ACL pins an executable (`allow_exes`) for anyone other than the daemon's own uid (any `allow_gids` entry counts) is a configuration error and the daemon **refuses to start**, naming the secret; `allow_any_exe` secrets for other users only produce a warning (their requests will be denied with `proc_unavailable`). The remedy is `daemon.user = "root"` (no privilege drop) or restricting the ACL to the daemon's own uid. FIFO readers of other users are unidentified when the daemon is not root: with `enforce_acl = true` they are refused (`fifo_reader_unknown`), without it the request shows an unidentified reader.
+
+### 22.3 Privileges and users
+
+Neither sysusers nor tmpfiles is assumed. On macOS the job is started by launchd as root, binds its sockets (creating `/var/run/secretd`, which macOS clears at boot), gives the client socket to the daemon user and group, drops to `daemon.user` (`_secretd`) and verifies root cannot be regained; this is the existing root-start path of §13, not a new one. The service account and groups are created with `dscl` (README in `packaging/launchd/`). FIFOs on macOS use a directory owned by the daemon user (`/var/db/secretd-pipes`), because `/var/run/secretd` is owned by root.
+
+### 22.4 FIFO semantics on macOS
+
+`open(O_WRONLY|O_NONBLOCK)` on a FIFO without a reader fails with `ENXIO` on both systems, and a reader still blocked in its own `open(O_RDONLY)` counts as a reader on both. The polling reader detection of §20.2 and the re-arm pause are unchanged. A vanished reader is detected through `poll(POLLOUT)` on the write end (`POLLERR` on Linux, `POLLHUP` expected on macOS; both are accepted) and, independently, as `EPIPE` on write. tokio waits with kqueue instead of epoll.
+
+### 22.5 Not supported or different
+
+* No `SO_PEERPIDFD`/pidfd on macOS: pid reuse is caught by the start time only.
+* No systemd-style sandbox on macOS (`ProtectSystem`, syscall filter, capability bounding, `MemoryDenyWriteExecute`): `PT_DENY_ATTACH`, `RLIMIT_CORE=0` and the dedicated account are the available hardening. Hardened-runtime/notarization entitlements are not used.
+* launchd socket activation is opt-in and not covered by automated tests.
+* Unix socket paths are limited to 104 bytes on macOS (108 on Linux).
+* Exe pinning is by path on both systems (not inode).
+
+### 22.6 Tests and CI
+
+Linux-only tests are gated with `#[cfg(target_os = "linux")]` (the `setpriv` multi-uid test, pidfd tests, the `/proc/<pid>/fdinfo` helpers). Pure parsers (`KERN_PROCARGS2`, `/proc/<pid>/stat`) are tested on every OS; macOS-only unit tests for the libproc/sysctl wrappers and `LOCAL_PEERPID` run on macOS. CI runs `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` on `ubuntu-latest` and `macos-latest`.

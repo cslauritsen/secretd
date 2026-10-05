@@ -397,9 +397,10 @@ async fn inject_output_file_mode_and_overwrite_protection() {
     assert!(leftovers.is_empty());
 }
 
-/// Real multi-uid check of SO_PEERCRED: needs root and `setpriv`, so it only
-/// runs with `SECRETD_TEST_MULTIUID=1` (the `secret` binary and its directory
-/// must also be reachable by uid 65534).
+/// Real multi-uid check of SO_PEERCRED: needs root and `setpriv` (util-linux,
+/// so Linux only), and only runs with `SECRETD_TEST_MULTIUID=1` (the `secret`
+/// binary and its directory must also be reachable by uid 65534).
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multiuid_real_peer_credentials() {
     use std::os::unix::fs::PermissionsExt;

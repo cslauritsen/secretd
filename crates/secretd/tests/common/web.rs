@@ -63,8 +63,11 @@ impl Web {
             limits: std::mem::take(&mut o.limits),
             timeout_secs: o.timeout_secs,
             notifier: o.notifier.take(),
+            channels: o.channels.take(),
+            extra_channels: std::mem::take(&mut o.extra_channels),
             notifier_from_cfg: Some(Box::new(|cfg: &Config| {
-                Arc::new(HttpNotifier::new(&cfg.notify).unwrap()) as Arc<dyn Notifier>
+                Arc::new(HttpNotifier::new(cfg.notify.as_ref().unwrap()).unwrap())
+                    as Arc<dyn Notifier>
             })),
             audit_writer: o.audit_writer.take(),
             peer: o.peer.take(),
@@ -80,9 +83,17 @@ impl Web {
         };
         let h = Harness::start(opts).await;
         let oidc_client = Arc::new(
-            OidcClient::new(h.cfg.approval.oidc.clone(), pw("client-secret-value")).unwrap(),
+            OidcClient::new(
+                h.cfg.approval.as_ref().unwrap().oidc.clone(),
+                pw("client-secret-value"),
+            )
+            .unwrap(),
         );
-        let app = approval::router(h.core.clone(), h.cfg.approval.clone(), oidc_client.clone());
+        let app = approval::router(
+            h.core.clone(),
+            h.cfg.approval.clone().unwrap(),
+            oidc_client.clone(),
+        );
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move {
@@ -269,6 +280,9 @@ pub fn notification_from_click(click: &str) -> secretd::notify::Notification {
         reason: None,
         expires_at: String::new(),
         approval_url: click.to_string(),
+        approval_token: String::new(),
+        via: None,
+        identified: true,
     }
 }
 

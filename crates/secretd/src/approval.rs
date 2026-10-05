@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
 use hmac::{Hmac, Mac};
-use secret_proto::config::ApprovalCfg;
+use secret_proto::config::{ApprovalCfg, ChannelKind};
 use secret_proto::rpc::PendingInfo;
 use secret_proto::sanitize;
 use sha2::Sha256;
@@ -487,7 +487,7 @@ impl AppState {
     }
 
     fn audit(&self, ev: AuditEvent) {
-        let _ = self.core.audit(&ev);
+        let _ = self.core.audit(&ev.channel(ChannelKind::Web));
     }
 
     fn rate_limited_response(&self, ip: IpAddr) -> Response {
@@ -499,6 +499,7 @@ impl AppState {
         let _ = self.core.audit_coalesced(
             AuditEvent::new("rate_limited")
                 .outcome(why)
+                .channel(ChannelKind::Web)
                 .source(Some(ip)),
             &ip.to_string(),
         );
@@ -603,15 +604,31 @@ fn approve_page(
     if let Some(d) = description {
         b.push_str(&row("Description", &esc(&sanitize::clean(d, 200))));
     }
-    b.push_str(&row(
-        "Caller",
-        &format!(
-            "uid {} ({}), pid {}",
-            info.uid,
-            esc(&info.username),
-            info.pid
-        ),
-    ));
+    if let Some(via) = &info.via {
+        b.push_str(&row(
+            "Requested",
+            &format!(
+                "{} <span class=\"note\">(caller identity is best effort)</span>",
+                esc(via)
+            ),
+        ));
+    }
+    if info.via.is_some() && info.pid == 0 {
+        b.push_str(&row(
+            "Caller",
+            "unknown (no reader process could be identified)",
+        ));
+    } else {
+        b.push_str(&row(
+            "Caller",
+            &format!(
+                "uid {} ({}), pid {}",
+                info.uid,
+                esc(&info.username),
+                info.pid
+            ),
+        ));
+    }
     b.push_str(&row(
         "Executable",
         &format!("<code>{}</code>", esc(&info.exe)),

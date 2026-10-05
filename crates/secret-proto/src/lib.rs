@@ -15,11 +15,39 @@ pub mod config;
 pub mod mem;
 #[cfg(feature = "server")]
 pub mod store;
+#[cfg(feature = "server")]
+pub mod sys;
 
 pub use rpc::{
     Encoding, ErrorKind, GetParams, GetResult, ListResult, PendingInfo, PingResult, Request,
     Response, RpcError,
 };
+
+/// Directory of the daemon's runtime sockets (spec section 22): `/run` is a
+/// tmpfs on Linux; macOS has no `/run`, its equivalent is `/var/run`.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_RUN_DIR: &str = "/var/run/secretd";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_RUN_DIR: &str = "/run/secretd";
+
+/// Default client socket path (per OS, see [`DEFAULT_RUN_DIR`]).
+#[cfg(target_os = "macos")]
+pub const DEFAULT_SOCKET: &str = "/var/run/secretd/secretd.sock";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_SOCKET: &str = "/run/secretd/secretd.sock";
+
+/// Default admin socket path (per OS).
+#[cfg(target_os = "macos")]
+pub const DEFAULT_ADMIN_SOCKET: &str = "/var/run/secretd/admin.sock";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_ADMIN_SOCKET: &str = "/run/secretd/admin.sock";
+
+/// Default location of the encrypted store (per OS): macOS has no `/var/lib`;
+/// `/var/db` is where daemons keep state there.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_STORE: &str = "/var/db/secretd/store.age";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_STORE: &str = "/var/lib/secretd/store.age";
 
 /// Maximum length of one protocol line (excluding the newline): 64 KiB.
 pub const MAX_LINE_LEN: usize = 64 * 1024;
