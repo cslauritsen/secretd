@@ -160,6 +160,7 @@ async fn run() -> Result<()> {
         web_parts = Some((approval_cfg.clone(), oidc));
     }
     let mut ha_channel = None;
+    let mut ha_reload: Option<Arc<HaChannel>> = None;
     if let (true, Some(ha_cfg)) = (
         cfg.channels.has(ChannelKind::HomeAssistant),
         &cfg.homeassistant,
@@ -168,6 +169,7 @@ async fn run() -> Result<()> {
             .map_err(|e| anyhow!("{e}"))?;
         let ha = HaChannel::new(ha_cfg, token).context("setting up the Home Assistant channel")?;
         channels.push(ha.clone());
+        ha_reload = Some(ha.clone());
         ha_channel = Some(ha);
     }
     if want_admin {
@@ -225,8 +227,25 @@ async fn run() -> Result<()> {
                 match load_config(&args.config) {
                     Ok(c) => {
                         let new_fifos = c.fifos.clone();
+                        // Settings that only a restart applies are named, not
+                        // silently ignored; the Home Assistant approver
+                        // allowlist is applied now (revocation must not wait).
+                        let restart = secretd::reload::restart_required(&core.config(), &c);
+                        if let Some(ha) = &ha_reload {
+                            ha.apply_config(c.homeassistant.as_ref());
+                            tracing::info!(
+                                "home assistant approver allowlist reloaded ({} user id(s))",
+                                c.homeassistant.as_ref().map_or(0, |h| h.owner_user_ids.len())
+                            );
+                        }
                         core.set_config(c);
-                        tracing::info!("configuration reloaded");
+                        tracing::info!("configuration reloaded (secrets, limits, timeouts, pipes and the home assistant allowlist)");
+                        for section in &restart {
+                            tracing::warn!(
+                                "[{section}] changed in the configuration file but is NOT applied: \
+                                 it only takes effect after a restart of secretd"
+                            );
+                        }
                         // Pipes are re-armed only if their configuration changed
                         // (every wait is cancelled first).
                         if new_fifos != fifo_cfgs {

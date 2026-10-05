@@ -18,5 +18,6 @@ pub mod oidc;
 pub mod peer;
 pub mod platform;
 pub mod procinfo;
+pub mod reload;
 pub mod runtime;
 pub mod server;
