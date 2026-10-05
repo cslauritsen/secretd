@@ -12,7 +12,7 @@ use secret_proto::rpc::{ErrorKind, GetParams, PendingInfo, RpcError};
 use secret_proto::sanitize;
 use secret_proto::store::{self, Passphrase, StoreError};
 use secret_proto::{valid_secret_name, Encoding, MAX_REASON_CHARS};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
@@ -208,6 +208,31 @@ struct State {
     conns_total: usize,
 }
 
+/// How long an announcement that is still in flight when its request is
+/// resolved may keep going before it is abandoned.
+const ANNOUNCE_GRACE: Duration = Duration::from_secs(15);
+
+/// Announcements still running when their request was resolved.
+struct LateAnnounces {
+    tasks: tokio::task::JoinSet<(usize, ChannelKind, Result<(), ()>)>,
+    /// Task id -> index into the channel list.
+    idx: HashMap<tokio::task::Id, usize>,
+}
+
+/// Add the identity of the requester (and the pipe) to an audit event.
+fn stamp(mut ev: AuditEvent, caller: Option<&Caller>, origin: &Origin) -> AuditEvent {
+    if let Origin::Fifo(p) = origin {
+        ev.fifo = Some(p.clone());
+    }
+    if let Some(c) = caller {
+        ev.uid = Some(c.uid);
+        ev.gid = Some(c.gid);
+        ev.pid = Some(c.pid);
+        ev.exe = c.proc.as_ref().map(|p| p.exe.clone());
+    }
+    ev
+}
+
 /// Default window over which repeated rejections are folded into one summary line.
 pub const COALESCE_WINDOW: Duration = Duration::from_secs(60);
 const COALESCE_MAX_KEYS: usize = 4096;
@@ -226,7 +251,7 @@ pub struct Core {
     state: Mutex<State>,
     coalesce: Mutex<HashMap<CoalesceKey, Slot>>,
     coalesce_window: Mutex<Duration>,
-    audit: Audit,
+    audit: Arc<Audit>,
     channels: Vec<Arc<dyn Channel>>,
     procs: Arc<dyn ProcInfoReader>,
     /// Serialises unsealing: one scrypt derivation can need hundreds of MiB.
@@ -234,6 +259,9 @@ pub struct Core {
     /// Test hook: artificial delay inside the blocking unseal task, to widen
     /// the race window between approve and deny/timeout/disconnect.
     unseal_delay: Mutex<Duration>,
+    /// How long announcements still running after their request resolved may
+    /// continue (test hook; defaults to [`ANNOUNCE_GRACE`]).
+    announce_grace: Mutex<Duration>,
 }
 
 /// Decrements the connection counters when dropped.
@@ -307,11 +335,12 @@ impl Core {
             state: Mutex::new(State::default()),
             coalesce: Mutex::new(HashMap::new()),
             coalesce_window: Mutex::new(COALESCE_WINDOW),
-            audit,
+            audit: Arc::new(audit),
             channels,
             procs,
             unseal_gate: tokio::sync::Semaphore::new(1),
             unseal_delay: Mutex::new(Duration::ZERO),
+            announce_grace: Mutex::new(ANNOUNCE_GRACE),
         })
     }
 
@@ -319,6 +348,15 @@ impl Core {
     #[doc(hidden)]
     pub fn set_unseal_delay(&self, d: Duration) {
         *self.unseal_delay.lock().unwrap_or_else(|e| e.into_inner()) = d;
+    }
+
+    /// Test hook: shorten the grace period of in-flight announcements.
+    #[doc(hidden)]
+    pub fn set_announce_grace(&self, d: Duration) {
+        *self
+            .announce_grace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = d;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -353,17 +391,11 @@ impl Core {
     /// and the FIFO path for pipe requests.
     pub fn audit_req(
         &self,
-        mut ev: AuditEvent,
+        ev: AuditEvent,
         caller: Option<&Caller>,
         origin: &Origin,
     ) -> io::Result<()> {
-        if let Origin::Fifo(p) = origin {
-            ev.fifo = Some(p.clone());
-        }
-        match caller {
-            Some(c) => self.audit_for(ev, c),
-            None => self.audit(&ev),
-        }
+        self.audit(&stamp(ev, caller, origin))
     }
 
     fn rejection_event(
@@ -839,20 +871,27 @@ impl Core {
         });
 
         // Announce on every enabled notification channel at once.
-        let mut announces: tokio::task::JoinSet<(ChannelKind, Result<(), ()>)> =
+        let mut announces: tokio::task::JoinSet<(usize, ChannelKind, Result<(), ()>)> =
             tokio::task::JoinSet::new();
-        for ch in self.channels.iter().filter(|c| c.announces()) {
+        let mut task_idx: HashMap<tokio::task::Id, usize> = HashMap::new();
+        for (idx, ch) in self
+            .channels
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.announces())
+        {
             let (ch, n) = (ch.clone(), notification.clone());
-            announces.spawn(async move {
+            let handle = announces.spawn(async move {
                 let kind = ch.kind();
                 match ch.announce(&n).await {
-                    Ok(()) => (kind, Ok(())),
+                    Ok(()) => (idx, kind, Ok(())),
                     Err(e) => {
                         tracing::error!("{} channel: {e}", kind.as_str());
-                        (kind, Err(()))
+                        (idx, kind, Err(()))
                     }
                 }
             });
+            task_idx.insert(handle.id(), idx);
         }
         // With no announcing channel (admin only) the request is armed at once.
         let mut notified = announces.is_empty();
@@ -870,8 +909,13 @@ impl Core {
         // ends the request when every announcing channel failed.
         let mut done = loop {
             tokio::select! {
-                Some(joined) = announces.join_next(), if !announces.is_empty() => {
-                    let Ok((kind, res)) = joined else {
+                Some(joined) = announces.join_next_with_id(), if !announces.is_empty() => {
+                    let (tid, joined) = match joined {
+                        Ok((tid, v)) => (tid, Ok(v)),
+                        Err(e) => (e.id(), Err(e)),
+                    };
+                    task_idx.remove(&tid);
+                    let Ok((_, kind, res)) = joined else {
                         // The announce task itself panicked: count it as a failure.
                         if announces.is_empty() && !notified {
                             break Done::NotifyFailed;
@@ -981,15 +1025,91 @@ impl Core {
         // Tell every channel that the request is closed (first resolution
         // wins: a Home Assistant notification is cleared, the web URL already
         // answers 410). Detached so a slow channel never delays the client.
-        self.close_channels(&id, why);
+        // Announcements still in flight are not abandoned: they finish (within
+        // a grace period), are audited, and only then is their channel told.
+        let late = (!announces.is_empty()).then(|| LateAnnounces {
+            tasks: announces,
+            idx: task_idx,
+        });
+        self.close_channels(&id, &name, why, late, caller.cloned(), origin);
         result
     }
 
-    fn close_channels(&self, id: &str, why: Closed) {
-        for ch in &self.channels {
-            let (ch, id) = (ch.clone(), id.to_string());
-            tokio::spawn(async move { ch.closed(&id, why).await });
+    fn close_channels(
+        &self,
+        id: &str,
+        name: &str,
+        why: Closed,
+        late: Option<LateAnnounces>,
+        caller: Option<Caller>,
+        origin: Origin,
+    ) {
+        let waiting: HashSet<usize> = late
+            .as_ref()
+            .map(|l| l.idx.values().copied().collect())
+            .unwrap_or_default();
+        for (i, ch) in self.channels.iter().enumerate() {
+            if !waiting.contains(&i) {
+                let (ch, id) = (ch.clone(), id.to_string());
+                tokio::spawn(async move { ch.closed(&id, why).await });
+            }
         }
+        let Some(mut late) = late else { return };
+        let (chans, audit) = (self.channels.clone(), self.audit.clone());
+        let (id, name) = (id.to_string(), name.to_string());
+        let grace = *self
+            .announce_grace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tokio::spawn(async move {
+            let deadline = Instant::now() + grace;
+            let log = |ev: AuditEvent| {
+                let ev = stamp(ev.request(&id).secret(&name), caller.as_ref(), &origin);
+                if let Err(e) = audit.log(&ev) {
+                    tracing::error!("audit log write failed: {e}");
+                }
+            };
+            let close = |idx: usize| {
+                let (ch, id) = (chans[idx].clone(), id.clone());
+                tokio::spawn(async move { ch.closed(&id, why).await });
+            };
+            let mut waiting = waiting;
+            loop {
+                match tokio::time::timeout_at(deadline, late.tasks.join_next_with_id()).await {
+                    Ok(None) => break,
+                    Ok(Some(Ok((_, (idx, kind, res))))) => {
+                        let ev = match res {
+                            Ok(()) => AuditEvent::new("notified"),
+                            Err(()) => AuditEvent::new("notify_failed"),
+                        };
+                        log(ev
+                            .channel(kind)
+                            .detail("announcement finished after the request was closed"));
+                        waiting.remove(&idx);
+                        close(idx);
+                    }
+                    Ok(Some(Err(e))) => {
+                        if let Some(idx) = late.idx.get(&e.id()).copied() {
+                            waiting.remove(&idx);
+                            close(idx);
+                        }
+                    }
+                    Err(_) => {
+                        // Grace period over: give up on the stragglers.
+                        late.tasks.abort_all();
+                        while late.tasks.join_next().await.is_some() {}
+                        for idx in waiting.drain() {
+                            log(AuditEvent::new("notify_failed")
+                                .channel(chans[idx].kind())
+                                .outcome("timeout")
+                                .detail("still announcing after the request was closed"));
+                            close(idx);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Returns false if the uid exceeded its per-minute `secret.get` budget.
@@ -1239,7 +1359,9 @@ impl Core {
                 AuditEvent::new("acl_denied")
                     .request(id)
                     .secret(&name)
-                    .outcome("acl_changed"),
+                    .outcome("acl_changed")
+                    .source(source.ip())
+                    .channel(source.channel()),
                 caller.as_ref(),
                 &origin,
             );
