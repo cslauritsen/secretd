@@ -160,6 +160,8 @@ async fn reconnects_with_exponential_backoff_and_resets() {
         ..Opts::default()
     })
     .await;
+    // Every connect line is wanted here (the coalescer has its own test).
+    h.core.set_coalesce_window(Duration::ZERO);
     let task = tokio::spawn(chan.clone().run(h.core.clone()));
     ha.wait_connected().await;
     let t = ha.connections();
@@ -342,29 +344,38 @@ async fn wrong_passphrase_then_right_one() {
     assert!(!env.h.audit_raw().contains("wrong guess"));
 }
 
+/// Wait until no approval is being processed on the channel.
+async fn wait_idle(chan: &HaChannel) {
+    for _ in 0..600 {
+        if !chan.is_approving() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the approval gate never opened");
+}
+
 #[tokio::test]
 async fn three_wrong_passphrases_deny_and_clear() {
     let env = start_env().await.ready().await;
     let (mut c, id, (approve, _)) = env.request("db-password", 0).await;
-    for i in 0..3 {
+    for i in 0..3usize {
         env.ha.set_state(ENTITY, "nope");
         env.ha.inject_action(&approve, Some(OWNER));
-        env.ha
-            .wait_until("the guess to be consumed", |m| m.count("set_value:") > i)
-            .await;
-        // Give the attempt time to finish before the next tap.
-        for _ in 0..200 {
-            if env
-                .h
-                .audit_events()
-                .iter()
-                .filter(|e| *e == "decrypt_failed")
-                .count()
-                > i
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        if i < 2 {
+            // The attempt is over once the "wrong passphrase" follow-up is out
+            // (it is the (i+1)th notification after the announcement) and the
+            // approval gate is open again. Tapping Approve earlier would be
+            // answered "busy" (which the channel does by design), so this
+            // waits for the state, not for a log line that is written first:
+            // polling the audit log for `decrypt_failed` raced with the
+            // approval handler still sending its follow-up.
+            let n = env.ha.wait_notification(i + 1).await;
+            assert!(n["service_data"]["title"]
+                .as_str()
+                .unwrap()
+                .contains("Wrong passphrase"));
+            wait_idle(&env.chan).await;
         }
     }
     assert_eq!(err_kind(&c.recv().await.unwrap()), "DECRYPT_FAILED");
@@ -375,6 +386,39 @@ async fn three_wrong_passphrases_deny_and_clear() {
         .ha
         .timeline()
         .contains(&format!("clear_notification:{id}")));
+    assert_eq!(env.ha.count("set_value:"), 3, "one clear per read");
+    // The owner is told the request is over (a separate, action-less message).
+    env.ha
+        .wait_until("outcome notification", |m| {
+            m.count(&format!("notify:secretd-result-{id}:")) == 1
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_follow_up_in_flight_does_not_block_the_next_approval() {
+    // Regression for the flaky `three_wrong_passphrases_deny_and_clear`: the
+    // approval gate used to stay closed while the "wrong passphrase"
+    // follow-up was being sent, so an Approve tapped just after the attempt
+    // was answered "busy" (and never read the entity).
+    let env = start_env().await.ready().await;
+    let (mut c, _id, (approve, _)) = env.request("db-password", 0).await;
+    env.ha.hold_notify_replies(true);
+    env.ha.set_state(ENTITY, "wrong guess");
+    env.ha.inject_action(&approve, Some(OWNER));
+    env.ha
+        .wait_until("the follow-up to be sent", |m| {
+            m.timeline().iter().any(|t| t.contains("Wrong passphrase"))
+        })
+        .await;
+    // HA has not answered the follow-up yet, but the attempt is over.
+    assert!(!env.chan.is_approving(), "gate held while notifying");
+    let reads = env.ha.get_states_count();
+    env.ha.set_state(ENTITY, PASS);
+    env.ha.inject_action(&approve, Some(OWNER));
+    assert_eq!(value_of(&mut c).await, "hunter2-secret-value");
+    assert_eq!(env.ha.get_states_count(), reads + 1, "read, not busy");
+    env.ha.release_replies();
 }
 
 #[tokio::test]
@@ -417,13 +461,18 @@ async fn clear_failure_is_retried_audited_and_not_fatal() {
     env.ha.inject_action(&approve, Some(OWNER));
     // The clear was attempted (3 times) before the release went ahead.
     assert_eq!(value_of(&mut c).await, "hunter2-secret-value");
-    assert_eq!(env.ha.count("set_value:"), 3);
+    assert!(env.ha.count("set_value:") >= 3);
     assert!(audit_has(
         &env.h,
         "ha_clear_failed",
         "channel",
         "homeassistant"
     ));
+    // Closing the request retries (3 more attempts) because a clear is owed.
+    env.ha
+        .wait_until("the retry at close", |m| m.count("set_value:") >= 6)
+        .await;
+    assert_eq!(env.ha.state(ENTITY), PASS, "still there: HA refused");
 }
 
 #[tokio::test]
@@ -708,4 +757,401 @@ async fn web_approval_clears_the_home_assistant_notification() {
         "unknown_request"
     ));
     task.abort();
+}
+
+// ------------------------------------------------ passphrase entity handling
+
+/// Wait (bounded) for a condition on the daemon side.
+async fn wait_for(what: &str, f: impl Fn() -> bool) {
+    for _ in 0..600 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test]
+async fn closing_one_request_keeps_a_passphrase_typed_for_another() {
+    let env = start_env().await.ready().await;
+    let (ca, id_a, _) = env.request("db-password", 0).await;
+    let (cb, id_b, _) = env.request("second", 1).await;
+    // The owner is typing the passphrase for B ...
+    env.ha.set_state(ENTITY, "typed-for-B");
+    // ... when A goes away (the client disconnects).
+    drop(ca);
+    env.ha
+        .wait_until("A's notification cleared", |m| {
+            m.timeline().contains(&format!("clear_notification:{id_a}"))
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(env.ha.state(ENTITY), "typed-for-B", "B's passphrase wiped");
+    assert_eq!(env.ha.count("set_value:"), 0);
+    assert_eq!(env.h.core.pending_count(), 1);
+    // B is the last request: when it closes, the entity is cleared.
+    drop(cb);
+    env.ha
+        .wait_until("B's cleanup", |m| {
+            m.timeline().contains(&format!("clear_notification:{id_b}"))
+                && m.state(ENTITY).is_empty()
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn release_through_another_channel_clears_a_typed_passphrase() {
+    let env = start_env().await.ready().await;
+    let (mut c, id, _) = env.request("db-password", 0).await;
+    // The owner typed the passphrase into HA but approves on the admin socket.
+    env.ha.set_state(ENTITY, "typed-into-ha");
+    assert_eq!(
+        env.h
+            .core
+            .approve(&id, pw(PASS), secretd::core::Source::Admin)
+            .await,
+        secretd::core::ApproveOutcome::Released
+    );
+    assert_eq!(value_of(&mut c).await, "hunter2-secret-value");
+    env.ha
+        .wait_until("the typed passphrase to be cleared", |m| {
+            m.state(ENTITY).is_empty()
+        })
+        .await;
+    assert!(!env.h.audit_raw().contains("typed-into-ha"));
+}
+
+#[tokio::test]
+async fn a_failed_clear_is_retried_when_the_request_closes() {
+    let env = start_env().await.ready().await;
+    let (mut c, _id, (approve, _)) = env.request("db-password", 0).await;
+    env.ha.fail_service("input_text.set_value");
+    env.ha.set_state(ENTITY, PASS);
+    env.ha.inject_action(&approve, Some(OWNER));
+    assert_eq!(value_of(&mut c).await, "hunter2-secret-value");
+    assert_eq!(env.ha.state(ENTITY), PASS, "the clear failed");
+    // HA recovers: the clear owed by the closed request goes through.
+    env.ha
+        .wait_until("first failures", |m| m.count("set_value:") >= 3)
+        .await;
+    env.ha.unfail_service("input_text.set_value");
+    env.ha
+        .wait_until("the owed clear", |m| m.state(ENTITY).is_empty())
+        .await;
+    assert!(audit_has(
+        &env.h,
+        "ha_clear_failed",
+        "channel",
+        "homeassistant"
+    ));
+}
+
+#[tokio::test]
+async fn an_owed_clear_is_settled_at_reconnect_even_with_requests_pending() {
+    let env = start_env().await.ready().await;
+    let (mut ca, _a, (approve_a, _)) = env.request("db-password", 0).await;
+    let (_cb, _b, _) = env.request("second", 1).await;
+    // A is approved but HA refuses every clear: PASS stays in the entity.
+    env.ha.fail_service("input_text.set_value");
+    env.ha.set_state(ENTITY, PASS);
+    env.ha.inject_action(&approve_a, Some(OWNER));
+    assert_eq!(value_of(&mut ca).await, "hunter2-secret-value");
+    env.ha
+        .wait_until("failed clears", |m| m.count("set_value:") >= 3)
+        .await;
+    assert_eq!(env.ha.state(ENTITY), PASS);
+    // B is still pending, so the entity is left alone while connected ...
+    // (the owner may be typing for B) ... but the link drops, HA recovers and
+    // the connection comes back: the passphrase that was already used goes.
+    env.ha.unfail_service("input_text.set_value");
+    env.ha.drop_connection();
+    wait_for("the link to come back", || {
+        env.chan.is_connected() && env.ha.state(ENTITY).is_empty()
+    })
+    .await;
+    assert!(env
+        .h
+        .audit_lines()
+        .iter()
+        .any(|l| { l["event"] == "ha_entity_cleared" && l["outcome"] == "owed" }));
+}
+
+#[tokio::test]
+async fn a_failed_read_still_clears_the_entity() {
+    let env = start_env().await.ready().await;
+    let (mut c, _id, (approve, _)) = env.request("db-password", 0).await;
+    // HA answers the state query with an error: the typed passphrase is
+    // still in the entity and must not be left there.
+    env.ha.set_state(ENTITY, PASS);
+    env.ha.fail_get_states(true);
+    env.ha.inject_action(&approve, Some(OWNER));
+    let n = env.ha.wait_notification(1).await;
+    assert!(n["service_data"]["title"]
+        .as_str()
+        .unwrap()
+        .contains("Cannot read"));
+    assert_eq!(env.ha.state(ENTITY), "", "cleared after the failed read");
+    assert_eq!(env.ha.count("set_value:"), 1);
+    assert!(n["service_data"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("cleared"));
+    // The request is still pending; the owner types it again and it works.
+    env.ha.fail_get_states(false);
+    env.ha.set_state(ENTITY, PASS);
+    env.ha.inject_action(&approve, Some(OWNER));
+    assert_eq!(value_of(&mut c).await, "hunter2-secret-value");
+}
+
+#[tokio::test]
+async fn a_read_that_loses_the_connection_still_ends_with_a_cleared_entity() {
+    let env = start_env().await.ready().await;
+    let (_c, _id, (approve, _)) = env.request("db-password", 0).await;
+    env.ha.set_state(ENTITY, PASS);
+    env.ha.drop_on_get_states(true);
+    env.ha.inject_action(&approve, Some(OWNER));
+    // The link dies mid-read: the clear is retried (and, if it cannot get
+    // through, owed until the reconnect).
+    wait_for("the disconnect", || !env.chan.is_connected()).await;
+    env.ha.drop_on_get_states(false);
+    wait_for("reconnect and the owed clear", || {
+        env.chan.is_connected() && env.ha.state(ENTITY).is_empty()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn outcomes_that_consume_the_passphrase_notify_the_owner() {
+    // Aborted: the client goes away while the store is being unsealed.
+    let env = start_env().await.ready().await;
+    env.h.core.set_unseal_delay(Duration::from_millis(600));
+    let (c, id, (approve, _)) = env.request("db-password", 0).await;
+    env.ha.set_state(ENTITY, PASS);
+    env.ha.inject_action(&approve, Some(OWNER));
+    wait_for("the approval to start", || {
+        env.h
+            .audit_events()
+            .contains(&"approve_attempt".to_string())
+    })
+    .await;
+    drop(c);
+    let tag = format!("notify:secretd-result-{id}:");
+    env.ha
+        .wait_until("the outcome notification", |m| m.count(&tag) == 1)
+        .await;
+    let n = env
+        .ha
+        .notifications()
+        .into_iter()
+        .find(|n| n["service_data"]["data"]["tag"] == format!("secretd-result-{id}").as_str())
+        .unwrap();
+    assert!(n["service_data"]["title"]
+        .as_str()
+        .unwrap()
+        .contains("aborted"));
+    assert!(n["service_data"]["data"]["actions"].is_null(), "no buttons");
+    assert!(!env.h.audit_raw().contains(PASS));
+    drop(env);
+
+    // CallerChanged: the requesting process is not the one that connected.
+    let env = start_env().await.ready().await;
+    let (mut c, id, (approve, _)) = env.request("db-password", 0).await;
+    env.h.procs.set(
+        PID,
+        secretd::procinfo::ProcInfo {
+            exe: "/opt/test/bin/imposter".into(),
+            ..psql_proc()
+        },
+    );
+    env.ha.set_state(ENTITY, PASS);
+    env.ha.inject_action(&approve, Some(OWNER));
+    assert_eq!(err_kind(&c.recv().await.unwrap()), "CALLER_CHANGED");
+    let tag = format!("notify:secretd-result-{id}:");
+    env.ha
+        .wait_until("the outcome notification", |m| m.count(&tag) == 1)
+        .await;
+    let n = env
+        .ha
+        .notifications()
+        .into_iter()
+        .find(|n| n["service_data"]["data"]["tag"] == format!("secretd-result-{id}").as_str())
+        .unwrap();
+    assert!(n["service_data"]["title"]
+        .as_str()
+        .unwrap()
+        .contains("caller changed"));
+    assert_eq!(env.ha.state(ENTITY), "");
+}
+
+#[tokio::test]
+async fn auth_invalid_is_retried_slowly_and_audited_once() {
+    let ha = MockHa::start().await;
+    let chan = HaChannel::new(&ha_cfg(&ha.url()), pw("revoked-token")).unwrap();
+    chan.set_auth_invalid_backoff(Duration::from_millis(500));
+    let h = Harness::start(Opts {
+        channels: Some(vec![chan.clone(), Arc::new(AdminChannel)]),
+        ..Opts::default()
+    })
+    .await;
+    let task = tokio::spawn(chan.clone().run(h.core.clone()));
+    ha.wait_until("the first rejection", |m| m.auth_failures() >= 1)
+        .await;
+    // The normal backoff (50 ms here) would have retried several times by now.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(ha.auth_failures(), 1, "no fast retries after auth_invalid");
+    // It does retry later (500 ms, then doubled), and audits only once.
+    ha.wait_until("the second attempt", |m| m.auth_failures() >= 2)
+        .await;
+    let n = h
+        .audit_events()
+        .iter()
+        .filter(|e| *e == "ha_auth_invalid")
+        .count();
+    assert_eq!(n, 1, "{:?}", h.audit_events());
+    assert!(!h.audit_raw().contains("revoked-token"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_notification_that_could_not_be_cleared_is_cleared_at_reconnect() {
+    let env = start_env().await.ready().await;
+    let (c, id, _) = env.request("db-password", 0).await;
+    env.ha.set_state(ENTITY, "typed-while-down");
+    // The link goes down and stays down.
+    env.ha.reject_next(10_000);
+    env.ha.drop_connection();
+    wait_for("the disconnect", || !env.chan.is_connected()).await;
+    // The request ends while HA cannot be reached.
+    drop(c);
+    wait_for("the request to close", || env.h.core.pending_count() == 0).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!env
+        .ha
+        .timeline()
+        .contains(&format!("clear_notification:{id}")));
+    // HA comes back: the stale notification and the passphrase are cleared.
+    env.ha.reject_next(0);
+    env.ha
+        .wait_until("the deferred clean-up", |m| {
+            m.timeline().contains(&format!("clear_notification:{id}")) && m.state(ENTITY).is_empty()
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn connect_and_disconnect_audit_lines_are_coalesced() {
+    let env = start_env().await.ready().await;
+    for _ in 0..3 {
+        env.ha.drop_connection();
+        wait_for("the disconnect", || !env.chan.is_connected()).await;
+        wait_for("the reconnect", || env.chan.is_connected()).await;
+    }
+    let count = |e: &str| env.h.audit_events().iter().filter(|x| *x == e).count();
+    assert_eq!(count("ha_connected"), 1, "{:?}", env.h.audit_events());
+    assert_eq!(count("ha_disconnected"), 1);
+    env.h.core.flush_audit_summaries(true);
+    let summaries: Vec<String> = env
+        .h
+        .audit_lines()
+        .iter()
+        .filter(|l| {
+            l["detail"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("summary"))
+        })
+        .map(|l| format!("{} {}", l["event"], l["detail"]))
+        .collect();
+    assert!(
+        summaries
+            .iter()
+            .any(|s| s.contains("ha_connected") && s.contains("3 further")),
+        "{summaries:?}"
+    );
+    assert!(
+        summaries
+            .iter()
+            .any(|s| s.contains("ha_disconnected") && s.contains("2 further")),
+        "{summaries:?}"
+    );
+}
+
+#[tokio::test]
+async fn at_most_sixteen_action_events_are_handled_at_once() {
+    let env = start_env().await.ready().await;
+    let (_c, _id, (approve, _)) = env.request("db-password", 0).await;
+    // Sixteen handlers get stuck waiting for HA: one on the state query, the
+    // other fifteen on their "busy" answers.
+    env.ha.hold_replies(true);
+    for _ in 0..16 {
+        env.ha.inject_action(&approve, Some(OWNER));
+    }
+    env.ha
+        .wait_until("sixteen blocked handlers", |m| m.held_count() == 16)
+        .await;
+    // A seventeenth and further events are dropped, not handled: handling one
+    // would audit a rejection (one per distinct user).
+    for i in 0..10 {
+        env.ha
+            .inject_action(&approve, Some(&format!("mallory-{i}")));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !env.h
+            .audit_events()
+            .contains(&"ha_event_rejected".to_string()),
+        "events beyond the cap were handled"
+    );
+    assert_eq!(env.ha.held_count(), 16);
+    // Once the handlers finish, their permits are free again.
+    env.ha.release_replies();
+    wait_idle(&env.chan).await;
+    env.ha.inject_action(&approve, Some("mallory-late"));
+    wait_for("an event to be handled again", || {
+        env.h.audit_lines().iter().any(|l| {
+            l["event"] == "ha_event_rejected"
+                && l["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("mallory-late"))
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn revoking_a_user_id_by_reload_takes_effect() {
+    let env = start_env().await.ready().await;
+    let (mut c, _id, (approve, _)) = env.request("db-password", 0).await;
+    env.ha.set_state(ENTITY, PASS);
+    let reads = env.ha.get_states_count();
+    // The owner's id is removed from the allowlist (what a SIGHUP applies).
+    let mut cfg = ha_cfg(&env.ha.url());
+    cfg.owner_user_ids = vec!["the-new-owner".into()];
+    env.chan.apply_config(Some(&cfg));
+    env.ha.inject_action(&approve, Some(OWNER));
+    wait_for("the rejection", || {
+        audit_has(&env.h, "ha_event_rejected", "outcome", "user_not_allowed")
+    })
+    .await;
+    assert_eq!(env.h.core.pending_count(), 1, "request untouched");
+    assert_eq!(env.ha.get_states_count(), reads, "entity never read");
+    assert_eq!(env.ha.state(ENTITY), PASS);
+    // Removing the section altogether rejects everybody.
+    env.chan.apply_config(None);
+    env.ha.inject_action(&approve, Some("the-new-owner"));
+    env.ha.inject_action(&approve, Some("another-user"));
+    wait_for("two more rejections", || {
+        env.h
+            .audit_lines()
+            .iter()
+            .filter(|l| l["event"] == "ha_event_rejected")
+            .count()
+            >= 3
+    })
+    .await;
+    assert_eq!(env.h.core.pending_count(), 1);
+    // The new list is live: the new owner can approve.
+    env.chan.apply_config(Some(&cfg));
+    env.ha.inject_action(&approve, Some("the-new-owner"));
+    assert_eq!(value_of(&mut c).await, "hunter2-secret-value");
 }

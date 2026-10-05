@@ -10,7 +10,12 @@
 //! Security properties kept here (see `docs/DECISIONS.md` and the README):
 //! * the passphrase entity is read only in response to a valid Approve action
 //!   for a pending request (and once at connect, to clear a stale value), and
-//!   is cleared immediately after being read, whatever happens next;
+//!   is cleared immediately after being read, whatever happens next (also
+//!   after a *failed* read, since the passphrase may still be in HA);
+//! * whenever the last request announced here closes (for any reason, also a
+//!   release through another channel) an entity that may hold a typed
+//!   passphrase is cleared; a clear that fails is retried, audited, and owed
+//!   until it succeeds (next request, next connect);
 //! * action events are accepted only from `owner_user_ids` (`context.user_id`)
 //!   and only with the constant-time-checked per-request token;
 //! * the notification text contains neither the passphrase nor the token; the
@@ -29,8 +34,8 @@ use secret_proto::sanitize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Semaphore};
@@ -48,6 +53,15 @@ const DENY_PREFIX: &str = "SECRETD_DENY_";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// A write to the socket that takes longer means the peer stopped reading.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Delay before retrying after `auth_invalid` (doubling, capped): a wrong or
+/// revoked token must not be retried once a second, since Home Assistant bans
+/// an IP address after repeated authentication failures (`ip_ban_enabled`).
+const AUTH_INVALID_BASE_MS: u64 = 5 * 60 * 1000;
+const AUTH_INVALID_CAP_MS: u64 = 30 * 60 * 1000;
+/// Notification tags whose clearing failed and is retried at the next connect.
+const MAX_STALE_TAGS: usize = 256;
 const PING_EVERY: Duration = Duration::from_secs(30);
 const DEAD_AFTER: Duration = Duration::from_secs(75);
 /// Largest WebSocket message accepted (a `get_states` answer of a big install).
@@ -66,8 +80,41 @@ struct Cmd {
     reply: oneshot::Sender<CallResult>,
 }
 
+/// Who may approve. Separate from the rest of the settings because a SIGHUP
+/// reload applies it live (revoking a user id must not wait for a restart).
+#[derive(Debug, Clone)]
+struct Allow {
+    owner_user_ids: Vec<String>,
+    require_user_id: bool,
+}
+
+impl Allow {
+    fn from_cfg(cfg: &HaCfg) -> Allow {
+        Allow {
+            owner_user_ids: cfg.owner_user_ids.clone(),
+            require_user_id: cfg.require_user_id,
+        }
+    }
+}
+
+/// What is known about the contents of the passphrase entity. All requests
+/// share one entity, so this is channel-wide.
+#[derive(Debug, Default)]
+struct EntityState {
+    /// The owner was invited to type a passphrase (an actionable notification
+    /// went out) and nothing cleared the entity since: it may hold one.
+    dirty: bool,
+    /// Bumped on every invitation; lets a clear that raced with a new prompt
+    /// leave `dirty` set.
+    seq: u64,
+    /// A clear was needed and did not succeed (HA error, disconnected): it is
+    /// retried at the next announcement and at the next connect.
+    owed: bool,
+}
+
 pub struct HaChannel {
     cfg: HaCfg,
+    allow: RwLock<Allow>,
     token: Zeroizing<String>,
     tls: Option<Arc<rustls::ClientConfig>>,
     /// Command queue of the live, authenticated connection (`None` while down).
@@ -76,8 +123,52 @@ pub struct HaChannel {
     tracked: Mutex<HashMap<String, Zeroizing<String>>>,
     /// One approval at a time: every request shares one passphrase entity.
     approving: AtomicBool,
+    entity: Mutex<EntityState>,
+    /// Notification tags that could not be cleared (HA unreachable).
+    stale_tags: Mutex<Vec<String>>,
+    /// First delay after `auth_invalid` in milliseconds (test hook).
+    auth_backoff_ms: AtomicU64,
     core: Mutex<Weak<Core>>,
     handlers: Arc<Semaphore>,
+}
+
+/// Why a connection attempt ended.
+struct SessionError {
+    msg: String,
+    /// Home Assistant answered the authentication with `auth_invalid`.
+    auth_invalid: bool,
+}
+
+impl From<String> for SessionError {
+    fn from(msg: String) -> Self {
+        SessionError {
+            msg,
+            auth_invalid: false,
+        }
+    }
+}
+
+impl From<&str> for SessionError {
+    fn from(msg: &str) -> Self {
+        msg.to_string().into()
+    }
+}
+
+/// Delay before the `fails`-th consecutive retry after `auth_invalid`:
+/// `base`, doubling, capped at 30 minutes (or `base` if that is larger).
+fn auth_invalid_delay(base_ms: u64, fails: u32) -> Duration {
+    let shift = fails.saturating_sub(1).min(16);
+    let ms = base_ms
+        .saturating_mul(1u64 << shift)
+        .min(AUTH_INVALID_CAP_MS.max(base_ms));
+    Duration::from_millis(ms)
+}
+
+async fn ws_send(ws: &mut Ws, m: Message) -> Result<(), String> {
+    match tokio::time::timeout(WRITE_TIMEOUT, ws.send(m)).await {
+        Ok(r) => r.map_err(|e| e.to_string()),
+        Err(_) => Err("write to Home Assistant timed out".into()),
+    }
 }
 
 /// Holds the "an approval is being processed" flag.
@@ -228,13 +319,45 @@ impl HaChannel {
         Ok(Arc::new(HaChannel {
             tls: build_tls(cfg)?,
             cfg: cfg.clone(),
+            allow: RwLock::new(Allow::from_cfg(cfg)),
             token,
             link: Mutex::new(None),
             tracked: Mutex::new(HashMap::new()),
             approving: AtomicBool::new(false),
+            entity: Mutex::new(EntityState::default()),
+            stale_tags: Mutex::new(Vec::new()),
+            auth_backoff_ms: AtomicU64::new(AUTH_INVALID_BASE_MS),
             core: Mutex::new(Weak::new()),
             handlers: Arc::new(Semaphore::new(MAX_HANDLERS)),
         }))
+    }
+
+    /// Apply the settings of a reloaded configuration that can change live:
+    /// the allowlist (`owner_user_ids`, `ha_require_user_id`). `None` (the
+    /// section was removed) rejects every event until a restart. Everything
+    /// else in `[homeassistant]` needs a restart (see `reload.rs`).
+    pub fn apply_config(&self, cfg: Option<&HaCfg>) {
+        let allow = match cfg {
+            Some(c) => Allow::from_cfg(c),
+            None => Allow {
+                owner_user_ids: Vec::new(),
+                require_user_id: true,
+            },
+        };
+        *self.allow.write().unwrap_or_else(|e| e.into_inner()) = allow;
+    }
+
+    /// Test hook: first delay after `auth_invalid` (default 5 minutes).
+    #[doc(hidden)]
+    pub fn set_auth_invalid_backoff(&self, d: Duration) {
+        self.auth_backoff_ms
+            .store(d.as_millis().max(1) as u64, Ordering::Relaxed);
+    }
+
+    /// Test hook: true while an approval is being processed.
+    #[doc(hidden)]
+    pub fn is_approving(&self) -> bool {
+        self.approving.load(Ordering::Acquire)
     }
 
     /// True while the WebSocket is up and authenticated.
@@ -260,22 +383,48 @@ impl HaChannel {
     pub async fn run(self: Arc<Self>, core: Arc<Core>) {
         *self.core.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&core);
         let mut delay = self.cfg.backoff_min_ms;
+        let mut auth_fails: u32 = 0;
         loop {
             let mut connected = false;
             let res = self.session(&core, &mut connected).await;
             *self.link.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            let why = match res {
-                Ok(()) => "closed".to_string(),
-                Err(e) => e,
+            let (why, auth_invalid) = match res {
+                Ok(()) => ("closed".to_string(), false),
+                Err(e) => (e.msg, e.auth_invalid),
             };
             if connected {
                 delay = self.cfg.backoff_min_ms;
-                let _ = core.audit(
-                    &AuditEvent::new("ha_disconnected")
+                auth_fails = 0;
+                // Coalesced: a flapping link must not flood the audit log.
+                let _ = core.audit_coalesced(
+                    AuditEvent::new("ha_disconnected")
                         .channel(ChannelKind::HomeAssistant)
                         .detail(&sanitize::clean(&why, 200)),
+                    "-",
                 );
                 tracing::warn!("home assistant disconnected: {why}");
+            } else if auth_invalid {
+                // A rejected token will not become valid by retrying, and
+                // Home Assistant bans addresses after repeated failures.
+                auth_fails = auth_fails.saturating_add(1);
+                let wait =
+                    auth_invalid_delay(self.auth_backoff_ms.load(Ordering::Relaxed), auth_fails);
+                if auth_fails == 1 {
+                    // Once per episode; a later success re-arms it.
+                    let _ = core.audit(
+                        &AuditEvent::new("ha_auth_invalid")
+                            .channel(ChannelKind::HomeAssistant)
+                            .detail("access token rejected; retrying only every few minutes"),
+                    );
+                }
+                tracing::error!(
+                    "home assistant rejected the access token (auth_invalid); next attempt in {} s. \
+                     Fix the token in homeassistant.token_file and restart secretd",
+                    wait.as_secs().max(1)
+                );
+                delay = self.cfg.backoff_min_ms;
+                tokio::time::sleep(wait).await;
+                continue;
             } else {
                 tracing::warn!("home assistant connection failed: {why} (retry in {delay} ms)");
             }
@@ -288,7 +437,7 @@ impl HaChannel {
         self: &Arc<Self>,
         core: &Arc<Core>,
         connected: &mut bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), SessionError> {
         let mut ws_cfg = WebSocketConfig::default();
         ws_cfg.max_message_size = Some(MAX_MESSAGE);
         ws_cfg.max_frame_size = Some(MAX_MESSAGE);
@@ -314,23 +463,28 @@ impl HaChannel {
         let auth = Zeroizing::new(
             json!({"type": "auth", "access_token": self.token.as_str()}).to_string(),
         );
-        ws.send(Message::text(auth.as_str()))
-            .await
-            .map_err(|e| e.to_string())?;
+        ws_send(&mut ws, Message::text(auth.as_str())).await?;
         drop(auth);
         let reply = recv_json(&mut ws, AUTH_TIMEOUT).await?;
         match reply["type"].as_str() {
             Some("auth_ok") => {}
-            Some("auth_invalid") => return Err("authentication rejected (auth_invalid)".into()),
+            Some("auth_invalid") => {
+                return Err(SessionError {
+                    msg: "authentication rejected (auth_invalid)".into(),
+                    auth_invalid: true,
+                })
+            }
             _ => return Err("unexpected reply to authentication".into()),
         }
 
         // Subscribe to action events (command id 1).
-        ws.send(Message::text(
-            json!({"id": 1, "type": "subscribe_events", "event_type": EVENT_TYPE}).to_string(),
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
+        ws_send(
+            &mut ws,
+            Message::text(
+                json!({"id": 1, "type": "subscribe_events", "event_type": EVENT_TYPE}).to_string(),
+            ),
+        )
+        .await?;
         loop {
             let m = recv_json(&mut ws, AUTH_TIMEOUT).await?;
             if m["type"] == "result" && m["id"] == 1 {
@@ -344,13 +498,21 @@ impl HaChannel {
         let (tx, mut rx) = mpsc::channel::<Cmd>(32);
         *self.link.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
         *connected = true;
-        let _ = core.audit(&AuditEvent::new("ha_connected").channel(ChannelKind::HomeAssistant));
+        let _ = core.audit_coalesced(
+            AuditEvent::new("ha_connected").channel(ChannelKind::HomeAssistant),
+            "-",
+        );
         tracing::info!("home assistant connected");
-        // Do not leave a passphrase typed before we started lying around.
+        // Catch up on what could not be done while the link was down (stale
+        // notifications, an owed clear of the passphrase entity) and do not
+        // leave a passphrase typed before we started lying around.
         tokio::spawn({
             let me = self.clone();
             let core = core.clone();
-            async move { me.clear_stale(&core).await }
+            async move {
+                me.flush_stale_tags().await;
+                me.clear_stale(&core).await
+            }
         });
 
         let mut next_id: u64 = 2;
@@ -379,9 +541,7 @@ impl HaChannel {
                     let mut body = cmd.body;
                     body["id"] = json!(id);
                     calls.insert(id, cmd.reply);
-                    ws.send(Message::text(body.to_string()))
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    ws_send(&mut ws, Message::text(body.to_string())).await?;
                 }
                 _ = tick.tick() => {
                     if last_rx.elapsed() > DEAD_AFTER {
@@ -389,9 +549,8 @@ impl HaChannel {
                     }
                     let id = next_id;
                     next_id += 1;
-                    ws.send(Message::text(json!({"id": id, "type": "ping"}).to_string()))
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    ws_send(&mut ws, Message::text(json!({"id": id, "type": "ping"}).to_string()))
+                        .await?;
                 }
             }
         }
@@ -451,8 +610,11 @@ impl HaChannel {
             .clone()
             .ok_or_else(|| "home assistant is not connected".to_string())?;
         let (reply, rx) = oneshot::channel();
-        tx.send(Cmd { body, reply })
+        // A stalled connection task stops draining the queue: do not wait on
+        // a full queue forever.
+        tokio::time::timeout(CALL_TIMEOUT, tx.send(Cmd { body, reply }))
             .await
+            .map_err(|_| "command queue full (connection stalled)".to_string())?
             .map_err(|_| "home assistant is not connected".to_string())?;
         match tokio::time::timeout(CALL_TIMEOUT, rx).await {
             Ok(Ok(r)) => r,
@@ -481,8 +643,15 @@ impl HaChannel {
         ])
     }
 
-    /// (Re)send the actionable notification for `id` under its tag.
+    /// (Re)send the actionable notification for `id` under its tag. This
+    /// invites the owner to type a passphrase, so the entity counts as
+    /// possibly holding one from here on.
     async fn prompt(&self, id: &str, title: &str, message: &str) -> Result<(), String> {
+        {
+            let mut e = self.entity.lock().unwrap_or_else(|e| e.into_inner());
+            e.dirty = true;
+            e.seq += 1;
+        }
         let token = self
             .tracked
             .lock()
@@ -501,14 +670,76 @@ impl HaChannel {
             .map(|_| ())
     }
 
+    /// Clear the notification with tag `id`. A failure (typically: not
+    /// connected) is remembered and retried at the next connect, so a dead
+    /// request's Approve button does not stay on the phone.
     async fn clear_notification(&self, id: &str) {
         let body = self.notify_call(json!({"tag": id}), "clear_notification", None);
         if let Err(e) = self.call(body).await {
             tracing::warn!("could not clear home assistant notification: {e}");
+            let mut t = self.stale_tags.lock().unwrap_or_else(|e| e.into_inner());
+            if t.len() < MAX_STALE_TAGS && !t.iter().any(|x| x == id) {
+                t.push(id.to_string());
+            }
         }
     }
 
-    // ------------------------------------------------- passphrase entity
+    /// Retry the notification clears that failed earlier.
+    async fn flush_stale_tags(&self) {
+        let tags = std::mem::take(&mut *self.stale_tags.lock().unwrap_or_else(|e| e.into_inner()));
+        for t in tags {
+            // Fails back into the list when HA is unreachable again.
+            self.clear_notification(&t).await;
+        }
+    }
+
+    /// An informational notification (no actions, own tag) about what became
+    /// of an approval, for outcomes where the typed passphrase was consumed
+    /// without releasing anything. Separate tag: the request's own
+    /// notification is cleared when the request closes.
+    async fn notify_outcome(&self, id: &str, o: &ApproveOutcome) {
+        let (title, msg) = match o {
+            ApproveOutcome::Released | ApproveOutcome::WrongPassphrase { .. } => return,
+            ApproveOutcome::Failed => (
+                "Request denied",
+                "Too many wrong passphrases: the request was denied and nothing was released.",
+            ),
+            ApproveOutcome::Gone => (
+                "Request no longer pending",
+                "The request had already expired, been cancelled or been resolved. Your \
+                 passphrase was cleared and not used.",
+            ),
+            ApproveOutcome::Busy => (
+                "Approval already in progress",
+                "Another approval of this request was being processed. Your passphrase was \
+                 cleared and not used; tap Approve again if the request is still pending.",
+            ),
+            ApproveOutcome::Aborted => (
+                "Request aborted",
+                "The program stopped waiting (timeout or disconnect) while the store was being \
+                 opened. Nothing was released and your passphrase was cleared.",
+            ),
+            ApproveOutcome::CallerChanged => (
+                "Request refused: caller changed",
+                "The requesting program changed or could not be re-verified. Nothing was \
+                 released, the request is closed and your passphrase was cleared.",
+            ),
+            ApproveOutcome::NotInStore => (
+                "Secret missing from the store",
+                "The secret is configured but not in the store. Nothing was released and your \
+                 passphrase was cleared.",
+            ),
+            ApproveOutcome::Internal => (
+                "Request failed",
+                "An internal error stopped the approval (see the audit log). Nothing was \
+                 released and your passphrase was cleared.",
+            ),
+        };
+        let data = json!({"tag": format!("secretd-result-{id}"), "ttl": 0, "priority": "high"});
+        if let Err(e) = self.call(self.notify_call(data, msg, Some(title))).await {
+            tracing::warn!("could not send the approval outcome notification: {e}");
+        }
+    }
 
     /// Current state of the passphrase entity. Unavailable/unknown count as empty.
     async fn read_entity(&self) -> Result<Zeroizing<String>, String> {
@@ -535,8 +766,10 @@ impl HaChannel {
     }
 
     /// Set the passphrase entity to the empty string. Retries; audits
-    /// `ha_clear_failed` if it still fails. Returns whether it worked.
+    /// `ha_clear_failed` and remembers that a clear is owed if it still
+    /// fails. Returns whether it worked.
     async fn clear_entity(&self, core: &Core) -> bool {
+        let seq0 = self.entity.lock().unwrap_or_else(|e| e.into_inner()).seq;
         let body = json!({
             "type": "call_service",
             "domain": "input_text",
@@ -550,11 +783,23 @@ impl HaChannel {
                 tokio::time::sleep(CLEAR_RETRY_DELAY).await;
             }
             match self.call(body.clone()).await {
-                Ok(_) => return true,
+                Ok(_) => {
+                    let others = self.tracked.lock().unwrap_or_else(|e| e.into_inner()).len() > 1;
+                    let mut e = self.entity.lock().unwrap_or_else(|e| e.into_inner());
+                    e.owed = false;
+                    // Still "possibly typed into" if the owner was invited to
+                    // type again meanwhile, or another request is waiting for
+                    // its passphrase (the caller's own request counts as one).
+                    if e.seq == seq0 && !others {
+                        e.dirty = false;
+                    }
+                    return true;
+                }
                 Err(e) => last = e,
             }
         }
         tracing::error!("could not clear the passphrase entity: {last}");
+        self.entity.lock().unwrap_or_else(|e| e.into_inner()).owed = true;
         let _ = core.audit(
             &AuditEvent::new("ha_clear_failed")
                 .channel(ChannelKind::HomeAssistant)
@@ -563,9 +808,22 @@ impl HaChannel {
         false
     }
 
-    /// At connect: a non-empty entity is a stale passphrase; clear it. Skipped
+    /// At connect: clear what a clear owed from earlier could not (even while
+    /// requests are pending: that passphrase was already used or is dead), or
+    /// else a non-empty entity is a stale passphrase. The latter is skipped
     /// while requests are pending here (the owner may be typing for one).
     async fn clear_stale(&self, core: &Core) {
+        let owed = self.entity.lock().unwrap_or_else(|e| e.into_inner()).owed;
+        if owed {
+            if self.clear_entity(core).await {
+                let _ = core.audit(
+                    &AuditEvent::new("ha_entity_cleared")
+                        .outcome("owed")
+                        .channel(ChannelKind::HomeAssistant),
+                );
+            }
+            return;
+        }
         if !self
             .tracked
             .lock()
@@ -607,11 +865,12 @@ impl HaChannel {
     }
 
     fn user_allowed(&self, user: Option<&str>) -> Result<(), &'static str> {
+        let allow = self.allow.read().unwrap_or_else(|e| e.into_inner());
         match user {
-            Some(u) if self.cfg.owner_user_ids.iter().any(|o| o == u) => Ok(()),
-            Some(_) if self.cfg.owner_user_ids.is_empty() && !self.cfg.require_user_id => Ok(()),
+            Some(u) if allow.owner_user_ids.iter().any(|o| o == u) => Ok(()),
+            Some(_) if allow.owner_user_ids.is_empty() && !allow.require_user_id => Ok(()),
             Some(_) => Err("user_not_allowed"),
-            None if !self.cfg.require_user_id => Ok(()),
+            None if !allow.require_user_id => Ok(()),
             None => Err("user_missing"),
         }
     }
@@ -675,7 +934,7 @@ impl HaChannel {
 
     async fn do_approve(self: &Arc<Self>, core: &Arc<Core>, id: &str) {
         // Only one approval at a time: all requests share one entity.
-        let Some(_gate) = ApprovalGate::enter(&self.approving) else {
+        let Some(gate) = ApprovalGate::enter(&self.approving) else {
             let _ = self
                 .prompt(
                     id,
@@ -690,18 +949,25 @@ impl HaChannel {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("cannot read the passphrase entity: {e}");
-                let _ = self
-                    .prompt(
-                        id,
-                        "Cannot read passphrase",
-                        "Secretd could not read the passphrase entity. Try again.",
-                    )
-                    .await;
+                // The passphrase the owner typed may still be there (the
+                // answer can be lost on its way): clear it, whatever failed.
+                let cleared = self.clear_entity(core).await;
+                drop(gate);
+                let msg = if cleared {
+                    "Secretd could not read the passphrase entity, so it was cleared. Enter the \
+                     passphrase again, then tap Approve."
+                } else {
+                    "Secretd could not read the passphrase entity and could not clear it either; \
+                     it will retry. Delete the text yourself if you can, enter the passphrase \
+                     again, then tap Approve."
+                };
+                let _ = self.prompt(id, "Cannot read passphrase", msg).await;
                 return;
             }
         };
         if pass.is_empty() {
             // Nothing to unseal with; not an attempt.
+            drop(gate);
             let _ = self
                 .prompt(
                     id,
@@ -718,22 +984,29 @@ impl HaChannel {
         // The clear is attempted (with retries, audited on failure) before the
         // secret can be released.
         self.clear_entity(core).await;
-        // Released, Failed, Gone, ...: the core closes the request, which
-        // clears the notification (`closed`); only a retryable failure needs a
-        // follow-up here.
-        if let ApproveOutcome::WrongPassphrase { remaining } =
-            core.approve(id, pass, Source::HomeAssistant).await
-        {
-            let _ = self
-                .prompt(
-                    id,
-                    "Wrong passphrase",
-                    &format!(
-                        "Wrong passphrase. {remaining} of {MAX_ATTEMPTS} attempts left. \
-                         Enter it again, then tap Approve."
-                    ),
-                )
-                .await;
+        let outcome = core.approve(id, pass, Source::HomeAssistant).await;
+        // The passphrase is gone from HA and from here: the next approval
+        // may start (the follow-up below is only a notification).
+        drop(gate);
+        match outcome {
+            // Released: the core closes the request, which clears the
+            // notification (`closed`).
+            ApproveOutcome::Released => {}
+            ApproveOutcome::WrongPassphrase { remaining } => {
+                let _ = self
+                    .prompt(
+                        id,
+                        "Wrong passphrase",
+                        &format!(
+                            "Wrong passphrase. {remaining} of {MAX_ATTEMPTS} attempts left. \
+                             Enter it again, then tap Approve."
+                        ),
+                    )
+                    .await;
+            }
+            // Everything else consumed the passphrase without releasing:
+            // tell the owner what happened.
+            other => self.notify_outcome(id, &other).await,
         }
     }
 }
@@ -747,6 +1020,14 @@ impl Channel for HaChannel {
     async fn announce(&self, n: &Notification) -> Result<(), NotifyError> {
         if !self.is_connected() {
             return Err(NotifyError("home assistant is not connected".into()));
+        }
+        // A clear that is still owed from earlier concerns a dead passphrase:
+        // settle it before inviting the owner to type another.
+        let owed = self.entity.lock().unwrap_or_else(|e| e.into_inner()).owed;
+        if owed {
+            if let Some(core) = self.core() {
+                self.clear_entity(&core).await;
+            }
         }
         self.tracked
             .lock()
@@ -768,24 +1049,36 @@ impl Channel for HaChannel {
         Ok(())
     }
 
-    async fn closed(&self, request_id: &str, why: Closed) {
-        let was_ours = self
-            .tracked
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(request_id)
-            .is_some();
+    async fn closed(&self, request_id: &str, _why: Closed) {
+        let (was_ours, others) = {
+            let mut t = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
+            let was = t.remove(request_id).is_some();
+            (was, !t.is_empty())
+        };
         if !was_ours {
             return;
         }
         self.clear_notification(request_id).await;
-        // A passphrase typed for a request that is now dead must not linger.
-        if why != Closed::Released {
-            if let Some(core) = self.core() {
-                if self.is_connected() {
-                    self.clear_entity(&core).await;
-                }
-            }
+        // All requests share one entity: while another one is still waiting
+        // the owner may be typing for it, so leave it alone. The last request
+        // to close clears it, whatever the reason (deny, timeout, disconnect,
+        // and a release through another channel, which never read it).
+        if others {
+            return;
+        }
+        let may_hold_passphrase = {
+            let e = self.entity.lock().unwrap_or_else(|e| e.into_inner());
+            e.dirty || e.owed
+        };
+        if !may_hold_passphrase {
+            return;
+        }
+        let Some(core) = self.core() else { return };
+        if self.is_connected() {
+            self.clear_entity(&core).await;
+        } else {
+            // Cannot reach HA now: the next connect clears it.
+            self.entity.lock().unwrap_or_else(|e| e.into_inner()).owed = true;
         }
     }
 }
@@ -870,6 +1163,20 @@ mod tests {
         .unwrap();
         let v = read_pem_certs(&p).unwrap();
         assert_eq!(v, vec![vec![0, 1, 2, 3, 4], vec![5, 6, 7]]);
+    }
+
+    #[test]
+    fn auth_invalid_backoff_is_long_doubling_and_capped() {
+        let m = |ms: u64| Duration::from_millis(ms);
+        assert_eq!(auth_invalid_delay(300_000, 1), m(300_000));
+        assert_eq!(auth_invalid_delay(300_000, 2), m(600_000));
+        assert_eq!(auth_invalid_delay(300_000, 3), m(1_200_000));
+        assert_eq!(auth_invalid_delay(300_000, 4), m(1_800_000));
+        assert_eq!(auth_invalid_delay(300_000, 40), m(1_800_000));
+        // A base above the cap is kept (never shortened).
+        assert_eq!(auth_invalid_delay(3_600_000, 3), m(3_600_000));
+        // The default is minutes, never the normal one-second reconnect.
+        const { assert!(AUTH_INVALID_BASE_MS >= 60_000) };
     }
 
     #[test]

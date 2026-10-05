@@ -63,6 +63,7 @@ pub fn default_outcome(event: &str) -> &'static str {
         "ha_disconnected" => "disconnected",
         "ha_event_rejected" => "rejected",
         "ha_clear_failed" => "failed",
+        "ha_auth_invalid" => "rejected",
         "ha_entity_cleared" => "cleared",
         _ => "ok",
     }
@@ -202,6 +203,7 @@ mod tests {
             "ha_disconnected",
             "ha_event_rejected",
             "ha_clear_failed",
+            "ha_auth_invalid",
             "ha_entity_cleared",
         ] {
             let e = AuditEvent::new(ev);

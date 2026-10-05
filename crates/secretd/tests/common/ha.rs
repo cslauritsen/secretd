@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -35,6 +35,16 @@ struct Inner {
     auth_failures: AtomicUsize,
     get_states: AtomicUsize,
     fail_services: Mutex<HashSet<String>>,
+    /// `get_states` answers with an error.
+    fail_get_states: AtomicBool,
+    /// `get_states` cuts the connection instead of answering.
+    drop_on_get_states: AtomicBool,
+    /// While set, `call_service` and `get_states` are executed but their
+    /// answers are held back until `release_replies`.
+    hold: AtomicBool,
+    /// Like `hold`, but only for `notify` service calls.
+    hold_notify: AtomicBool,
+    held: Mutex<Vec<Value>>,
     current: Mutex<Option<mpsc::UnboundedSender<ServerCmd>>>,
     sub_id: Mutex<Option<u64>>,
 }
@@ -94,6 +104,42 @@ impl MockHa {
     }
     pub fn fail_service(&self, name: &str) {
         self.inner.fail_services.lock().unwrap().insert(name.into());
+    }
+    pub fn unfail_service(&self, name: &str) {
+        self.inner.fail_services.lock().unwrap().remove(name);
+    }
+    pub fn fail_get_states(&self, on: bool) {
+        self.inner.fail_get_states.store(on, Ordering::SeqCst);
+    }
+    pub fn drop_on_get_states(&self, on: bool) {
+        self.inner.drop_on_get_states.store(on, Ordering::SeqCst);
+    }
+    /// Hold back the answers to `call_service` / `get_states` (the commands
+    /// are still executed and logged).
+    pub fn hold_replies(&self, on: bool) {
+        self.inner.hold.store(on, Ordering::SeqCst);
+    }
+    /// Hold back only the answers to `notify` service calls.
+    pub fn hold_notify_replies(&self, on: bool) {
+        self.inner.hold_notify.store(on, Ordering::SeqCst);
+    }
+    /// Number of answers currently held back.
+    pub fn held_count(&self) -> usize {
+        self.inner.held.lock().unwrap().len()
+    }
+    /// Stop holding and send every held answer.
+    pub fn release_replies(&self) {
+        self.inner.hold.store(false, Ordering::SeqCst);
+        self.inner.hold_notify.store(false, Ordering::SeqCst);
+        let held: Vec<Value> = std::mem::take(&mut *self.inner.held.lock().unwrap());
+        if let Some(tx) = self.inner.current.lock().unwrap().clone() {
+            for f in held {
+                let _ = tx.send(ServerCmd::Frame(f));
+            }
+        }
+    }
+    pub fn remove_entity(&self, entity: &str) {
+        self.inner.entities.lock().unwrap().remove(entity);
     }
     pub fn drop_connection(&self) {
         if let Some(tx) = self.inner.current.lock().unwrap().take() {
@@ -244,6 +290,7 @@ async fn serve(inner: Arc<Inner>, s: tokio::net::TcpStream) {
         ))
         .await;
     let (tx, mut rx) = mpsc::unbounded_channel();
+    inner.held.lock().unwrap().clear();
     *inner.current.lock().unwrap() = Some(tx);
     loop {
         tokio::select! {
@@ -252,6 +299,15 @@ async fn serve(inner: Arc<Inner>, s: tokio::net::TcpStream) {
                 let Message::Text(t) = m else { continue };
                 let cmd: Value = serde_json::from_str(t.as_str()).unwrap();
                 let reply = handle(&inner, &cmd);
+                let held = (matches!(cmd["type"].as_str(), Some("call_service" | "get_states"))
+                    && inner.hold.load(Ordering::SeqCst))
+                    || (cmd["type"] == "call_service"
+                        && cmd["domain"] == "notify"
+                        && inner.hold_notify.load(Ordering::SeqCst));
+                if let (true, Some(r)) = (held, reply.clone()) {
+                    inner.held.lock().unwrap().push(r);
+                    continue;
+                }
                 if let Some(r) = reply {
                     if ws.send(Message::text(r.to_string())).await.is_err() { return; }
                 }
@@ -281,6 +337,18 @@ fn handle(inner: &Inner, cmd: &Value) -> Option<Value> {
             inner.get_states.fetch_add(1, Ordering::SeqCst);
             inner.log.lock().unwrap().push(cmd.clone());
             inner.timeline.lock().unwrap().push("get_states".into());
+            if inner.drop_on_get_states.load(Ordering::SeqCst) {
+                if let Some(tx) = inner.current.lock().unwrap().take() {
+                    let _ = tx.send(ServerCmd::Close);
+                }
+                return None;
+            }
+            if inner.fail_get_states.load(Ordering::SeqCst) {
+                return Some(json!({
+                    "id": id, "type": "result", "success": false,
+                    "error": {"code": "home_assistant_error", "message": "simulated failure"}
+                }));
+            }
             let list: Vec<Value> = inner
                 .entities
                 .lock()
