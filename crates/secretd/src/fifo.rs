@@ -104,6 +104,19 @@ fn fdinfo_flags(text: &str) -> Option<u32> {
     u32::from_str_radix(v, 8).ok()
 }
 
+/// Does a descriptor with these open flags (from `fdinfo`) make its process a
+/// reader of the pipe? Not if it is write-only, and not if it is an `O_PATH`
+/// descriptor: that one names the pipe (for `fstat`, `fchmod`, `*at` calls) but
+/// can neither read nor write, and its access mode bits are meaningless
+/// (they read as `O_RDONLY`), so counting it would let any process that merely
+/// holds such a descriptor trigger requests or make a lone reader "ambiguous".
+#[cfg(target_os = "linux")]
+fn flags_mean_reader(flags: u32) -> bool {
+    // O_PATH is 0o10000000 on every architecture Linux runs secretd on.
+    const O_PATH: u32 = 0o10000000;
+    flags & O_PATH == 0 && flags & 0o3 != 1 // O_WRONLY (1) has no read access
+}
+
 impl ReaderScanner for ProcScanner {
     fn readers(&self, dev: u64, ino: u64) -> io::Result<Vec<ReaderIdent>> {
         self.scan(dev, ino)
@@ -136,7 +149,12 @@ impl ProcScanner {
                 let Ok(v) = macos::vnode_fd(pid, fd) else {
                     continue;
                 };
-                // Only a descriptor opened for reading is a reader.
+                // Only a descriptor opened for reading is a reader: `FREAD`
+                // in the open flags (a write-only descriptor has `FWRITE`
+                // only). macOS has no `O_PATH`; its nearest relative,
+                // `O_EVTONLY`, cannot be exercised here and is not treated
+                // specially. Linux additionally has to exclude `O_PATH`
+                // descriptors (see `flags_mean_reader`).
                 if v.dev != want_dev || v.ino != ino || !v.readable {
                     continue;
                 }
@@ -201,8 +219,7 @@ impl ProcScanner {
                 )) else {
                     continue;
                 };
-                // O_WRONLY (1) is the one access mode without read access.
-                if fdinfo_flags(&info).is_none_or(|f| f & 0o3 == 1) {
+                if !fdinfo_flags(&info).is_some_and(flags_mean_reader) {
                     continue;
                 }
                 let ids = proc_ids(pid);
@@ -241,11 +258,52 @@ fn cstr(p: &Path) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
 }
 
+/// Create `dir` and every missing ancestor with mode 0755. `mkdir`'s mode is
+/// filtered by the umask (the unit sets `UMask=0077`, which would give 0700 and
+/// lock the readers out), so the mode is set explicitly with `fchmod` on a
+/// descriptor of each directory created, after checking that it is a real
+/// directory of the daemon user.
+fn create_dirs(dir: &Path, daemon_uid: u32) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    let mut missing: Vec<&Path> = Vec::new();
+    let mut cur = dir;
+    loop {
+        match std::fs::symlink_metadata(cur) {
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                missing.push(cur);
+                match cur.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => cur = p,
+                    _ => break,
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    for d in missing.into_iter().rev() {
+        std::fs::DirBuilder::new().mode(0o755).create(d)?;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(d)?;
+        let md = f.metadata()?;
+        if !md.is_dir() || md.uid() != daemon_uid {
+            return Err(io::Error::other(format!(
+                "{} was replaced while it was being created",
+                d.display()
+            )));
+        }
+        f.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
 /// Create (or take over a leftover of ours) and verify the pipe for `cfg`.
 ///
 /// `daemon_uid` is the uid the daemon runs as. The parent directory must be a
 /// real directory (not a symlink) owned by that uid and not writable by
-/// group/others, so nobody else can plant or swap entries. An existing path
+/// group/others, so nobody else can plant or swap entries (a missing one is
+/// created with mode 0755, whatever the umask). An existing path
 /// must be a FIFO (never a symlink or anything else) owned by the daemon user
 /// or by the configured owner (a leftover of a crashed run); it is replaced.
 /// Ownership and mode are applied with `fchown`/`fchmod` on an open
@@ -285,13 +343,7 @@ pub fn setup(cfg: &FifoCfg, daemon_uid: u32) -> io::Result<FifoId> {
                 );
             }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o755)
-                .create(parent)?;
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => create_dirs(parent, daemon_uid)?,
         Err(e) => return Err(e),
     }
 
@@ -417,6 +469,22 @@ pub fn setup(cfg: &FifoCfg, daemon_uid: u32) -> io::Result<FifoId> {
     })
 }
 
+/// Let every reader that is blocked in `open(O_RDONLY)` on the pipe go: a
+/// reader that arrives while the pipe is not armed (during the cool-down, or
+/// between the last probe and shutdown) would otherwise stay blocked forever
+/// once the pipe is removed, since nobody will ever open the write end. Opening
+/// the write end wakes all of them; closing it again gives them EOF.
+pub fn release_waiting_readers(path: &Path, id: FifoId) {
+    for _ in 0..4 {
+        match try_open_writer(path, id) {
+            Ok(Some(fd)) => drop(fd),
+            _ => return,
+        }
+        // Readers that arrive right now are picked up by the next round.
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Remove the pipe if it is still the inode we created.
 pub fn remove(path: &Path, id: FifoId) {
     if let Ok(md) = std::fs::symlink_metadata(path) {
@@ -514,7 +582,17 @@ fn verify(before: &[ReaderIdent], now: &[ReaderIdent], reader_present: bool) -> 
         // Nobody could be seen either time: all that can be checked is that
         // somebody still has the read end open.
         (None, None) if reader_present => Verdict::Ok,
-        (Some(a), Some(b)) if a.pid == b.pid && a.proc == b.proc && reader_present => Verdict::Ok,
+        // Same process (pid and start time), same program, same credentials: a
+        // setuid() or a setgid() since the owner looked is a different caller.
+        (Some(a), Some(b))
+            if a.pid == b.pid
+                && a.uid == b.uid
+                && a.gid == b.gid
+                && a.proc == b.proc
+                && reader_present =>
+        {
+            Verdict::Ok
+        }
         _ => Verdict::Changed,
     }
 }
@@ -637,7 +715,6 @@ impl Ctx {
             );
             return;
         }
-        attempts.push_back(now);
 
         // Who is reading? (best effort)
         let readers = match self.scan_for_new_reader().await {
@@ -695,6 +772,12 @@ impl Ctx {
             }
         }
 
+        // Only a reader that gets this far counts against the per-minute limit
+        // (it is what reaches the owner). Openers refused above (ambiguous,
+        // unknown, failing the ACL) are bounded by the cool-down and are
+        // audited through the coalescer; counting them would let any process
+        // that may open the pipe use up the budget of the legitimate reader.
+        attempts.push_back(now);
         // Same bookkeeping as `secret.get`: logged one by one, fails closed.
         if self
             .core
@@ -878,6 +961,7 @@ async fn run_fifo(ctx: Ctx, mut stop: watch::Receiver<bool>) {
             _ = wait_stop(&mut stop) => break 'outer,
         }
     }
+    release_waiting_readers(&path, ctx.id);
     remove(&path, ctx.id);
 }
 
@@ -892,11 +976,19 @@ impl FifoHandle {
     /// Cancel every wait and remove the pipes. An approved request that is
     /// being written finishes within its write deadline.
     pub async fn shutdown(self) {
+        self.shutdown_within(Duration::from_secs(15)).await;
+    }
+
+    /// [`shutdown`](Self::shutdown) that stops waiting for a busy pipe task
+    /// after `grace` (a write to a stuck reader can take up to its deadline):
+    /// the pipes are released and removed regardless.
+    pub async fn shutdown_within(self, grace: Duration) {
         let _ = self.stop.send(true);
         for t in self.tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(15), t).await;
+            let _ = tokio::time::timeout(grace, t).await;
         }
         for (p, id) in &self.paths {
+            release_waiting_readers(p, *id);
             remove(p, *id);
         }
     }
@@ -977,6 +1069,36 @@ mod tests {
         );
         assert_eq!(fdinfo_flags("flags:\t02\n"), Some(2));
         assert_eq!(fdinfo_flags("nothing"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_descriptors_with_read_access_are_readers() {
+        assert!(flags_mean_reader(0)); // O_RDONLY
+        assert!(flags_mean_reader(0o4000)); // O_RDONLY | O_NONBLOCK
+        assert!(flags_mean_reader(2)); // O_RDWR
+        assert!(flags_mean_reader(0o2102000)); // O_RDWR | O_LARGEFILE | O_CLOEXEC
+        assert!(!flags_mean_reader(1)); // O_WRONLY
+        assert!(!flags_mean_reader(0o4001)); // O_WRONLY | O_NONBLOCK
+                                             // O_PATH (access mode bits read as O_RDONLY) is not a reader.
+        assert!(!flags_mean_reader(0o10000000));
+        assert!(!flags_mean_reader(0o12100000));
+        assert_eq!(0o10000000, libc::O_PATH as u32);
+    }
+
+    #[test]
+    fn verdict_requires_the_same_credentials() {
+        let a = ident(10, "/bin/cat");
+        let mut other_uid = a.clone();
+        other_uid.uid = 0;
+        let mut other_gid = a.clone();
+        other_gid.gid = 0;
+        for changed in [other_uid, other_gid] {
+            assert!(matches!(
+                verify(std::slice::from_ref(&a), &[changed], true),
+                Verdict::Changed
+            ));
+        }
     }
 
     #[test]

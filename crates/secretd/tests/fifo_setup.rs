@@ -225,3 +225,25 @@ fn remove_only_removes_the_inode_it_created() {
     remove(&p, id);
     assert!(p.exists());
 }
+
+#[test]
+fn directories_the_daemon_creates_are_0755_under_a_restrictive_umask() {
+    // The packaged unit runs with UMask=0077: a plain mkdir would give 0700 and
+    // lock the readers out of their pipe.
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let top = d.path().join("run");
+    let dir = top.join("secretd").join("pipes");
+    let p = dir.join("db");
+    let old = unsafe { libc::umask(0o077) };
+    let r = setup(&cfg(&p), euid());
+    unsafe { libc::umask(old) };
+    let id = r.unwrap();
+    for created in [&top, &top.join("secretd"), &dir] {
+        let mode = std::fs::metadata(created).unwrap().mode() & 0o7777;
+        assert_eq!(mode, 0o755, "{} is {mode:o}", created.display());
+    }
+    // The pipe itself still has exactly the configured mode.
+    assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o7777, 0o640);
+    remove(&p, id);
+}

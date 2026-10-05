@@ -28,6 +28,8 @@ struct Script {
     queue: Mutex<VecDeque<Vec<ReaderIdent>>>,
     default: Mutex<Vec<ReaderIdent>>,
     calls: AtomicUsize,
+    /// Make the `n`th call (1-based) take this long.
+    slow: Mutex<Option<(usize, Duration)>>,
 }
 
 impl Script {
@@ -36,7 +38,14 @@ impl Script {
             queue: Mutex::new(VecDeque::new()),
             default: Mutex::new(default),
             calls: AtomicUsize::new(0),
+            slow: Mutex::new(None),
         })
+    }
+    fn set_default(&self, v: Vec<ReaderIdent>) {
+        *self.default.lock().unwrap() = v;
+    }
+    fn slow_call(&self, n: usize, d: Duration) {
+        *self.slow.lock().unwrap() = Some((n, d));
     }
     fn then(&self, v: Vec<ReaderIdent>) {
         self.queue.lock().unwrap().push_back(v);
@@ -45,7 +54,13 @@ impl Script {
 
 impl ReaderScanner for Script {
     fn readers(&self, _dev: u64, _ino: u64) -> std::io::Result<Vec<ReaderIdent>> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let slow = *self.slow.lock().unwrap();
+        if let Some((at, d)) = slow {
+            if at == n {
+                std::thread::sleep(d);
+            }
+        }
         Ok(self
             .queue
             .lock()
@@ -689,4 +704,266 @@ async fn two_pipes_may_share_one_secret() {
     }
     assert_eq!(ra.await.unwrap().unwrap(), SECRET);
     assert_eq!(rb.await.unwrap().unwrap(), SECRET);
+}
+
+#[tokio::test]
+async fn refused_openers_do_not_use_up_the_attempt_budget() {
+    let h = Harness::start(Opts::default()).await;
+    let mut cfg = fifo_cfg(&h, "db", "db-password");
+    cfg.attempts_per_min = 1;
+    cfg.enforce_acl = true;
+    let path = cfg.path.clone();
+    // Nobody can be identified: with enforce_acl every opener is refused.
+    let scan = Script::new(vec![]);
+    let _handle = start(&h, scan.clone(), &[cfg]);
+    for _ in 0..3 {
+        assert_eq!(read_pipe(path.clone()).await.unwrap().unwrap(), b"");
+    }
+    assert!(!ev(&h, "fifo_reader_unknown").is_empty());
+    assert!(
+        ev(&h, "rate_limited").is_empty(),
+        "refused openers were counted: {:?}",
+        h.audit_lines()
+    );
+    // The legitimate reader still gets through (budget of one per minute).
+    scan.set_default(vec![psql_reader(777)]);
+    let reader = read_pipe(path.clone());
+    let n = h.notifier.wait_for(1).await;
+    assert_eq!(
+        h.core
+            .approve(&n[0].request_id, pw(PASS), Source::Admin)
+            .await,
+        ApproveOutcome::Released
+    );
+    assert_eq!(reader.await.unwrap().unwrap(), SECRET);
+}
+
+#[tokio::test]
+async fn release_time_check_notices_that_the_reader_has_left() {
+    // The scanner keeps reporting the same reader, but by the time of the
+    // release-time scan nobody holds the read end any more: the pipe's own
+    // POLLERR state must make the release fail closed (nothing written).
+    let h = Harness::start(Opts::default()).await;
+    let cfg = fifo_cfg(&h, "db", "db-password");
+    let path = cfg.path.clone();
+    let scan = Script::new(vec![psql_reader(777)]);
+    scan.slow_call(2, Duration::from_millis(800)); // the release-time scan
+    let _handle = start(&h, scan.clone(), &[cfg]);
+    let (quit_tx, quit_rx) = std::sync::mpsc::channel::<()>();
+    let p2 = path.clone();
+    let reader = tokio::task::spawn_blocking(move || {
+        let f = std::fs::File::open(&p2).unwrap();
+        let _ = quit_rx.recv_timeout(Duration::from_secs(20));
+        drop(f);
+    });
+    let n = h.notifier.wait_for(1).await;
+    let id = n[0].request_id.clone();
+    let core = h.core.clone();
+    let approve = tokio::spawn(async move { core.approve(&id, pw(PASS), Source::Admin).await });
+    // Wait until the release-time scan has started, then let the reader go.
+    for _ in 0..500 {
+        if scan.calls.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    quit_tx.send(()).unwrap();
+    reader.await.unwrap();
+    assert_eq!(approve.await.unwrap(), ApproveOutcome::CallerChanged);
+    let changed = ev(&h, "caller_changed");
+    assert_eq!(changed.len(), 1, "{:?}", h.audit_lines());
+    assert_eq!(changed[0]["outcome"], "at_release");
+    assert!(ev(&h, "released").is_empty() && ev(&h, "aborted").is_empty());
+    assert_no_secret_in_audit(&h);
+}
+
+#[tokio::test]
+async fn a_reader_blocked_in_open_while_the_pipe_is_not_armed_is_released_at_shutdown() {
+    // During the cool-down the pipe is not probed, so a reader that arrives
+    // then sits in open(2). Removing the pipe must not strand it forever.
+    let h = Harness::start(Opts::default()).await;
+    let mut cfg = fifo_cfg(&h, "db", "db-password");
+    cfg.cooldown_secs = 30;
+    let path = cfg.path.clone();
+    let handle = start(&h, Script::new(vec![psql_reader(777)]), &[cfg]);
+    let first = read_pipe(path.clone());
+    let n = h.notifier.wait_for(1).await;
+    h.core.deny(&n[0].request_id, Source::Admin);
+    assert_eq!(first.await.unwrap().unwrap(), b"");
+    // Cool-down: this reader blocks in open().
+    let second = read_pipe(path.clone());
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(!second.is_finished(), "should still be blocked in open");
+    assert_eq!(h.notifier.count(), 1);
+    handle.shutdown().await;
+    let got = tokio::time::timeout(Duration::from_secs(3), second)
+        .await
+        .expect("the reader is stuck in open() after shutdown")
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, b"", "EOF, nothing written");
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn shutdown_removes_the_pipe_even_if_a_task_is_still_busy() {
+    let extra =
+        format!("\n[[secret]]\nname = \"large\"\nallow_uids = [1000]\nallow_exes = [\"{PSQL}\"]\n");
+    let h = Harness::start(Opts {
+        extra,
+        ..Opts::default()
+    })
+    .await;
+    put_secret(&h, "large", &vec![b'x'; 300_000]).await;
+    let mut cfg = fifo_cfg(&h, "large", "large");
+    cfg.write_deadline_secs = 30;
+    let path = cfg.path.clone();
+    let handle = start(&h, Script::new(vec![psql_reader(777)]), &[cfg]);
+    // A reader that opens the pipe and never reads: the write stalls.
+    let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+    let p2 = path.clone();
+    let stuck = std::thread::spawn(move || {
+        let f = std::fs::File::open(&p2).unwrap();
+        let _ = hold_rx.recv_timeout(Duration::from_secs(20));
+        f
+    });
+    let n = h.notifier.wait_for(1).await;
+    let id = n[0].request_id.clone();
+    let core = h.core.clone();
+    let _approve = tokio::spawn(async move { core.approve(&id, pw(PASS), Source::Admin).await });
+    tokio::time::sleep(Duration::from_millis(500)).await; // the write is stuck
+    let t0 = Instant::now();
+    handle.shutdown_within(Duration::from_millis(300)).await;
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    assert!(!path.exists(), "pipe left behind by a busy task");
+    hold_tx.send(()).unwrap();
+    let _ = stuck.join();
+}
+
+// ------------------------------------------------------------- the scanner
+
+mod scanner {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+
+    /// A fresh FIFO (no daemon involved) and its (dev, ino).
+    fn new_pipe(d: &tempfile::TempDir) -> (PathBuf, u64, u64) {
+        let p = d.path().join("probe");
+        let c = CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let md = std::fs::metadata(&p).unwrap();
+        (p, md.dev(), md.ino())
+    }
+
+    /// A process that holds `path` open with `flags` (no CLOEXEC) and sleeps.
+    fn holder(path: &std::path::Path, flags: i32) -> Child {
+        let c = CString::new(path.to_str().unwrap()).unwrap();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60").stdout(Stdio::null()).stderr(Stdio::null());
+        // SAFETY: the closure only calls open(2) (async-signal-safe) on a
+        // CString prepared before the fork.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::open(c.as_ptr(), flags) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        cmd.spawn().expect("spawn holder")
+    }
+
+    fn scanner() -> ProcScanner {
+        ProcScanner::new(Arc::new(RealProcReader))
+    }
+
+    struct Kill(Vec<Child>);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            for c in &mut self.0 {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn a_reader_is_found_with_its_identity() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, dev, ino) = new_pipe(&d);
+        let child = holder(&p, libc::O_RDONLY | libc::O_NONBLOCK);
+        let pid = child.id();
+        let _k = Kill(vec![child]);
+        let found = scanner().readers(dev, ino).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].pid, pid);
+        assert_eq!(found[0].uid, euid());
+        assert_eq!(found[0].proc.as_ref().unwrap().exe, exe_of(pid));
+    }
+
+    #[test]
+    fn write_only_descriptors_are_not_readers() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, dev, ino) = new_pipe(&d);
+        // This process keeps a read end open so that a write-only open works
+        // (the scanner never reports its own process).
+        let mine = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&p)
+            .unwrap();
+        let writer = holder(&p, libc::O_WRONLY | libc::O_NONBLOCK);
+        let wpid = writer.id();
+        let mut k = Kill(vec![writer]);
+        assert!(
+            scanner().readers(dev, ino).unwrap().is_empty(),
+            "a write-only descriptor made a reader"
+        );
+        // A read-write descriptor does count (positive control).
+        let rw = holder(&p, libc::O_RDWR | libc::O_NONBLOCK);
+        let rpid = rw.id();
+        k.0.push(rw);
+        let found = scanner().readers(dev, ino).unwrap();
+        assert_eq!(found.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![rpid]);
+        assert_ne!(rpid, wpid);
+        drop(mine);
+    }
+
+    #[test]
+    fn the_scanners_own_process_is_never_a_reader() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, dev, ino) = new_pipe(&d);
+        let _mine = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&p)
+            .unwrap();
+        assert!(
+            scanner().readers(dev, ino).unwrap().is_empty(),
+            "the daemon's own descriptors must be ignored"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_o_path_descriptor_is_not_a_reader() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, dev, ino) = new_pipe(&d);
+        let path_only = holder(&p, libc::O_PATH);
+        let _k = Kill(vec![path_only]);
+        assert!(
+            scanner().readers(dev, ino).unwrap().is_empty(),
+            "an O_PATH descriptor made a reader"
+        );
+        // With a real reader next to it, the lone reader is still unambiguous.
+        let reader = holder(&p, libc::O_RDONLY | libc::O_NONBLOCK);
+        let rpid = reader.id();
+        let _k2 = Kill(vec![reader]);
+        let found = scanner().readers(dev, ino).unwrap();
+        assert_eq!(found.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![rpid]);
+    }
 }
